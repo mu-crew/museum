@@ -9,13 +9,16 @@ CONF_DIR="$HOME/.config/museum"
 
 mkdir -p "$CONF_DIR"
 if [ ! -f "$CONF_DIR/config" ]; then
-  [ $# -ge 1 ] || { echo "usage: $0 STORE   (first install needs a store, e.g. host:/path)" >&2; exit 1; }
+  [ $# -ge 1 ] || {
+    echo "usage: $0 STORE   (first install needs a store, e.g. host:/path)" >&2
+    exit 1
+  }
   STORE="$1" NAME="${2:-$(hostname -s)}"
   # A taken name means another machine (or an old install) owns that folder.
   # An explicit NAME argument is the caller saying the reuse is intended.
   case "$STORE" in
     *:*) ssh -o BatchMode=yes "${STORE%%:*}" "test -d '${STORE#*:}/$NAME'" && TAKEN=1 || TAKEN= ;;
-    *)   [ -d "$STORE/$NAME" ] && TAKEN=1 || TAKEN= ;;
+    *) [ -d "$STORE/$NAME" ] && TAKEN=1 || TAKEN= ;;
   esac
   if [ -n "$TAKEN" ] && [ $# -lt 2 ]; then
     echo "museum: $STORE/$NAME already exists." >&2

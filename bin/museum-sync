@@ -16,7 +16,11 @@
 set -eu
 
 CONFIG="${MUSEUM_CONFIG:-$HOME/.config/museum/config}"
-[ -f "$CONFIG" ] || { echo "museum: missing $CONFIG (set STORE=host:/path)" >&2; exit 1; }
+[ -f "$CONFIG" ] || {
+  echo "museum: missing $CONFIG (set STORE=host:/path)" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
 . "$CONFIG"
 : "${STORE:?museum: STORE not set in $CONFIG}"
 NAME="${NAME:-$(hostname -s)}"
@@ -27,14 +31,20 @@ INTERVAL="${MUSEUM_INTERVAL:-600}"
 case "${1:---now}" in
   --now) MODE=now ;;
   --if-due) MODE=if-due ;;
-  *) echo "usage: museum-sync [--if-due | --now]" >&2; exit 2 ;;
+  *)
+    echo "usage: museum-sync [--if-due | --now]" >&2
+    exit 2
+    ;;
 esac
 
 # The first rsync 3 found: PATH's, then Homebrew's. macOS /usr/bin/rsync is
 # openrsync, which lacks --append-verify.
 RSYNC=
 for r in "$(command -v rsync || true)" /opt/homebrew/bin/rsync /usr/local/bin/rsync; do
-  if [ -x "$r" ] && "$r" --version 2>/dev/null | grep -q '^rsync  *version 3'; then RSYNC=$r; break; fi
+  if [ -x "$r" ] && "$r" --version 2> /dev/null | grep -q '^rsync  *version 3'; then
+    RSYNC=$r
+    break
+  fi
 done
 
 mkdir -p "$STATE_DIR"
@@ -42,9 +52,13 @@ mkdir -p "$STATE_DIR"
 [ "$MODE" = now ] && : > "$STATE_DIR/pending"
 
 # A non-blocking lock on fd 9, released when the fd closes or the script dies.
-if command -v flock >/dev/null 2>&1; then lock() { flock -n 9; }
-elif [ -x /usr/bin/lockf ]; then lock() { /usr/bin/lockf -s -t 0 9; }
-else echo "museum: no flock or lockf on this system" >&2; exit 1
+if command -v flock > /dev/null 2>&1; then
+  lock() { flock -n 9; }
+elif [ -x /usr/bin/lockf ]; then
+  lock() { /usr/bin/lockf -s -t 0 9; }
+else
+  echo "museum: no flock or lockf on this system" >&2
+  exit 1
 fi
 open_lock() { exec 9> "$STATE_DIR/lock"; }
 unlock() { exec 9>&-; }
@@ -52,8 +66,8 @@ unlock() { exec 9>&-; }
 due() {
   [ -f "$STATE_DIR/pending" ] && return 0
   [ "$MODE" = if-due ] || return 1
-  last=$(cat "$STATE_DIR/last-start" 2>/dev/null || true)
-  [ $(( $(date +%s) - ${last:-0} )) -ge "$INTERVAL" ]
+  last=$(cat "$STATE_DIR/last-start" 2> /dev/null || true)
+  [ $(($(date +%s) - ${last:-0})) -ge "$INTERVAL" ]
 }
 
 record() { # status message
@@ -70,7 +84,7 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o Serv
 copy() {
   case "$STORE" in
     *:*) $SSH "${STORE%%:*}" "mkdir -p '${STORE#*:}/$NAME'" || return ;;
-    *)   mkdir -p "$STORE/$NAME" || return ;;
+    *) mkdir -p "$STORE/$NAME" || return ;;
   esac
   "$RSYNC" -a --append-verify --timeout=120 --include='*/' --include='*.jsonl' --exclude='*' \
     -e "$SSH" "$SRC/" "$STORE/$NAME/" || [ $? -eq 24 ]
@@ -86,7 +100,13 @@ sync_once() {
   # The subshell closes the lock fd first, so neither it nor ssh/rsync hold
   # the lock. Otherwise a killed script's orphans keep it, and every sync on
   # the node silently skips until they die.
-  out=$(exec 9>&-; copy 2>&1) && { record ok ""; return 0; }
+  out=$(
+    exec 9>&-
+    copy 2>&1
+  ) && {
+    record ok ""
+    return 0
+  }
   record error "$(printf '%s' "$out" | tail -n 1)"
   printf '%s\n' "$out" >&2
   return 1

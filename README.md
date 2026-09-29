@@ -87,4 +87,14 @@ skills/museum/       agent skill: where the store is and how to search it
 docs/                 design notes
 ```
 
+## Develop
+
+The shell scripts are linted with shellcheck and formatted with shfmt. Both run through `uvx` at pinned versions, so you only need [uv](https://docs.astral.sh/uv/). The same `make check` runs in CI.
+
+```sh
+make check   # shellcheck + shfmt -d
+make fmt     # shfmt -w (style comes from .editorconfig)
+make hooks   # run make check on every commit that touches the scripts
+```
+
 Part of [mu-crew](https://github.com/mu-crew). Written mostly by AI coding agents, with a human reviewing what ships, and built for running them.

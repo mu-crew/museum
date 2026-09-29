@@ -1,0 +1,15 @@
+#!/bin/sh
+# Lint and format gate (shellcheck, shfmt). Turn it on with `make hooks`.
+# Escape hatch: git commit --no-verify.
+set -e
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '^(bin/|install\.sh$|\.githooks/|Makefile$|\.editorconfig$)'; then
+	exit 0
+fi
+
+if ! command -v uvx >/dev/null 2>&1; then
+	echo "pre-commit: uvx missing, skipping shell checks (install uv)" >&2
+	exit 0
+fi
+
+make -s check
