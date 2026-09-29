@@ -1,0 +1,25 @@
+#!/bin/sh
+# Back up local pi sessions to the museum store. Append-only: nothing is ever deleted.
+# Config: ~/.config/museum/config (shell syntax)
+#   STORE=host:/path   or   STORE=/local/path
+#   NAME=my-laptop     (optional, defaults to `hostname -s`)
+set -eu
+
+CONFIG="${MUSEUM_CONFIG:-$HOME/.config/museum/config}"
+[ -f "$CONFIG" ] || { echo "museum: missing $CONFIG (set STORE=host:/path)" >&2; exit 1; }
+. "$CONFIG"
+: "${STORE:?museum: STORE not set in $CONFIG}"
+NAME="${NAME:-$(hostname -s)}"
+SRC="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
+
+# macOS /usr/bin/rsync is openrsync, which lacks --append-verify; prefer a real rsync.
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Create the host folder (remote or local).
+case "$STORE" in
+  *:*) ssh -o BatchMode=yes "${STORE%%:*}" "mkdir -p '${STORE#*:}/$NAME'" ;;
+  *)   mkdir -p "$STORE/$NAME" ;;
+esac
+
+exec rsync -a --append-verify --include='*/' --include='*.jsonl' --exclude='*' \
+  -e 'ssh -o BatchMode=yes' "$SRC/" "$STORE/$NAME/"

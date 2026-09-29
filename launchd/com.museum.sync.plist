@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Installed by install.sh with @MUSEUM_SYNC@ and @HOME@ substituted. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.museum.sync</string>
+  <key>ProgramArguments</key>
+  <array><string>@MUSEUM_SYNC@</string></array>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/museum-sync.log</string>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/museum-sync.log</string>
+</dict>
+</plist>
