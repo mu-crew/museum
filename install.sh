@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install museum on this machine: config, periodic sync, skill.
-# Usage: ./install.sh [STORE]     e.g. ./install.sh devbox:/data/museum
+# Usage: ./install.sh [STORE [NAME]]     e.g. ./install.sh devbox:/data/museum
+# NAME is this machine's folder in the store; defaults to `hostname -s`, pinned in config.
 set -eu
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SYNC="$ROOT/bin/museum-sync"
@@ -9,7 +10,21 @@ CONF_DIR="$HOME/.config/museum"
 mkdir -p "$CONF_DIR"
 if [ ! -f "$CONF_DIR/config" ]; then
   [ $# -ge 1 ] || { echo "usage: $0 STORE   (first install needs a store, e.g. host:/path)" >&2; exit 1; }
-  printf 'STORE=%s\n# NAME=%s\n' "$1" "$(hostname -s)" > "$CONF_DIR/config"
+  STORE="$1" NAME="${2:-$(hostname -s)}"
+  # A taken name means another machine (or an old install) owns that folder.
+  # An explicit NAME argument is the caller saying the reuse is intended.
+  case "$STORE" in
+    *:*) ssh -o BatchMode=yes "${STORE%%:*}" "test -d '${STORE#*:}/$NAME'" && TAKEN=1 || TAKEN= ;;
+    *)   [ -d "$STORE/$NAME" ] && TAKEN=1 || TAKEN= ;;
+  esac
+  if [ -n "$TAKEN" ] && [ $# -lt 2 ]; then
+    echo "museum: $STORE/$NAME already exists." >&2
+    echo "  same machine reinstalling:  $0 $STORE $NAME" >&2
+    echo "  a different machine:        $0 $STORE <unique-name>" >&2
+    exit 1
+  fi
+  # Pin NAME so a hostname change never starts a new folder.
+  printf 'STORE=%s\nNAME=%s\n' "$STORE" "$NAME" > "$CONF_DIR/config"
   echo "wrote $CONF_DIR/config"
 fi
 

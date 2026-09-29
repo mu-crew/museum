@@ -18,12 +18,13 @@ Each machine runs `bin/museum-sync` every 10 minutes. It uses rsync to copy `~/.
 ## Install (per machine)
 
 ```sh
-./install.sh devbox:/data/museum   # first time: writes ~/.config/museum/config
+./install.sh devbox:/data/museum          # first time: writes ~/.config/museum/config
+./install.sh devbox:/data/museum work-mbp # first time, with an explicit machine name
 ./install.sh                        # later runs: re-link the skill and reload the schedule
 ```
 
 The install script:
-1. writes `~/.config/museum/config` (`STORE=`, and optionally `NAME=` to override the hostname)
+1. writes `~/.config/museum/config` with `STORE=` and `NAME=`. `NAME` defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<NAME>` already exists, the install stops unless you pass `NAME` explicitly
 2. symlinks `skills/museum` into `~/.agents/skills/`
 3. installs the schedule: a launchd agent on macOS, a cron entry on Linux
 4. runs the first sync
