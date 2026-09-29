@@ -5,7 +5,7 @@ description: Museum, the archive of all past pi sessions from every machine. Use
 
 # Museum
 
-Every machine rsyncs `~/.pi/agent/sessions/` into one central store. The store location is the `STORE=` line in `~/.config/museum/config`, either `host:/path` (ssh) or a local `/path`. If that file is missing, search the local `~/.pi/agent/sessions/` instead. The store is a few minutes behind; the current machine's newest sessions may only be local.
+Every machine rsyncs `~/.pi/agent/sessions/` into one central store. The store location is the `STORE=` line in `~/.config/museum/config`, either `host:/path` (ssh) or a local `/path`. If that file is missing, search the local `~/.pi/agent/sessions/` instead. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends; the current machine's newest sessions may only be local. `~/.cache/museum/state` says when this machine last synced and why it failed, if it did.
 
 ## Layout
 

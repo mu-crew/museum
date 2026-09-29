@@ -10,7 +10,7 @@ museum is a central, append-only backup of pi coding-agent sessions from every m
 
 ## How it works
 
-Each machine runs `bin/museum-sync` every 10 minutes. It uses rsync to copy `~/.pi/agent/sessions/*.jsonl` into the store:
+A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at most every 10 minutes while agents work, and when a session ends. It uses rsync to copy `~/.pi/agent/sessions/*.jsonl` into the store:
 
 ```
 <store>/<hostname>/<pi cwd folder>/<timestamp>_<session id>.jsonl
@@ -19,7 +19,9 @@ Each machine runs `bin/museum-sync` every 10 minutes. It uses rsync to copy `~/.
 - **The store** is any ssh host plus folder (`host:/path`), or a local path.
 - **Append-only:** the sync never passes `--delete`, so sessions you delete locally stay in the store.
 - **No collisions:** each machine writes only its own `<hostname>/` folder, so there is nothing to lock or merge.
-- **No daemon, no index:** agents search the files directly using the `museum` skill.
+- **No daemon, no scheduler, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly using the `museum` skill.
+- **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock` on Linux, `lockf` on macOS) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
+- **Failures show up in pi:** the footer says `museum: backup failing: <error>` or `museum: no backup for 3d`, and says nothing while backups work.
 
 ## Install (per machine)
 
@@ -28,7 +30,7 @@ Each machine runs `bin/museum-sync` every 10 minutes. It uses rsync to copy `~/.
 ./install.sh /data/museum                 # first time, local store (this machine is the store host)
 ./install.sh /Volumes/backup/museum       # local path on a mounted disk or network share
 ./install.sh devbox:/data/museum work-mbp # first time, with an explicit machine name
-./install.sh                              # later runs: re-link the skill and reload the schedule
+./install.sh                              # later runs: re-link the skill and the extension
 ```
 
 The store uses rsync's syntax: `host:/path` goes over ssh, anything else is a local path. On the store host itself, use the local path rather than `localhost:`, which would need sshd and a key for your own account.
@@ -36,8 +38,11 @@ The store uses rsync's syntax: `host:/path` goes over ssh, anything else is a lo
 The install script:
 1. writes `~/.config/museum/config` with `STORE=` and `NAME=`. `NAME` defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<NAME>` already exists, the install stops unless you pass `NAME` explicitly
 2. symlinks `skills/museum` into `~/.agents/skills/`
-3. installs the schedule: a launchd agent on macOS, a cron entry on Linux
-4. runs the first sync
+3. symlinks `pi/museum.ts` into `~/.pi/agent/extensions/`. Running pi agents pick it up on restart or `/reload`
+4. removes the cron entry or launchd agent that earlier versions installed
+5. runs the first sync
+
+Run `bin/museum-sync` by hand to sync now. State (last sync, last error) is in `~/.cache/museum/`.
 
 ## Requirements
 
@@ -53,9 +58,9 @@ The store holds the only complete copy of every machine's sessions. Snapshot it 
 ## Layout
 
 ```
-bin/museum-sync      the rsync backup
+bin/museum-sync      the rsync backup, one at a time per node
+pi/museum.ts          pi extension: triggers the sync, warns in the footer
 install.sh            per-machine setup
-launchd/              macOS schedule template
 skills/museum/       agent skill: where the store is and how to search it
 docs/                 design notes
 ```

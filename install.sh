@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install museum on this machine: config, periodic sync, skill.
+# Install museum on this machine: config, skill, pi extension.
 # Usage: ./install.sh [STORE [NAME]]     e.g. ./install.sh devbox:/data/museum
 # NAME is this machine's folder in the store; defaults to `hostname -s`, pinned in config.
 set -eu
@@ -33,21 +33,23 @@ mkdir -p "$HOME/.agents/skills"
 ln -sfn "$ROOT/skills/museum" "$HOME/.agents/skills/museum"
 echo "linked skill -> ~/.agents/skills/museum"
 
-# Schedule: launchd on macOS, cron elsewhere. Every 10 minutes.
-case "$(uname)" in
-  Darwin)
-    PLIST="$HOME/Library/LaunchAgents/com.museum.sync.plist"
-    sed -e "s|@MUSEUM_SYNC@|$SYNC|" -e "s|@HOME@|$HOME|g" "$ROOT/launchd/com.museum.sync.plist" > "$PLIST"
-    launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    echo "launchd agent loaded (log: ~/Library/Logs/museum-sync.log)"
-    ;;
-  *)
-    LINE="*/10 * * * * $SYNC >>\$HOME/.cache/museum-sync.log 2>&1"
-    ( crontab -l 2>/dev/null | grep -v 'museum-sync'; echo "$LINE" ) | crontab -
-    echo "cron entry installed (log: ~/.cache/museum-sync.log)"
-    ;;
-esac
+# The pi extension runs museum-sync; no scheduler. Symlinked so it finds
+# bin/museum-sync beside it and repo edits are live.
+mkdir -p "$HOME/.pi/agent/extensions"
+ln -sfn "$ROOT/pi/museum.ts" "$HOME/.pi/agent/extensions/museum.ts"
+echo "linked pi extension -> ~/.pi/agent/extensions/museum.ts (running pi agents pick it up on restart or /reload)"
+
+# Remove the schedulers earlier versions installed.
+PLIST="$HOME/Library/LaunchAgents/com.museum.sync.plist"
+if [ -f "$PLIST" ]; then
+  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+  rm -f "$PLIST"
+  echo "removed old launchd agent"
+fi
+if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q 'museum-sync'; then
+  crontab -l 2>/dev/null | grep -v 'museum-sync' | crontab -
+  echo "removed old cron entry"
+fi
 
 echo "running first sync..."
-"$SYNC" && echo "ok"
+"$SYNC" --now && echo "ok"
