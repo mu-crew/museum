@@ -18,10 +18,14 @@ Each machine runs `bin/museum-sync` every 10 minutes. It uses rsync to copy `~/.
 ## Install (per machine)
 
 ```sh
-./install.sh devbox:/data/museum          # first time: writes ~/.config/museum/config
+./install.sh devbox:/data/museum          # first time, ssh store: writes ~/.config/museum/config
+./install.sh /data/museum                 # first time, local store (this machine is the store host)
+./install.sh /Volumes/backup/museum       # local path on a mounted disk or network share
 ./install.sh devbox:/data/museum work-mbp # first time, with an explicit machine name
-./install.sh                        # later runs: re-link the skill and reload the schedule
+./install.sh                              # later runs: re-link the skill and reload the schedule
 ```
+
+The store uses rsync's syntax: `host:/path` goes over ssh, anything else is a local path. On the store host itself, use the local path rather than `localhost:`, which would need sshd and a key for your own account.
 
 The install script:
 1. writes `~/.config/museum/config` with `STORE=` and `NAME=`. `NAME` defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<NAME>` already exists, the install stops unless you pass `NAME` explicitly
