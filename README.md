@@ -1,6 +1,12 @@
 # museum
 
-Central, append-only backup of pi coding-agent sessions from every machine, searchable by agents through plain `rg` and `jq`.
+> "We talked about this before. What did we decide?"
+
+That's easy to answer when one machine holds all your sessions. Across a fleet
+of laptops, devservers and throwaway worktrees, the session you need is on a
+host you've forgotten, or on one that no longer exists.
+
+museum is a central, append-only backup of pi coding-agent sessions from every machine, searchable by agents through plain `rg` and `jq`.
 
 ## How it works
 
