@@ -33,23 +33,11 @@ mkdir -p "$HOME/.agents/skills"
 ln -sfn "$ROOT/skills/museum" "$HOME/.agents/skills/museum"
 echo "linked skill -> ~/.agents/skills/museum"
 
-# The pi extension runs museum-sync; no scheduler. Symlinked so it finds
+# The pi extension runs museum-sync. Symlinked so it finds
 # bin/museum-sync beside it and repo edits are live.
 mkdir -p "$HOME/.pi/agent/extensions"
 ln -sfn "$ROOT/pi/museum.ts" "$HOME/.pi/agent/extensions/museum.ts"
 echo "linked pi extension -> ~/.pi/agent/extensions/museum.ts (running pi agents pick it up on restart or /reload)"
-
-# Remove the schedulers earlier versions installed.
-PLIST="$HOME/Library/LaunchAgents/com.museum.sync.plist"
-if [ -f "$PLIST" ]; then
-  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-  rm -f "$PLIST"
-  echo "removed old launchd agent"
-fi
-if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q 'museum-sync'; then
-  crontab -l 2>/dev/null | grep -v 'museum-sync' | crontab -
-  echo "removed old cron entry"
-fi
 
 echo "running first sync..."
 "$SYNC" --now && echo "ok"

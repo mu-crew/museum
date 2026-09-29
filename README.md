@@ -19,7 +19,7 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 - **The store** is any ssh host plus folder (`host:/path`), or a local path.
 - **Append-only:** the sync never passes `--delete`, so sessions you delete locally stay in the store.
 - **No collisions:** each machine writes only its own `<hostname>/` folder, so nothing in the store needs locking or merging.
-- **No daemon, no scheduler, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly using the `museum` skill.
+- **No daemon, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly using the `museum` skill.
 - **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock` on Linux, `lockf` on macOS) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
 - **Failures show up in pi:** the footer says `museum: backup failing: <error>` or `museum: no backup for 3d`, and says nothing while backups work.
 
@@ -39,10 +39,7 @@ The install script:
 1. writes `~/.config/museum/config` with `STORE=` and `NAME=`. `NAME` defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<NAME>` already exists, the install stops unless you pass `NAME` explicitly
 2. symlinks `skills/museum` into `~/.agents/skills/`
 3. symlinks `pi/museum.ts` into `~/.pi/agent/extensions/`. Running pi agents pick it up on restart or `/reload`
-4. removes the cron entry or launchd agent that earlier versions installed
-5. runs the first sync
-
-**Upgrading from the cron version:** pull, run `./install.sh` again, then restart pi or run `/reload`. The script removes the old cron entry or launchd agent.
+4. runs the first sync
 
 ## Check and sync by hand
 

@@ -1,8 +1,8 @@
 /**
  * museum: back up this node's pi sessions from inside pi.
  *
- * Replaces cron/launchd. Sessions only change while pi runs, and pi runs in the
- * pane's own environment (ssh agent, PATH), which a scheduler does not have.
+ * Sessions only change while pi runs, so pi triggers the backup, in the pane's
+ * own environment (ssh agent, PATH).
  *
  *   session_start     catch up on what a crashed or killed pi left, if due
  *   agent_settled     sync if the node's last sync started over 10 minutes ago
