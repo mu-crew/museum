@@ -21,7 +21,7 @@ Some session lines are several MB because a tool output or file dump sits on a s
 
 For a remote store, run each command as `ssh <host> '<command>'` with `<store>` set to the remote path. Fall back to `grep` if `rg` is missing on the host.
 
-If the store host caps ssh sessions (`MaxSessions 1`, common on devservers), plain `ssh` calls can hang or fail with what looks like an auth error. Use [mule](https://github.com/mu-crew/mule) instead when it is installed and `~/.config/mule/config.toml` has a host whose `target` is the store host: `mule run --wait --quiet --host <name> '<command>'` runs the command there and prints its output. mule's flags go before the command. mule warns when a command ends in `| head`; the exit code is then the pipe's, which does not matter for a search. Exit 3 means mule's ssh master is not open: stop and ask the user to run the command mule prints.
+If ssh to the store host stalls (session-capped devservers), use [mule](https://github.com/mu-crew/mule): `mule run --wait --quiet --host <name> '<command>'`. On exit 3, ask the user to run the command mule prints.
 
 1. Find the files that match, newest first:
    ```
