@@ -13,6 +13,9 @@
 # Config: ~/.config/museum/config (shell syntax)
 #   STORE=host:/path   or   STORE=/local/path
 #   NAME=my-laptop     (optional, defaults to `hostname -s`)
+#   SSH_MUX_ONLY=1     (optional) sync only through a running ssh ControlMaster,
+#                      never a fresh connection: for hosts whose auth needs a
+#                      security-key touch or other human step
 set -eu
 
 CONFIG="${MUSEUM_CONFIG:-$HOME/.config/museum/config}"
@@ -27,6 +30,8 @@ NAME="${NAME:-$(hostname -s)}"
 SRC="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
 STATE_DIR="${MUSEUM_STATE_DIR:-$HOME/.cache/museum}"
 INTERVAL="${MUSEUM_INTERVAL:-600}"
+RETRY_DELAY="${MUSEUM_RETRY_DELAY:-30}"
+SSH_MUX_ONLY="${SSH_MUX_ONLY:-}"
 
 case "${1:---now}" in
   --now) MODE=now ;;
@@ -78,16 +83,48 @@ record() { # status message
 # BatchMode: never prompt. The timeouts bound a hung connection, which would
 # otherwise hold the lock (and every later sync on this node) indefinitely.
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+# Mux-only: a session over a master skips auth, so disabling every method
+# changes nothing there, but if the master dies between the check and rsync,
+# the fresh connection fails instead of asking for a key touch.
+[ -n "$SSH_MUX_ONLY" ] && SSH="$SSH -o PubkeyAuthentication=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o GSSAPIAuthentication=no -o HostbasedAuthentication=no"
+
+# Exit status of copy when SSH_MUX_ONLY is set and no master is running.
+NO_MASTER=90
 
 # errexit does not apply inside `$(copy)` used in a condition, hence the
 # explicit `|| return`. rsync 24 is "a file vanished mid-run", which is fine.
+# For an ssh store, the remote mkdir rides rsync's own connection
+# (--rsync-path), so a sync opens one ssh connection, not two.
 copy() {
   case "$STORE" in
-    *:*) $SSH "${STORE%%:*}" "mkdir -p '${STORE#*:}/$NAME'" || return ;;
-    *) mkdir -p "$STORE/$NAME" || return ;;
+    *:*)
+      host=${STORE%%:*}
+      # `-O check` only asks the local control socket; it never connects.
+      if [ -n "$SSH_MUX_ONLY" ] && ! $SSH -O check "$host" 2> /dev/null; then
+        echo "no ssh master for $host (run: ssh -MNf $host)"
+        return "$NO_MASTER"
+      fi
+      set -- --rsync-path="mkdir -p '${STORE#*:}/$NAME' && rsync"
+      ;;
+    *)
+      mkdir -p "$STORE/$NAME" || return
+      set --
+      ;;
   esac
   "$RSYNC" -a --append-verify --timeout=120 --include='*/' --include='*.jsonl' --exclude='*' \
-    -e "$SSH" "$SRC/" "$STORE/$NAME/" || [ $? -eq 24 ]
+    "$@" -e "$SSH" "$SRC/" "$STORE/$NAME/" || [ $? -eq 24 ]
+}
+
+# The subshell closes the lock fd first, so neither it nor ssh/rsync hold
+# the lock. Otherwise a killed script's orphans keep it, and every sync on
+# the node silently skips until they die.
+attempt() {
+  st=0
+  out=$(
+    exec 9>&-
+    copy 2>&1
+  ) || st=$?
+  return "$st"
 }
 
 sync_once() {
@@ -97,17 +134,25 @@ sync_once() {
     record error "rsync 3.x not found (macOS: brew install rsync)"
     return 1
   fi
-  # The subshell closes the lock fd first, so neither it nor ssh/rsync hold
-  # the lock. Otherwise a killed script's orphans keep it, and every sync on
-  # the node silently skips until they die.
-  out=$(
-    exec 9>&-
-    copy 2>&1
-  ) && {
+  attempt && {
     record ok ""
     return 0
   }
-  record error "$(printf '%s' "$out" | tail -n 1)"
+  # One retry, for a blip, only in mux-only mode with a live master: there it
+  # costs no human step. A fresh connection may need a key touch, and a
+  # missing master will not appear in $RETRY_DELAY seconds.
+  if [ -n "$SSH_MUX_ONLY" ] && [ "$st" -ne "$NO_MASTER" ]; then
+    printf '%s\nmuseum: retrying in %ss\n' "$out" "$RETRY_DELAY" >&2
+    sleep "$RETRY_DELAY"
+    attempt && {
+      record ok ""
+      return 0
+    }
+  fi
+  # ssh's or the remote mkdir's line says why; rsync's last line after it is only
+  # "connection unexpectedly closed" / "protocol data stream".
+  msg=$(printf '%s\n' "$out" | grep -E '^(ssh|mkdir): ' | tail -n 1)
+  record error "${msg:-$(printf '%s' "$out" | tail -n 1)}"
   printf '%s\n' "$out" >&2
   return 1
 }

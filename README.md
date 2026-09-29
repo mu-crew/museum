@@ -52,11 +52,16 @@ The pi footer shows the same state: nothing while backups work, `museum: backup 
 
 ## Configuration
 
-`~/.config/museum/config` holds `STORE=` and `NAME=`. These environment variables are for tests and unusual layouts:
+`~/.config/museum/config` holds `STORE=` and `NAME=`, and optionally `SSH_MUX_ONLY=1`.
+
+`SSH_MUX_ONLY=1` is for an ssh store whose login needs a human, such as a security-key touch. The sync then runs only over an ssh ControlMaster that is already open, and never opens a new connection. If no master is running, it records `no ssh master for <host> (run: ssh -MNf <host>)` and skips, so the footer tells you what to run and nothing asks for your key. In this mode a failed sync retries once after 30 seconds, because a retry over the master costs no touch. Without the setting, a failed sync waits for the next one: a new connection might need a touch.
+
+These environment variables are for tests and unusual layouts:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `MUSEUM_INTERVAL` | `600` | Seconds between routine syncs |
+| `MUSEUM_RETRY_DELAY` | `30` | Seconds before the one retry (`SSH_MUX_ONLY` only) |
 | `MUSEUM_CONFIG` | `~/.config/museum/config` | Config file |
 | `MUSEUM_STATE_DIR` | `~/.cache/museum` | Lock, `pending`, `last-start` and `state` |
 | `PI_SESSIONS_DIR` | `~/.pi/agent/sessions` | What gets backed up |

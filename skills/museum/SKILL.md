@@ -50,6 +50,6 @@ Use this when the user asks whether museum is working, or pi's footer shows `mus
    "$(dirname "$(readlink -f ~/.agents/skills/museum)")/../bin/museum-sync"
    ```
    Exit 0 means the sync succeeded, or another sync on this machine will cover it.
-3. Common causes: ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), or the store folder is not writable.
+3. Common causes: ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), the store folder is not writable, or, with `SSH_MUX_ONLY=1` in the config, no ssh master is running (`no ssh master for <host>`: the user runs `ssh -MNf <host>`, which may need their key).
 
 Report the error to the user. Do not change `~/.config/museum/config` or the ssh setup without asking.
