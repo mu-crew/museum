@@ -6,7 +6,7 @@
  *
  *   session_start     catch up on what a crashed or killed pi left, if due
  *   agent_settled     sync if the node's last sync started over 10 minutes ago
- *   session_shutdown  flush: sync this session's final turns now
+ *   session_shutdown  flush: sync this session's final turns, 5s after exit
  *
  * All the coordination is in `museum-sync`: one sync per node however many
  * agents call it, and a flush that arrives mid-sync re-runs it. This file only
@@ -49,7 +49,7 @@ function read(name: string): string {
   }
 }
 
-function run(mode: "--if-due" | "--now"): void {
+function run(mode: "--if-due" | "--now", delayS = 0): void {
   // Cheap pre-check, so ten agents settling does not fork ten shells. The
   // script re-checks under its lock; this is only an optimisation.
   if (mode === "--if-due") {
@@ -57,7 +57,13 @@ function run(mode: "--if-due" | "--now"): void {
     if (Date.now() / 1000 - last < INTERVAL_S) return;
   }
   try {
-    const child = spawn(syncPath(), [mode], { detached: true, stdio: "ignore" });
+    const child =
+      delayS > 0
+        ? spawn("/bin/sh", ["-c", `sleep ${delayS}; exec "$0" "$1"`, syncPath(), mode], {
+            detached: true,
+            stdio: "ignore",
+          })
+        : spawn(syncPath(), [mode], { detached: true, stdio: "ignore" });
     child.on("error", () => {});
     child.unref();
   } catch {
@@ -93,5 +99,8 @@ export default function museum(pi: ExtensionAPI): void {
     show(ctx);
     run("--if-due");
   });
-  pi.on("session_shutdown", () => run("--now"));
+  // Delayed: other extensions still write to the session after this handler
+  // (a session name, for one), and a sync that starts now would miss them
+  // until the next one. The child is detached, so pi does not wait.
+  pi.on("session_shutdown", () => run("--now", 5));
 }
