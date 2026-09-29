@@ -18,7 +18,7 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 
 - **The store** is any ssh host plus folder (`host:/path`), or a local path.
 - **Append-only:** the sync never passes `--delete`, so sessions you delete locally stay in the store.
-- **No collisions:** each machine writes only its own `<hostname>/` folder, so there is nothing to lock or merge.
+- **No collisions:** each machine writes only its own `<hostname>/` folder, so nothing in the store needs locking or merging.
 - **No daemon, no scheduler, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly using the `museum` skill.
 - **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock` on Linux, `lockf` on macOS) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
 - **Failures show up in pi:** the footer says `museum: backup failing: <error>` or `museum: no backup for 3d`, and says nothing while backups work.
@@ -42,13 +42,38 @@ The install script:
 4. removes the cron entry or launchd agent that earlier versions installed
 5. runs the first sync
 
-Run `bin/museum-sync` by hand to sync now. State (last sync, last error) is in `~/.cache/museum/`.
+**Upgrading from the cron version:** pull, run `./install.sh` again, then restart pi or run `/reload`. The script removes the old cron entry or launchd agent.
+
+## Check and sync by hand
+
+```sh
+cat ~/.cache/museum/state        # status=ok|error, time (epoch), message (last error)
+bin/museum-sync                  # sync now, and print rsync or ssh errors
+```
+
+The pi footer shows the same state: nothing while backups work, `museum: backup failing: <error>` after a failed sync, `museum: no backup for 3d` when no sync has succeeded for over a day.
+
+## Configuration
+
+`~/.config/museum/config` holds `STORE=` and `NAME=`. These environment variables are for tests and unusual layouts:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MUSEUM_INTERVAL` | `600` | Seconds between routine syncs |
+| `MUSEUM_CONFIG` | `~/.config/museum/config` | Config file |
+| `MUSEUM_STATE_DIR` | `~/.cache/museum` | Lock, `pending`, `last-start` and `state` |
+| `PI_SESSIONS_DIR` | `~/.pi/agent/sessions` | What gets backed up |
+| `MUSEUM_SYNC` | `bin/museum-sync` beside the extension | Script the extension runs |
+
+The extension and the script read the environment of the pi process, so set these where pi starts.
 
 ## Requirements
 
+- pi with extensions enabled. The sync runs only while pi runs.
+- `flock` (Linux, util-linux or BusyBox) or `/usr/bin/lockf` (macOS, built in).
 - rsync 3.x on the client. On macOS, `/usr/bin/rsync` is openrsync and lacks `--append-verify`, so install rsync with `brew install rsync`.
 - rsync on the store host.
-- Non-interactive ssh from each client to the store host (the scripts use `BatchMode=yes`).
+- Non-interactive ssh from each client to the store host (the scripts use `BatchMode=yes`). The sync runs in pi's environment, so a key held by your ssh agent works.
 - `rg` and `jq` for searching. The skill falls back to `grep` on hosts without `rg`.
 
 ## Back up the store
