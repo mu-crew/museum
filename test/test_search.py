@@ -18,6 +18,7 @@ search = load("museum-search")
 
 HAIL = "--home-u-hacking-hail--"
 WORKER = "--home-u-.local-state-mu-workspaces-hail-worker-1--"
+SELF = "0000-self"
 
 
 def msg(role: str, content: Any, ts: str = "2026-01-01T00:00:00Z") -> dict[str, Any]:
@@ -86,12 +87,47 @@ class Store(unittest.TestCase):
             "mac/--Users-u-notes--/2026-07-01T00-00-00-000Z_d.jsonl",
             [msg("user", 'she said "it\'s done" \\ café')],
         )
+        # Stalwart only in an assistant's thinking and tool-call arguments: an
+        # assistant line, but not a turn that says it.
+        write_session(
+            self.dir,
+            f"pc/{HAIL}/2026-09-01T00-00-00-000Z_f.jsonl",
+            [
+                msg("user", "check the config"),
+                msg(
+                    "assistant",
+                    [
+                        {"type": "thinking", "thinking": "look at stalwart"},
+                        {"type": "toolCall", "name": "bash", "arguments": {"cmd": "rg stalwart"}},
+                    ],
+                ),
+            ],
+        )
+        # Stalwart only in the recorded system prompt (AGENTS.md): no mention.
+        write_session(
+            self.dir,
+            f"pc/{HAIL}/2026-09-02T00-00-00-000Z_g.jsonl",
+            [
+                {
+                    "type": "message",
+                    "message": {"role": "system", "content": "", "sections": {"x": "Stalwart"}},
+                },
+                msg("user", "hello"),
+            ],
+        )
+        # The session doing the search, left out by --skip.
+        write_session(
+            self.dir,
+            f"pc/{HAIL}/2026-09-03T00-00-00-000Z_{SELF}.jsonl",
+            [msg("user", "what did we decide about stalwart?")],
+        )
 
     def run_search(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         if not self.rg:
             # A PATH with python3 but no rg exercises the pure-Python scan.
             env["PATH"] = str(Path(sys.executable).parent)
+        env["PI_SESSION_ID"] = SELF
         return subprocess.run(
             [sys.executable, str(BIN / "museum-search"), "--store", str(self.dir), *args],
             capture_output=True,
@@ -100,38 +136,65 @@ class Store(unittest.TestCase):
             check=False,
         )
 
-    def test_find_ranks_projects_first_then_newest(self) -> None:
+    def files(self, out: str) -> list[str]:
+        return [line.split()[1] for line in out.splitlines() if line.strip().startswith("file:")]
+
+    def test_find_ranks_conversation_then_projects_then_newest(self) -> None:
         out = self.run_search("find", "STALWART").stdout
-        files = [line.split()[1] for line in out.splitlines() if line.strip().startswith("file:")]
         self.assertEqual(
-            files,
+            self.files(out),
             [
                 f"pc/{HAIL}/2026-06-07T09-42-00-000Z_b.jsonl",
                 f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl",
                 f"pc/{WORKER}/2026-06-08T00-00-00-000Z_c.jsonl",
+                # Newest project session, but only thinking and a tool call.
+                f"pc/{HAIL}/2026-09-01T00-00-00-000Z_f.jsonl",
             ],
         )
-        self.assertIn("3 sessions mention", out)
+        self.assertIn(
+            '"STALWART": 3 sessions in conversation, 1 only in tool output; '
+            "1 more only in a system prompt",
+            out,
+        )
+
+    def test_find_skips_the_searching_session_unless_told_otherwise(self) -> None:
+        self.assertNotIn(SELF, self.run_search("find", "decide about").stdout)
+        out = self.run_search("find", "decide about", "--skip", "").stdout
+        self.assertEqual(self.files(out), [f"pc/{HAIL}/2026-09-03T00-00-00-000Z_{SELF}.jsonl"])
+
+    def test_find_with_only_system_prompt_mentions(self) -> None:
+        write_session(
+            self.dir,
+            "mac/--Users-u-x--/2026-01-01T00-00-00-000Z_h.jsonl",
+            [{"type": "message", "message": {"role": "system", "sections": {"a": "zebra"}}}],
+        )
+        out = self.run_search("find", "zebra").stdout
+        self.assertEqual(
+            out.strip(),
+            'no session mentions "zebra"; 1 more only in a system prompt (AGENTS.md, docs, skills)',
+        )
 
     def test_find_block_prefers_conversation_text_and_metadata(self) -> None:
         out = self.run_search("find", "stalwart", "hail", "--limit", "1").stdout
-        self.assertIn("2026-06-07 09:42  pc  hail@main  (3 matching entries)", out)
+        # The torn last line counts as tool output: it cannot be parsed.
+        self.assertIn("2026-06-07 09:42  pc  hail@main  (1 turns, 2 tool entries)", out)
         self.assertIn("first: look at this repo", out)
         self.assertIn("match: Hail runs on Stalwart + JMAP.", out)
         self.assertNotIn("table", out)
-        self.assertIn("showing 1", out)
+        self.assertIn("Showing 1:", out)
 
     def test_find_labels_folders_without_metadata(self) -> None:
         out = self.run_search("find", "fix stalwart").stdout
-        self.assertIn("pc  mu:hail-worker-1  (1 matching entries)", out)
+        self.assertIn("pc  mu:hail-worker-1  (1 turns, 0 tool entries)", out)
 
     def test_find_matches_json_escaped_and_unicode_terms(self) -> None:
         for term in ['"it\'s done"', "\\ café", "CAFÉ"]:
             with self.subTest(term=term):
-                self.assertIn("1 sessions mention", self.run_search("find", term).stdout)
+                out = self.run_search("find", term).stdout
+                self.assertIn("1 sessions in conversation", out)
 
     def test_find_misses(self) -> None:
-        self.assertIn("no session mentions", self.run_search("find", "zzqq").stdout)
+        self.assertEqual(self.run_search("find", "zzqq").stdout, 'no session mentions "zzqq"\n')
         r = self.run_search("find", "x", "nosuchproject")
         self.assertEqual(r.returncode, 1)
         self.assertIn("no store folder matches", r.stderr)
@@ -185,8 +248,8 @@ class Units(unittest.TestCase):
         self.assertEqual(search.window(texts, None), list(range(7)))
 
     def test_forward_carries_the_limit(self) -> None:
-        ns = search.parse(["find", "t", "--limit", "3"])
-        self.assertEqual(search.forward(ns), ["find", "t", "--limit", "3"])
+        ns = search.parse(["find", "t", "--limit", "3", "--skip", "me"])
+        self.assertEqual(search.forward(ns), ["find", "t", "--limit", "3", "--skip", "me"])
         self.assertEqual(search.forward(search.parse(["show", "f", "t"])), ["show", "f", "t"])
 
     def test_remote_command_is_one_shell_command(self) -> None:

@@ -14,9 +14,13 @@ TERM is a literal, matched case-insensitively. PROJECT narrows `find` to store
 folders whose name contains it. FILE is a path relative to the store, as `find`
 prints it.
 
-`find` ranks project folders before mu workspace folders (.../mu/workspaces/...),
-because orchestrator sessions hold the decisions and worker sessions carry them
-out; within each group the newest session comes first.
+`find` ranks sessions by where TERM appears. Sessions that mention it in a user
+or assistant turn come before those where only tool output does; sessions where
+only the recorded system prompt does (AGENTS.md, docs, skills: the same in every
+session of a project) are left out. Within each tier, project folders come before
+mu workspace folders (.../mu/workspaces/...), because orchestrator sessions hold
+the decisions and worker sessions carry them out; then the newest comes first.
+The session running the search ($PI_SESSION_ID, sent as --skip) is left out too.
 
 For an ssh store the script runs on the store host: ssh starts `python3 -` there
 and this file arrives on stdin, so the store host needs python3 and nothing from
@@ -41,6 +45,23 @@ MU_WORKSPACE = "-mu-workspaces-"
 SNIPPET = 100  # characters of context either side of a match
 
 
+# Where a mention sits, best first: the text of a user or assistant turn, then
+# anything else (tool calls and output, thinking, custom entries), then the
+# recorded system prompt, which is not a mention. Every message entry in a
+# session is written as {"type":"message",...,"message":{"role":"<role>",...}.
+CONVERSATION, TOOL, SYSTEM = 0, 1, 2
+ROLE = re.compile(r'"message":\{"role":"(\w+)"')
+
+
+def tier(line: str) -> int:
+    """A line's tier by its role alone: CONVERSATION means only "may be"."""
+    m = ROLE.search(line)
+    role = m[1] if m else None
+    if role in ("user", "assistant"):
+        return CONVERSATION
+    return SYSTEM if role == "system" else TOOL
+
+
 class Session(NamedTuple):
     path: str  # relative to the store: host/folder/file.jsonl
     host: str
@@ -52,9 +73,12 @@ class Session(NamedTuple):
         host, folder, name = path.split("/", 2)
         return cls(path, host, folder, name)
 
+    def id(self) -> str:
+        return self.name.removesuffix(".jsonl").rpartition("_")[2]
+
     def rank(self) -> tuple[bool, str]:
-        """Sort key: project folders first, then newest first (by name, which
-        starts with the ISO start time). Negated with a reverse sort."""
+        """Sort key within a tier: project folders first, then newest first (by
+        name, which starts with the ISO start time). Use with a reverse sort."""
         return (MU_WORKSPACE not in self.folder, self.name)
 
     def started(self) -> str:
@@ -117,31 +141,85 @@ def snippet(s: str, term: str) -> str | None:
     return s[max(0, i - SNIPPET) : i + len(term) + SNIPPET]
 
 
-def matching_files(dirs: list[str], term: str) -> list[str]:
-    """Store-relative paths of the sessions whose raw text contains TERM."""
+def rg(args: list[str], dirs: list[str]) -> list[str]:
+    """rg's output lines over the store's session files."""
+    out = subprocess.run(
+        ["rg", "-i", "-g", "*.jsonl", *args, "--", *dirs],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    ).stdout
+    return out.splitlines()
+
+
+def said(line: str, term: str) -> bool:
+    """Whether a session line is a user or assistant turn whose text says TERM:
+    not only its thinking, a tool call's arguments, or its metadata."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return False
+    body = text(entry) if isinstance(entry, dict) else None
+    return body is not None and term.lower() in body.lower()
+
+
+def matching_files(dirs: list[str], term: str) -> dict[str, int]:
+    """Store-relative paths of the sessions that mention TERM, each with the
+    best tier it appears in."""
     raw = needle(term)
-    rg = shutil.which("rg")
-    if rg:
-        out = subprocess.run(
-            [rg, "-l", "-i", "-F", "-g", "*.jsonl", "--", raw, *dirs],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout
-        return [p.removeprefix("./") for p in out.splitlines()]
-    found = []
-    for d in dirs:
-        # The store is <host>/<folder>/<session>.jsonl; a PROJECT dir is <host>/<folder>.
-        for path in Path(d).glob("*/*/*.jsonl" if d == "." else "*.jsonl"):
-            with path.open(encoding="utf-8", errors="replace") as f:
-                if any(raw in line.lower() for line in f):
-                    found.append(str(path))
-    return found
+    if not shutil.which("rg"):
+        found = {}
+        for d in dirs:
+            # The store is <host>/<folder>/<session>.jsonl; a PROJECT dir is <host>/<folder>.
+            for path in Path(d).glob("*/*/*.jsonl" if d == "." else "*.jsonl"):
+                t = best_tier(path, term)
+                if t is not None:
+                    found[str(path)] = t
+        return found
+    # Three rg passes, about 0.5s each on a 1.3GB store, where reading every
+    # mention in Python takes about 6s. rg's regex syntax rejects some of
+    # re.escape's escapes (a space), so escape only what is special in both.
+    lit = re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", raw)
+    anywhere = {p.removeprefix("./") for p in rg(["-l", "-F", raw], dirs)}
+    tiers = dict.fromkeys(anywhere, TOOL)
+    # Lines that may be a turn saying TERM; Python confirms one per session.
+    for hit in rg(
+        ["--with-filename", "-e", rf'"message":\{{"role":"(user|assistant)".*{lit}'], dirs
+    ):
+        path, _, line = hit.partition(":")
+        path = path.removeprefix("./")
+        if tiers.get(path) == TOOL and said(line, term):
+            tiers[path] = CONVERSATION
+    # A session left at TOOL whose mentions all sit in the recorded system
+    # prompt is not a mention. System lines are few, so this pass is cheap.
+    in_system = rg(["-l", "-e", rf'"message":\{{"role":"system".*{lit}'], dirs)
+    for path in {p.removeprefix("./") for p in in_system}:
+        best = best_tier(Path(path), term)
+        if tiers.get(path) == TOOL and best is not None:
+            tiers[path] = best
+    return tiers
+
+
+def best_tier(path: Path, term: str) -> int | None:
+    raw, best = needle(term), None
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if raw not in line.lower():
+                continue
+            t = tier(line)
+            if t == CONVERSATION and not said(line, term):
+                t = TOOL
+            best = t if best is None else min(best, t)
+            if best == CONVERSATION:
+                break
+    return best
 
 
 class Summary(NamedTuple):
-    hits: int  # entries that mention TERM anywhere, tool output included
+    hits: int  # user or assistant turns whose text mentions TERM
+    tool: int  # other entries that do, system prompts left out
     meta: dict[str, Any]  # the museum custom entry's data, if the session has one
     first: str  # the first user message
     match: str  # the first mention in conversation text, else in any entry
@@ -149,11 +227,20 @@ class Summary(NamedTuple):
 
 def summarize(path: Path, term: str) -> Summary:
     raw = needle(term)
-    hits, meta, first, match, fallback = 0, {}, "", "", ""
+    hits, tool, meta, first, match, fallback = 0, 0, {}, "", "", ""
     with path.open(encoding="utf-8", errors="replace") as f:
         for line in f:
             mentions = raw in line.lower()
-            hits += mentions
+            if mentions:
+                t = tier(line)
+                if t == CONVERSATION and not said(line, term):
+                    t = TOOL
+                if t == SYSTEM:
+                    mentions = False
+                elif t == CONVERSATION:
+                    hits += 1
+                else:
+                    tool += 1
             # Parse only the lines that can still add something: some lines are
             # several MB of tool output.
             wanted = (not first and '"user"' in line) or (not meta and '"museum"' in line)
@@ -171,37 +258,57 @@ def summarize(path: Path, term: str) -> Summary:
             if body is None:
                 # Tool output rarely says what was decided: only a fallback.
                 if mentions and not fallback:
-                    fallback = snippet(squash(json.dumps(entry, ensure_ascii=False)), term) or ""
+                    fallback = snippet(squash(" ".join(strings(entry))), term) or ""
                 continue
             if not first and entry["message"]["role"] == "user":
                 first = squash(body)[:160]
             if mentions and not match:
                 match = snippet(squash(body), term) or ""
-    return Summary(hits, meta, first, match or fallback)
+    return Summary(hits, tool, meta, first, match or fallback)
 
 
-def find(term: str, project: str | None, limit: int) -> int:
+def strings(value: object) -> Iterator[str]:
+    """Every string inside a JSON value, unescaped: tool output as text."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from strings(v)
+
+
+def find(term: str, project: str | None, limit: int, skip: str) -> int:
     if project:
         dirs = sorted(str(p) for p in Path().glob(f"*/*{project}*") if p.is_dir())
         if not dirs:
             return fail(f"no store folder matches *{project}*")
     else:
         dirs = ["."]
-    sessions = sorted(map(Session.of, matching_files(dirs, term)), key=Session.rank, reverse=True)
-    if not sessions:
-        print(f'no session mentions "{term}"')
+    tiers = {
+        s: t for p, t in matching_files(dirs, term).items() if (s := Session.of(p)).id() != skip
+    }
+    talk = [s for s, t in tiers.items() if t == CONVERSATION]
+    tools = [s for s, t in tiers.items() if t == TOOL]
+    ranked = sorted(talk, key=Session.rank, reverse=True)
+    ranked += sorted(tools, key=Session.rank, reverse=True)
+    skipped = len(tiers) - len(ranked)
+    note = f"; {skipped} more only in a system prompt (AGENTS.md, docs, skills)" if skipped else ""
+    if not ranked:
+        print(f'no session mentions "{term}"{note}')
         return 0
-    shown = sessions[:limit]
+    shown = ranked[:limit]
     print(
-        f'{len(sessions)} sessions mention "{term}"; showing {len(shown)}. '
-        "Project folders first, then mu workspaces; newest first."
+        f'"{term}": {len(talk)} sessions in conversation, {len(tools)} only in tool output{note}. '
+        f"Showing {len(shown)}: conversation first, project folders before mu workspaces, "
+        "newest first."
     )
     for s in shown:
         sm = summarize(Path(s.path), term)
         where = "@".join(str(sm.meta[k]) for k in ("project", "branch") if sm.meta.get(k))
-        print(
-            f"\n{s.started()}  {s.host}  {where or label(s.folder)}  ({sm.hits} matching entries)"
-        )
+        counts = f"{sm.hits} turns, {sm.tool} tool entries"
+        print(f"\n{s.started()}  {s.host}  {where or label(s.folder)}  ({counts})")
         print(f"  file:  {s.path}\n  first: {sm.first}\n  match: {sm.match}")
     return 0
 
@@ -292,6 +399,12 @@ def parse(argv: list[str]) -> argparse.Namespace:
     f.add_argument("term")
     f.add_argument("project", nargs="?")
     f.add_argument("--limit", type=int, default=int(os.environ.get("MUSEUM_LIMIT", "20")))
+    f.add_argument(
+        "--skip",
+        metavar="SESSION_ID",
+        default=os.environ.get("PI_SESSION_ID", ""),
+        help="leave this session out (default: $PI_SESSION_ID, the one searching)",
+    )
     s = sub.add_parser("show", help="one session's conversation")
     s.add_argument("file")
     s.add_argument("term", nargs="?")
@@ -300,9 +413,11 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 def forward(ns: argparse.Namespace) -> list[str]:
     """The subcommand again, as words for the store host. The limit goes as a
-    flag because environment variables do not cross ssh."""
+    flag, like the session to skip, because environment variables do not cross
+    ssh."""
     if ns.cmd == "find":
-        return ["find", ns.term, *([ns.project] if ns.project else []), "--limit", str(ns.limit)]
+        words = ["find", ns.term, *([ns.project] if ns.project else [])]
+        return [*words, "--limit", str(ns.limit), "--skip", ns.skip]
     return ["show", ns.file, *([ns.term] if ns.term else [])]
 
 
@@ -326,7 +441,7 @@ def main(argv: list[str]) -> int:
     except OSError:
         return fail(f"cannot enter store {store}")
     if ns.cmd == "find":
-        return find(ns.term, ns.project, ns.limit)
+        return find(ns.term, ns.project, ns.limit, ns.skip)
     return show(ns.file, ns.term)
 
 
