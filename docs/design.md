@@ -24,6 +24,7 @@ The main goal is keeping every pi session safely backed up in one place. Search 
 - **A central SQLite FTS index.** SQLite locking does not work across rsync copies or network filesystems. It would need `ssh host sessidx …`, which means a binary installed on the host.
 - **Per-host index shards plus a merged cache on each client.** This works, but it adds complexity that occasional grep searches don't need.
 - **Hashed file names or content-addressed chunks.** They aren't needed, because per-host folders already rule out collisions and readable paths make it easy to narrow a search.
+- **Compressing session files (`.jsonl.zst`).** Search can handle it: `rg -z` reads plain and `.zst` files in one pass, and on the store `find` took about 1.2s instead of 0.4s. The cost is in the sync. rsync appends only to plain files, so a session the store has compressed gets uploaded whole on every sync. Stopping that means sending only recently changed files (`--files-from`), and then the sync no longer repairs the store by itself. The store host would also need `zstd`. Put the store on a compressing filesystem instead: on btrfs with `compress-force=zstd:3`, the 865M store takes 272M on disk. Compressing each file with zstd would bring it to 229M.
 - **Existing tools.** chronicle (git transport; rewrites session files) doesn't fit. adobe/pi-session-search (scans local files) is the fork candidate if `museum-search` proves too limited.
 
 ## Possible later additions

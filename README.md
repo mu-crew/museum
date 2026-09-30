@@ -19,6 +19,7 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 - **The store** is any ssh host plus folder (`host:/path`), or a local path.
 - **Append-only:** the sync never passes `--delete`, so sessions you delete locally stay in the store.
 - **No collisions:** each machine writes only its own `<hostname>/` folder, so nothing in the store needs locking or merging.
+- **Compression is left to the filesystem:** session files are plain JSONL, and they compress to about a third of their size. Put the store on a filesystem that compresses, such as btrfs mounted with `compress-force=zstd:3`.
 - **No daemon, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly with `skills/museum/scripts/museum-search`, as the `museum` skill describes.
 - **Repo metadata:** at session start the extension adds a `museum` custom entry to the session (not sent to the model) with the git repo, remote, branch, commit and mu workstream, so a session in a throwaway mu worktree still names its project.
 - **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock(2)`) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
