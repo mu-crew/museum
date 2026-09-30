@@ -1,170 +1,279 @@
-#!/bin/sh
-# Back up local pi sessions to the museum store. Append-only: nothing is ever deleted.
-#
-#   museum-sync --if-due   sync if the last one started over MUSEUM_INTERVAL ago
-#   museum-sync [--now]    sync now; if a sync is already running, it runs again after
-#
-# Many pi agents on one node call this at once, so at most one sync runs per
-# node. The lock is a kernel lock on a file descriptor (flock on Linux, lockf on
-# macOS): it dies with its holder, so a crash or reboot cannot leave it held. A
-# caller that finds the lock taken exits 0 at once; with --now it first leaves a
-# `pending` mark, and the holder syncs again before it lets go.
-#
-# Config: ~/.config/museum/config (shell syntax)
-#   STORE=host:/path   or   STORE=/local/path
-#   NAME=my-laptop     (optional, defaults to `hostname -s`)
-#   SSH_MUX_ONLY=1     (optional) sync only through a running ssh ControlMaster,
-#                      never a fresh connection: for hosts whose auth needs a
-#                      security-key touch or other human step
-set -eu
+#!/usr/bin/env python3
+"""Back up local pi sessions to the museum store. Append-only: nothing is ever deleted.
 
-CONFIG="${MUSEUM_CONFIG:-$HOME/.config/museum/config}"
-[ -f "$CONFIG" ] || {
-  echo "museum: missing $CONFIG (set STORE=host:/path)" >&2
-  exit 1
-}
-# shellcheck source=/dev/null
-. "$CONFIG"
-: "${STORE:?museum: STORE not set in $CONFIG}"
-NAME="${NAME:-$(hostname -s)}"
-SRC="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
-STATE_DIR="${MUSEUM_STATE_DIR:-$HOME/.cache/museum}"
-INTERVAL="${MUSEUM_INTERVAL:-600}"
-RETRY_DELAY="${MUSEUM_RETRY_DELAY:-30}"
-SSH_MUX_ONLY="${SSH_MUX_ONLY:-}"
+  museum-sync --if-due   sync if the last one started over MUSEUM_INTERVAL ago
+  museum-sync [--now]    sync now; if a sync is already running, it runs again after
 
-case "${1:---now}" in
-  --now) MODE=now ;;
-  --if-due) MODE=if-due ;;
-  *)
-    echo "usage: museum-sync [--if-due | --now]" >&2
-    exit 2
-    ;;
-esac
+Many pi agents on one node call this at once, so at most one sync runs per node.
+The lock is flock(2) on a file descriptor: it dies with its holder, so a crash or
+reboot cannot leave it held. A caller that finds the lock taken exits 0 at once;
+with --now it first leaves a `pending` mark, and the holder syncs again before it
+lets go.
 
-# The first rsync 3 found: PATH's, then Homebrew's. macOS /usr/bin/rsync is
-# openrsync, which lacks --append-verify.
-RSYNC=
-for r in "$(command -v rsync || true)" /opt/homebrew/bin/rsync /usr/local/bin/rsync; do
-  if [ -x "$r" ] && "$r" --version 2> /dev/null | grep -q '^rsync  *version 3'; then
-    RSYNC=$r
-    break
-  fi
-done
+Config: ~/.config/museum/config, KEY=value lines
+  STORE=host:/path   or   STORE=/local/path
+  NAME=my-laptop     (optional, defaults to the short hostname)
+  SSH_MUX_ONLY=1     (optional) sync only through a running ssh ControlMaster,
+                     never a fresh connection: for hosts whose auth needs a
+                     security-key touch or other human step
+"""
 
-mkdir -p "$STATE_DIR"
-# Marked BEFORE trying the lock, so a holder that is mid-sync sees it.
-[ "$MODE" = now ] && : > "$STATE_DIR/pending"
+from __future__ import annotations
 
-# A non-blocking lock on fd 9, released when the fd closes or the script dies.
-if command -v flock > /dev/null 2>&1; then
-  lock() { flock -n 9; }
-elif [ -x /usr/bin/lockf ]; then
-  lock() { /usr/bin/lockf -s -t 0 9; }
-else
-  echo "museum: no flock or lockf on this system" >&2
-  exit 1
-fi
-open_lock() { exec 9> "$STATE_DIR/lock"; }
-unlock() { exec 9>&-; }
+import argparse
+import fcntl
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import NamedTuple
 
-due() {
-  [ -f "$STATE_DIR/pending" ] && return 0
-  [ "$MODE" = if-due ] || return 1
-  last=$(cat "$STATE_DIR/last-start" 2> /dev/null || true)
-  [ $(($(date +%s) - ${last:-0})) -ge "$INTERVAL" ]
-}
-
-record() { # status message
-  printf 'status=%s\ntime=%s\nmessage=%s\n' "$1" "$(date +%s)" "$2" > "$STATE_DIR/state.tmp"
-  mv "$STATE_DIR/state.tmp" "$STATE_DIR/state"
-}
-
+HOME = Path.home()
+# Exit status of copy() when SSH_MUX_ONLY is set and no master is running.
+NO_MASTER = 90
+# rsync's "some files vanished before they could be transferred": fine here.
+RSYNC_VANISHED = 24
 # BatchMode: never prompt. The timeouts bound a hung connection, which would
 # otherwise hold the lock (and every later sync on this node) indefinitely.
-SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+SSH += ["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
 # Mux-only: a session over a master skips auth, so disabling every method
 # changes nothing there, but if the master dies between the check and rsync,
 # the fresh connection fails instead of asking for a key touch.
-[ -n "$SSH_MUX_ONLY" ] && SSH="$SSH -o PubkeyAuthentication=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o GSSAPIAuthentication=no -o HostbasedAuthentication=no"
+NO_AUTH = [
+    f"-o{m}=no"
+    for m in (
+        "PubkeyAuthentication",
+        "PasswordAuthentication",
+        "KbdInteractiveAuthentication",
+        "GSSAPIAuthentication",
+        "HostbasedAuthentication",
+    )
+]
 
-# Exit status of copy when SSH_MUX_ONLY is set and no master is running.
-NO_MASTER=90
 
-# errexit does not apply inside `$(copy)` used in a condition, hence the
-# explicit `|| return`. rsync 24 is "a file vanished mid-run", which is fine.
-# For an ssh store, the remote mkdir rides rsync's own connection
-# (--rsync-path), so a sync opens one ssh connection, not two.
-copy() {
-  case "$STORE" in
-    *:*)
-      host=${STORE%%:*}
-      # `-O check` only asks the local control socket; it never connects.
-      if [ -n "$SSH_MUX_ONLY" ] && ! $SSH -O check "$host" 2> /dev/null; then
-        echo "no ssh master for $host (run: ssh -MNf $host)"
-        return "$NO_MASTER"
-      fi
-      set -- --rsync-path="mkdir -p '${STORE#*:}/$NAME' && rsync"
-      ;;
-    *)
-      mkdir -p "$STORE/$NAME" || return
-      set --
-      ;;
-  esac
-  "$RSYNC" -a --append-verify --timeout=120 --include='*/' --include='*.jsonl' --exclude='*' \
-    "$@" -e "$SSH" "$SRC/" "$STORE/$NAME/" || [ $? -eq 24 ]
-}
+class Settings(NamedTuple):
+    store: str
+    name: str
+    src: Path
+    state: Path
+    interval: int
+    retry_delay: int
+    mux_only: bool
 
-# The subshell closes the lock fd first, so neither it nor ssh/rsync hold
-# the lock. Otherwise a killed script's orphans keep it, and every sync on
-# the node silently skips until they die.
-attempt() {
-  st=0
-  out=$(
-    exec 9>&-
-    copy 2>&1
-  ) || st=$?
-  return "$st"
-}
 
-sync_once() {
-  rm -f "$STATE_DIR/pending"
-  date +%s > "$STATE_DIR/last-start"
-  if [ -z "$RSYNC" ]; then
-    record error "rsync 3.x not found (macOS: brew install rsync)"
-    return 1
-  fi
-  attempt && {
-    record ok ""
-    return 0
-  }
-  # One retry, for a blip, only in mux-only mode with a live master: there it
-  # costs no human step. A fresh connection may need a key touch, and a
-  # missing master will not appear in $RETRY_DELAY seconds.
-  if [ -n "$SSH_MUX_ONLY" ] && [ "$st" -ne "$NO_MASTER" ]; then
-    printf '%s\nmuseum: retrying in %ss\n' "$out" "$RETRY_DELAY" >&2
-    sleep "$RETRY_DELAY"
-    attempt && {
-      record ok ""
-      return 0
-    }
-  fi
-  # ssh's or the remote mkdir's line says why; rsync's last line after it is only
-  # "connection unexpectedly closed" / "protocol data stream".
-  msg=$(printf '%s\n' "$out" | grep -E '^(ssh|mkdir): ' | tail -n 1)
-  record error "${msg:-$(printf '%s' "$out" | tail -n 1)}"
-  printf '%s\n' "$out" >&2
-  return 1
-}
+class Result(NamedTuple):
+    code: int
+    output: str
 
-rc=0
-open_lock
-while lock; do
-  while due; do sync_once || rc=1; done
-  unlock
-  # A --now caller may have set `pending` after our last check but before the
-  # unlock, then found the lock taken and left. Take it back and sync for it.
-  [ -f "$STATE_DIR/pending" ] || break
-  open_lock
-done
-exit "$rc"
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"museum: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def read_config(path: Path) -> dict[str, str]:
+    """KEY=value lines, shell-quoted values allowed, # comments ignored."""
+    config = {}
+    for line in path.read_text().splitlines():
+        for word in shlex.split(line, comments=True):
+            key, eq, value = word.partition("=")
+            if eq:
+                config[key] = value
+    return config
+
+
+def settings() -> Settings:
+    env = os.environ
+    path = Path(env.get("MUSEUM_CONFIG", HOME / ".config/museum/config"))
+    if not path.is_file():
+        die(f"missing {path} (set STORE=host:/path)")
+    config = read_config(path)
+    if not config.get("STORE"):
+        die(f"STORE not set in {path}")
+    return Settings(
+        store=config["STORE"],
+        name=config.get("NAME") or socket.gethostname().split(".")[0],
+        src=Path(env.get("PI_SESSIONS_DIR", HOME / ".pi/agent/sessions")),
+        state=Path(env.get("MUSEUM_STATE_DIR", HOME / ".cache/museum")),
+        interval=int(env.get("MUSEUM_INTERVAL", "600")),
+        retry_delay=int(env.get("MUSEUM_RETRY_DELAY", "30")),
+        mux_only=bool(config.get("SSH_MUX_ONLY") or env.get("SSH_MUX_ONLY")),
+    )
+
+
+def find_rsync() -> str | None:
+    """The first rsync 3: PATH's, then Homebrew's. macOS /usr/bin/rsync is
+    openrsync, which lacks --append-verify."""
+    for candidate in (shutil.which("rsync"), "/opt/homebrew/bin/rsync", "/usr/local/bin/rsync"):
+        if not candidate or not os.access(candidate, os.X_OK):
+            continue
+        try:
+            out = subprocess.run(
+                [candidate, "--version"], capture_output=True, text=True, check=False
+            ).stdout
+        except OSError:
+            continue
+        if re.match(r"rsync\s+version 3", out):
+            return candidate
+    return None
+
+
+def run(cmd: list[str]) -> Result:
+    """stdout and stderr merged, in the order the command wrote them. The lock
+    fd is not inheritable (PEP 446), so neither ssh nor rsync, nor an orphan
+    they leave behind, can keep holding the lock."""
+    try:
+        p = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+    except OSError as e:
+        return Result(1, f"{cmd[0]}: {e}")
+    return Result(p.returncode, p.stdout)
+
+
+def copy(s: Settings, rsync: str) -> Result:
+    ssh = SSH + NO_AUTH if s.mux_only else SSH
+    extra = []
+    if ":" in s.store:
+        host, path = s.store.split(":", 1)
+        # `-O check` only asks the local control socket; it never connects.
+        if s.mux_only and run([*ssh, "-O", "check", host]).code != 0:
+            return Result(NO_MASTER, f"no ssh master for {host} (run: ssh -MNf {host})")
+        # The remote mkdir rides rsync's own connection, so a sync opens one
+        # ssh connection, not two.
+        extra = [f"--rsync-path=mkdir -p {shlex.quote(f'{path}/{s.name}')} && rsync"]
+    else:
+        try:
+            Path(s.store, s.name).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return Result(1, f"mkdir: {e}")
+    r = run(
+        [
+            rsync,
+            "-a",
+            "--append-verify",
+            "--timeout=120",
+            "--include=*/",
+            "--include=*.jsonl",
+            "--exclude=*",
+            *extra,
+            "-e",
+            " ".join(ssh),
+            f"{s.src}/",
+            f"{s.store}/{s.name}/",
+        ]
+    )
+    return Result(0, r.output) if r.code == RSYNC_VANISHED else r
+
+
+def error_line(output: str) -> str:
+    """ssh's or the remote mkdir's line says why; rsync's last line after it is
+    only "connection unexpectedly closed" / "protocol data stream"."""
+    lines = [line for line in output.splitlines() if line.strip()]
+    why = [line for line in lines if re.match(r"(ssh|mkdir): ", line)]
+    return (why or lines or [""])[-1]
+
+
+def record(s: Settings, status: str, message: str) -> None:
+    tmp = s.state / "state.tmp"
+    message = " ".join(message.split())
+    tmp.write_text(f"status={status}\ntime={int(time.time())}\nmessage={message}\n")
+    tmp.replace(s.state / "state")
+
+
+def sync_once(s: Settings, rsync: str | None) -> bool:
+    (s.state / "pending").unlink(missing_ok=True)
+    (s.state / "last-start").write_text(f"{int(time.time())}\n")
+    if rsync is None:
+        record(s, "error", "rsync 3.x not found (macOS: brew install rsync)")
+        return False
+    r = copy(s, rsync)
+    # One retry, for a blip, only in mux-only mode with a live master: there it
+    # costs no human step. A fresh connection may need a key touch, and a
+    # missing master will not appear in retry_delay seconds.
+    if r.code != 0 and s.mux_only and r.code != NO_MASTER:
+        print(f"{r.output}museum: retrying in {s.retry_delay}s", file=sys.stderr)
+        time.sleep(s.retry_delay)
+        r = copy(s, rsync)
+    if r.code == 0:
+        record(s, "ok", "")
+        return True
+    record(s, "error", error_line(r.output))
+    print(r.output, file=sys.stderr, end="")
+    return False
+
+
+def due(s: Settings, if_due: bool) -> bool:
+    if (s.state / "pending").exists():
+        return True
+    if not if_due:
+        return False
+    try:
+        last = int((s.state / "last-start").read_text().strip())
+    except (OSError, ValueError):
+        last = 0
+    return time.time() - last >= s.interval
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="museum-sync",
+        description="Back up local pi sessions to the museum store.",
+    )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--if-due",
+        action="store_true",
+        help="sync only if the last sync started over MUSEUM_INTERVAL seconds ago",
+    )
+    mode.add_argument(
+        "--now",
+        action="store_true",
+        help="sync now; if a sync is running, it runs again after (the default)",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    if_due = parse(argv).if_due
+    s = settings()
+    s.state.mkdir(parents=True, exist_ok=True)
+    # Marked BEFORE trying the lock, so a holder that is mid-sync sees it.
+    if not if_due:
+        (s.state / "pending").touch()
+    rsync = find_rsync()
+    fd = os.open(s.state / "lock", os.O_WRONLY | os.O_CREAT, 0o644)
+    ok = True
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            break
+        # The interval gates only the first round: a sync this caller just ran
+        # is not a reason to run again, only a `pending` mark is.
+        while due(s, if_due):
+            ok = sync_once(s, rsync) and ok
+            if_due = False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        # A --now caller may have set `pending` after our last check but before
+        # the unlock, then found the lock taken and left. Take it back and sync
+        # for it.
+        if not (s.state / "pending").exists():
+            break
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

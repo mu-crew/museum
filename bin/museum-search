@@ -1,143 +1,338 @@
-#!/bin/sh
-# Search the museum store in one call.
-#
-#   museum-search find TERM [PROJECT]   matching sessions, ranked, one block each
-#   museum-search show FILE [TERM]      a session's user and assistant text; with
-#                                       TERM, only the turns that mention it and
-#                                       the turn either side
-#   museum-search --remote-command ...  print the command that runs the search on
-#                                       the store host, for a transport like mule
-#
-# TERM is a literal, matched case-insensitively. PROJECT narrows `find` to store
-# folders whose name contains it. FILE is a path relative to the store, as `find`
-# prints it. MUSEUM_LIMIT (default 20) caps the sessions `find` shows.
-#
-# `find` ranks project folders before mu workspace folders (.../mu/workspaces/...),
-# because orchestrator sessions hold the decisions and worker sessions repeat
-# them; within each group the newest session comes first.
-#
-# For an ssh store the script ships itself to the store host as one quoted
-# `sh -c` argument, so the remote login shell (zsh, bash, anything) only parses
-# a quoted string, and the store host needs rg and jq but no copy of museum.
-set -eu
+#!/usr/bin/env python3
+"""Search the museum store in one call.
 
-die() {
-  echo "museum-search: $*" >&2
-  exit 1
-}
+  museum-search find TERM [PROJECT] [--limit N]   matching sessions, ranked
+  museum-search show FILE [TERM]                  a session's user and assistant
+                                                  text; with TERM, only the turns
+                                                  that mention it, plus one on
+                                                  either side
+  museum-search --remote-command ...              print the command that runs the
+                                                  search on the store host, for a
+                                                  transport like mule
 
-# Single-quote one word for a POSIX shell.
-q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+TERM is a literal, matched case-insensitively. PROJECT narrows `find` to store
+folders whose name contains it. FILE is a path relative to the store, as `find`
+prints it.
 
-# Escape a literal for an rg regex.
-re() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|/]/\\&/g'; }
+`find` ranks project folders before mu workspace folders (.../mu/workspaces/...),
+because orchestrator sessions hold the decisions and worker sessions carry them
+out; within each group the newest session comes first.
 
-# A store folder name as a short project label: the home prefix goes, and
-# mu workspaces become mu:<workstream>-<agent>.
-label() {
-  printf '%s' "$1" | sed -E 's/^--//; s/--$//; s/^(Users|home|var-home)-[^-]+-//; s/^\.local-state-mu-workspaces-/mu:/'
-}
+For an ssh store the script runs on the store host: ssh starts `python3 -` there
+and this file arrives on stdin, so the store host needs python3 and nothing from
+museum. rg makes `find` faster where it is installed, and is optional.
+"""
 
-# The text blocks of a user or assistant message; content is a string or blocks.
-JQ_TEXT='[.message.content | if type == "string" then . else (.[]? | select(.type == "text") | .text) end] | join(" ")'
+from __future__ import annotations
 
-cmd_find() {
-  [ $# -ge 1 ] && [ -n "$1" ] || die "usage: museum-search find TERM [PROJECT]"
-  term=$1 project=${2:-}
-  if [ -n "$project" ]; then
-    set -- */*"$project"*/
-    [ -d "$1" ] || die "no store folder matches *$project*"
-  else
-    set -- .
-  fi
-  tab=$(printf '\t')
-  files=$(rg -l -i -F -g '*.jsonl' -- "$term" "$@" < /dev/null | sed 's|^\./||' |
-    awk -F/ '{ print ($2 ~ /-mu-workspaces-/ ? 1 : 0) "\t" $NF "\t" $0 }' |
-    sort -t "$tab" -k1,1n -k2,2r | cut -f3)
-  [ -n "$files" ] || {
-    echo "no session mentions: $term"
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, NamedTuple
+
+MU_WORKSPACE = "-mu-workspaces-"
+SNIPPET = 100  # characters of context either side of a match
+
+
+class Session(NamedTuple):
+    path: str  # relative to the store: host/folder/file.jsonl
+    host: str
+    folder: str
+    name: str
+
+    @classmethod
+    def of(cls, path: str) -> Session:
+        host, folder, name = path.split("/", 2)
+        return cls(path, host, folder, name)
+
+    def rank(self) -> tuple[bool, str]:
+        """Sort key: project folders first, then newest first (by name, which
+        starts with the ISO start time). Negated with a reverse sort."""
+        return (MU_WORKSPACE not in self.folder, self.name)
+
+    def started(self) -> str:
+        m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})", self.name)
+        return f"{m[1]} {m[2]}:{m[3]}" if m else self.name
+
+
+def label(folder: str) -> str:
+    """A store folder as a short project label: the home prefix goes, and mu
+    workspaces become mu:<workstream>-<agent>."""
+    s = re.sub(r"^--|--$", "", folder)
+    s = re.sub(r"^(Users|home|var-home)-[^-]+-", "", s)
+    return re.sub(r"^\.local-state-mu-workspaces-", "mu:", s)
+
+
+def needle(term: str) -> str:
+    """TERM as it appears inside a JSON string in a session file, lowercased:
+    quotes and backslashes are escaped there, and non-ASCII is not."""
+    return json.dumps(term, ensure_ascii=False)[1:-1].lower()
+
+
+def entries(path: Path) -> Iterator[dict[str, Any]]:
+    """Every entry of a session. A torn last line, from a session still being
+    written, is skipped."""
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                yield entry
+
+
+def text(entry: dict[str, Any]) -> str | None:
+    """A user or assistant message's text blocks, joined; None for anything
+    else. Content is a string or a list of blocks."""
+    if entry.get("type") != "message":
+        return None
+    message = entry.get("message") or {}
+    if message.get("role") not in ("user", "assistant"):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    blocks = content if isinstance(content, list) else []
+    return " ".join(
+        b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+    )
+
+
+def squash(s: str) -> str:
+    return " ".join(s.split())
+
+
+def snippet(s: str, term: str) -> str | None:
+    i = s.lower().find(term.lower())
+    if i < 0:
+        return None
+    return s[max(0, i - SNIPPET) : i + len(term) + SNIPPET]
+
+
+def matching_files(dirs: list[str], term: str) -> list[str]:
+    """Store-relative paths of the sessions whose raw text contains TERM."""
+    raw = needle(term)
+    rg = shutil.which("rg")
+    if rg:
+        out = subprocess.run(
+            [rg, "-l", "-i", "-F", "-g", "*.jsonl", "--", raw, *dirs],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        return [p.removeprefix("./") for p in out.splitlines()]
+    found = []
+    for d in dirs:
+        # The store is <host>/<folder>/<session>.jsonl; a PROJECT dir is <host>/<folder>.
+        for path in Path(d).glob("*/*/*.jsonl" if d == "." else "*.jsonl"):
+            with path.open(encoding="utf-8", errors="replace") as f:
+                if any(raw in line.lower() for line in f):
+                    found.append(str(path))
+    return found
+
+
+class Summary(NamedTuple):
+    hits: int  # entries that mention TERM anywhere, tool output included
+    meta: dict[str, Any]  # the museum custom entry's data, if the session has one
+    first: str  # the first user message
+    match: str  # the first mention in conversation text, else in any entry
+
+
+def summarize(path: Path, term: str) -> Summary:
+    raw = needle(term)
+    hits, meta, first, match, fallback = 0, {}, "", "", ""
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            mentions = raw in line.lower()
+            hits += mentions
+            # Parse only the lines that can still add something: some lines are
+            # several MB of tool output.
+            wanted = (not first and '"user"' in line) or (not meta and '"museum"' in line)
+            if not (wanted or (mentions and not match)):
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if not meta and entry.get("customType") == "museum":
+                meta = entry.get("data") or {}
+            body = text(entry)
+            if body is None:
+                # Tool output rarely says what was decided: only a fallback.
+                if mentions and not fallback:
+                    fallback = snippet(squash(json.dumps(entry, ensure_ascii=False)), term) or ""
+                continue
+            if not first and entry["message"]["role"] == "user":
+                first = squash(body)[:160]
+            if mentions and not match:
+                match = snippet(squash(body), term) or ""
+    return Summary(hits, meta, first, match or fallback)
+
+
+def find(term: str, project: str | None, limit: int) -> int:
+    if project:
+        dirs = sorted(str(p) for p in Path().glob(f"*/*{project}*") if p.is_dir())
+        if not dirs:
+            return fail(f"no store folder matches *{project}*")
+    else:
+        dirs = ["."]
+    sessions = sorted(map(Session.of, matching_files(dirs, term)), key=Session.rank, reverse=True)
+    if not sessions:
+        print(f'no session mentions "{term}"')
+        return 0
+    shown = sessions[:limit]
+    print(
+        f'{len(sessions)} sessions mention "{term}"; showing {len(shown)}. '
+        "Project folders first, then mu workspaces; newest first."
+    )
+    for s in shown:
+        sm = summarize(Path(s.path), term)
+        where = "@".join(str(sm.meta[k]) for k in ("project", "branch") if sm.meta.get(k))
+        print(
+            f"\n{s.started()}  {s.host}  {where or label(s.folder)}  ({sm.hits} matching entries)"
+        )
+        print(f"  file:  {s.path}\n  first: {sm.first}\n  match: {sm.match}")
     return 0
-  }
-  total=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
-  limit=${MUSEUM_LIMIT:-20}
-  echo "$total sessions mention \"$term\"; showing $((total < limit ? total : limit)). Project folders first, then mu workspaces; newest first."
-  pattern=".{0,100}$(re "$term").{0,100}"
-  printf '%s\n' "$files" | head -n "$limit" | while IFS= read -r f; do
-    rest=${f#*/} name=${f##*/}
-    when=$(printf '%s' "$name" | sed -E 's/^([0-9-]{10})T([0-9]{2})-([0-9]{2}).*/\1 \2:\3/')
-    meta=$(rg -m1 -F '"customType":"museum"' "$f" < /dev/null |
-      jq -r '.data | [.project, .branch] | map(select(. != null and . != "")) | join("@")' 2> /dev/null || true)
-    hits=$(rg -c -i -F -- "$term" "$f" < /dev/null || true)
-    first=$(rg -m1 -F '"role":"user"' "$f" < /dev/null |
-      jq -r "select(.type == \"message\") | $JQ_TEXT | gsub(\"\\\\s+\"; \" \") | .[0:160]" 2> /dev/null || true)
-    # The first mention in conversation text; tool output (tables, file dumps)
-    # is the fallback, because it rarely says what was decided.
-    snip=$(rg -i -F -- "$term" "$f" < /dev/null |
-      jq -R -r "fromjson? | select(.type == \"message\" and (.message.role == \"user\" or .message.role == \"assistant\")) | $JQ_TEXT | gsub(\"\\\\s+\"; \" \")" 2> /dev/null |
-      rg -o -m1 -i -- "$pattern" | head -n 1 || true)
-    [ -n "$snip" ] || snip=$(rg -o -m1 -i -- "$pattern" "$f" < /dev/null | head -n 1 | sed 's/\\[nt]/ /g; s/\\"/"/g' || true)
-    snip=$(printf '%s' "$snip" | cut -c1-240)
-    printf '\n%s  %s  %s  (%s matching entries)\n' "$when" "${f%%/*}" "${meta:-$(label "${rest%%/*}")}" "$hits"
-    printf '  file:  %s\n  first: %s\n  match: %s\n' "$f" "$first" "$snip"
-  done
-}
 
-cmd_show() {
-  [ $# -ge 1 ] || die "usage: museum-search show FILE [TERM]"
-  [ -f "$1" ] || die "no such session in the store: $1"
-  head -n 1 "$1" | jq -r '"cwd: \(.cwd)"' 2> /dev/null || true
-  rg -m1 -F '"customType":"museum"' "$1" < /dev/null | jq -c '"repo: \(.data)"' -r 2> /dev/null || true
-  # -R with fromjson? skips a torn last line from a session still being written.
-  jq -R -n -r --arg t "${2:-}" "
-    [inputs | fromjson? | select(.type == \"message\" and (.message.role == \"user\" or .message.role == \"assistant\"))
-      | {ts: .timestamp, role: .message.role, text: ($JQ_TEXT)} | select(.text != \"\")] as \$m
-    | (\$t | ascii_downcase) as \$lt
-    | [range(0; \$m | length) | select(\$lt == \"\" or (\$m[.].text | ascii_downcase | contains(\$lt)))]
-    | [.[] | (. - 1, ., . + 1)] | unique | map(select(. >= 0 and . < (\$m | length))) as \$keep
-    | \$keep | to_entries[]
-    | (if .key > 0 and .value != \$keep[.key - 1] + 1 then \"...\n\" else \"\" end)
-      + (\$m[.value] | \"[\\(.ts)] \\(.role): \\(.text[0:1500])\")
-  " "$1"
-}
 
-main() {
-  print=
-  [ "${1:-}" = --remote-command ] && print=1 && shift
-  if [ "${1:-}" = --store ]; then
-    dir=$2
-    shift 2
-  else
-    config="${MUSEUM_CONFIG:-$HOME/.config/museum/config}"
-    [ -f "$config" ] || die "missing $config; search ~/.pi/agent/sessions by hand"
-    # shellcheck source=/dev/null
-    . "$config"
-    : "${STORE:?museum-search: STORE not set in $config}"
-    case "$STORE" in
-      *:*)
-        host=${STORE%%:*}
-        # env, not a VAR=x prefix: every login shell (fish too) runs `env`.
-        cmd="env MUSEUM_LIMIT=$(q "${MUSEUM_LIMIT:-20}") sh -c $(q "$(cat "$0")") museum-search --store $(q "${STORE#*:}")"
-        for a in "$@"; do cmd="$cmd $(q "$a")"; done
-        if [ -n "$print" ]; then
-          printf '%s\n' "$cmd"
-          return 0
-        fi
-        if [ -n "${SSH_MUX_ONLY:-}" ] && ! ssh -O check "$host" 2> /dev/null; then
-          die "no ssh master for $host (run: ssh -MNf $host)"
-        fi
-        exec ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "$cmd"
-        ;;
-      *) dir=$STORE ;;
-    esac
-  fi
-  cd "$dir" || die "cannot enter store $dir"
-  sub=${1:-}
-  [ $# -gt 0 ] && shift
-  case "$sub" in
-    find) cmd_find "$@" ;;
-    show) cmd_show "$@" ;;
-    *) die "usage: museum-search find TERM [PROJECT] | show FILE [TERM]" ;;
-  esac
-}
+def window(texts: list[str], term: str | None) -> list[int]:
+    """Indexes of the turns to print: all of them, or the ones that mention
+    TERM plus one on either side."""
+    if not term:
+        return list(range(len(texts)))
+    t = term.lower()
+    hits = [i for i, s in enumerate(texts) if t in s.lower()]
+    return sorted({j for i in hits for j in (i - 1, i, i + 1) if 0 <= j < len(texts)})
 
-main "$@"
+
+def show(file: str, term: str | None) -> int:
+    path = Path(file)
+    if not path.is_file():
+        return fail(f"no such session in the store: {file}")
+    turns = []
+    for entry in entries(path):
+        if entry.get("type") == "session":
+            print(f"cwd: {entry.get('cwd', '')}")
+        elif entry.get("customType") == "museum":
+            print(f"repo: {json.dumps(entry.get('data'), ensure_ascii=False)}")
+        body = text(entry)
+        if body:
+            turns.append((entry.get("timestamp", ""), entry["message"]["role"], body))
+    keep = window([body for _, _, body in turns], term)
+    for n, i in enumerate(keep):
+        if n > 0 and i != keep[n - 1] + 1:
+            print("...")
+        ts, role, body = turns[i]
+        print(f"[{ts}] {role}: {body[:1500]}")
+    return 0
+
+
+def fail(msg: str) -> int:
+    print(f"museum-search: {msg}", file=sys.stderr)
+    return 1
+
+
+def read_config(path: Path) -> dict[str, str]:
+    """KEY=value lines, shell-quoted values allowed, # comments ignored."""
+    config = {}
+    for line in path.read_text().splitlines():
+        for word in shlex.split(line, comments=True):
+            key, eq, value = word.partition("=")
+            if eq:
+                config[key] = value
+    return config
+
+
+def remote(host: str, store: str, args: list[str], mux_only: bool, print_only: bool) -> int:
+    """Run this script on the store host. ssh gets it on stdin, so the remote
+    login shell (zsh, bash, fish) only parses a few quoted words; mule has no
+    stdin, so --remote-command prints the source inline instead."""
+    words = ["--store", store, *args]
+    if print_only:
+        src = Path(__file__).read_text()
+        print(shlex.join(["python3", "-c", src, *words]))
+        return 0
+    if (
+        mux_only
+        and subprocess.run(
+            ["ssh", "-O", "check", host], capture_output=True, check=False
+        ).returncode
+    ):
+        return fail(f"no ssh master for {host} (run: ssh -MNf {host})")
+    with Path(__file__).open("rb") as src:
+        cmd = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            host,
+            shlex.join(["python3", "-", *words]),
+        ]
+        return subprocess.run(cmd, stdin=src, check=False).returncode
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="museum-search", description=__doc__.split("\n\n")[0])
+    p.add_argument("--store", help="search this store folder here, ignoring the config")
+    p.add_argument("--remote-command", action="store_true", help="print the store-host command")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("find", help="matching sessions, ranked")
+    f.add_argument("term")
+    f.add_argument("project", nargs="?")
+    f.add_argument("--limit", type=int, default=int(os.environ.get("MUSEUM_LIMIT", "20")))
+    s = sub.add_parser("show", help="one session's conversation")
+    s.add_argument("file")
+    s.add_argument("term", nargs="?")
+    return p.parse_args(argv)
+
+
+def forward(ns: argparse.Namespace) -> list[str]:
+    """The subcommand again, as words for the store host. The limit goes as a
+    flag because environment variables do not cross ssh."""
+    if ns.cmd == "find":
+        return ["find", ns.term, *([ns.project] if ns.project else []), "--limit", str(ns.limit)]
+    return ["show", ns.file, *([ns.term] if ns.term else [])]
+
+
+def main(argv: list[str]) -> int:
+    ns = parse(argv)
+    store = ns.store
+    if store is None:
+        config_path = Path(os.environ.get("MUSEUM_CONFIG", Path.home() / ".config/museum/config"))
+        if not config_path.is_file():
+            return fail(f"missing {config_path}; search ~/.pi/agent/sessions by hand")
+        config = read_config(config_path)
+        store = config.get("STORE") or ""
+        if not store:
+            return fail(f"STORE not set in {config_path}")
+        if ":" in store:
+            host, path = store.split(":", 1)
+            mux_only = bool(config.get("SSH_MUX_ONLY"))
+            return remote(host, path, forward(ns), mux_only, ns.remote_command)
+    try:
+        os.chdir(store)
+    except OSError:
+        return fail(f"cannot enter store {store}")
+    if ns.cmd == "find":
+        return find(ns.term, ns.project, ns.limit)
+    return show(ns.file, ns.term)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:  # `| head`
+        sys.stderr.close()
+        sys.exit(0)

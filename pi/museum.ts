@@ -77,7 +77,7 @@ function read(name: string): string {
 }
 
 function run(mode: "--if-due" | "--now", delayS = 0): void {
-  // Cheap pre-check, so ten agents settling does not fork ten shells. The
+  // Cheap pre-check, so ten agents settling does not start ten Pythons. The
   // script re-checks under its lock; this is only an optimisation.
   if (mode === "--if-due") {
     const last = Number(read("last-start").trim()) || 0;

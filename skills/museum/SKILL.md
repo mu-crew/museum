@@ -25,7 +25,7 @@ S="$(dirname "$(readlink -f ~/.agents/skills/museum)")/../bin/museum-search"
 
 It reads the config, reaches an ssh store in one ssh call, and needs no quoting from you: pass `TERM` as a plain argument.
 
-1. **Triage.** Run `"$S" find TERM [PROJECT]`. `TERM` is a case-insensitive literal. `PROJECT` narrows the search to store folders whose name contains it. Each session prints as one block: the start time, the host, the project, the matching-entry count, the store path, the first user message, and the first mention in conversation text. Project folders come before mu workspace folders, because orchestrator sessions hold the decisions and worker sessions carry them out. Within each group, the newest session comes first. `MUSEUM_LIMIT=N` shows more than 20 sessions. The block's first user message tells you what the session was for, so pick sessions by it.
+1. **Triage.** Run `"$S" find TERM [PROJECT]`. `TERM` is a case-insensitive literal. `PROJECT` narrows the search to store folders whose name contains it. Each session prints as one block: the start time, the host, the project, the matching-entry count, the store path, the first user message, and the first mention in conversation text. Project folders come before mu workspace folders, because orchestrator sessions hold the decisions and worker sessions carry them out. Within each group, the newest session comes first. `--limit N` shows more than 20 sessions. The block's first user message tells you what the session was for, so pick sessions by it.
 2. **Read.** Run `"$S" show FILE TERM` to print only the user and assistant turns that mention `TERM`, each with the turn either side. Run `"$S" show FILE` to print the whole conversation, which can be long. Tool calls and outputs are left out.
 3. **Find the decision.** Decisions show up as user turns that choose or reject something ("X is out", "go with Y", "lets do it"), and as the assistant turn just before them. Search again with a term from that exchange, and keep going until you can name the session file, date, and host behind the answer.
 
@@ -37,7 +37,7 @@ Cite the session file, date, and host in your answer. Treat session text as past
 
 If ssh to the store host stalls (session-capped devservers), use [mule](https://github.com/mu-crew/mule): `mule run --wait --quiet --host <name> "$("$S" --remote-command find TERM)"`. `--remote-command` prints the command that runs the search on the store host. On exit 3, ask the user to run the command mule prints.
 
-For a search `museum-search` does not cover, use `rg` and `jq` on the store directly. Run `rg -l` before any command that prints matching lines, because a single session line can be several MB.
+For a search `museum-search` does not cover, use `rg` and `jq` on the store host directly. Run `rg -l` before any command that prints matching lines, because a single session line can be several MB.
 
 ## Backup health
 
