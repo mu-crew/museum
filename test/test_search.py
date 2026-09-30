@@ -144,6 +144,7 @@ class Store(unittest.TestCase):
         self.assertEqual(
             self.files(out),
             [
+                # Both project sessions say it in one turn: newest first.
                 f"pc/{HAIL}/2026-06-07T09-42-00-000Z_b.jsonl",
                 f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl",
                 f"pc/{WORKER}/2026-06-08T00-00-00-000Z_c.jsonl",
@@ -151,11 +152,18 @@ class Store(unittest.TestCase):
                 f"pc/{HAIL}/2026-09-01T00-00-00-000Z_f.jsonl",
             ],
         )
-        self.assertIn(
-            '"STALWART": 3 sessions in conversation, 1 only in tool output; '
-            "1 more only in a system prompt",
-            out,
-        )
+        self.assertIn('"STALWART": 3 sessions in conversation, 1 only in tool output.', out)
+
+    def test_find_ranks_the_longer_discussion_first_unless_newest(self) -> None:
+        older = f"pc/{HAIL}/2025-01-01T00-00-00-000Z_i.jsonl"
+        turns = [msg("user", "zeta?"), msg("assistant", "zeta is a"), msg("user", "and zeta b")]
+        write_session(self.dir, older, turns)
+        newer = f"pc/{HAIL}/2026-12-01T00-00-00-000Z_j.jsonl"
+        write_session(self.dir, newer, [msg("user", "zeta once")])
+        self.assertEqual(self.files(self.run_search("find", "zeta").stdout), [older, newer])
+        out = self.run_search("find", "zeta", "--newest").stdout
+        self.assertEqual(self.files(out), [newer, older])
+        self.assertIn("newest first.", out)
 
     def test_find_skips_the_searching_session_unless_told_otherwise(self) -> None:
         self.assertNotIn(SELF, self.run_search("find", "decide about").stdout)
@@ -171,7 +179,7 @@ class Store(unittest.TestCase):
         out = self.run_search("find", "zebra").stdout
         self.assertEqual(
             out.strip(),
-            'no session mentions "zebra"; 1 more only in a system prompt (AGENTS.md, docs, skills)',
+            'no session mentions "zebra" outside a system prompt (AGENTS.md, docs, skills)',
         )
 
     def test_find_block_prefers_conversation_text_and_metadata(self) -> None:
@@ -194,7 +202,7 @@ class Store(unittest.TestCase):
                 self.assertIn("1 sessions in conversation", out)
 
     def test_find_misses(self) -> None:
-        self.assertEqual(self.run_search("find", "zzqq").stdout, 'no session mentions "zzqq"\n')
+        self.assertIn('no session mentions "zzqq"', self.run_search("find", "zzqq").stdout)
         r = self.run_search("find", "x", "nosuchproject")
         self.assertEqual(r.returncode, 1)
         self.assertIn("no store folder matches", r.stderr)
@@ -218,6 +226,11 @@ class Store(unittest.TestCase):
         self.assertNotIn("table", out)
         self.assertEqual(out.count("] user:"), 1)
         self.assertNotIn("...", out)
+
+    def test_show_users_prints_the_arc(self) -> None:
+        out = self.run_search("show", f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl", "--users")
+        turns = [line.split("] ", 1)[1] for line in out.stdout.splitlines()[1:]]
+        self.assertEqual(turns, ["user: brainstorm a hey.com clone", "user: go is out, rust vs ts"])
 
     def test_show_missing_file(self) -> None:
         r = self.run_search("show", "nope.jsonl")
@@ -247,10 +260,24 @@ class Units(unittest.TestCase):
         self.assertEqual(search.window(texts, "x"), [1, 2, 3, 5, 6])
         self.assertEqual(search.window(texts, None), list(range(7)))
 
+    def test_scan_drops_system_prompt_only_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            write_session(
+                Path(d),
+                "h/f/s.jsonl",
+                [{"type": "message", "message": {"role": "system", "sections": {"a": "Zed"}}}],
+            )
+            self.assertIsNone(search.scan(Path(d, "h/f/s.jsonl"), "zed"))
+            write_session(Path(d), "h/f/t.jsonl", [msg("user", "zed"), msg("user", "zed again")])
+            self.assertEqual(search.scan(Path(d, "h/f/t.jsonl"), "ZED"), (search.CONVERSATION, 2))
+
     def test_forward_carries_the_limit(self) -> None:
         ns = search.parse(["find", "t", "--limit", "3", "--skip", "me"])
         self.assertEqual(search.forward(ns), ["find", "t", "--limit", "3", "--skip", "me"])
         self.assertEqual(search.forward(search.parse(["show", "f", "t"])), ["show", "f", "t"])
+        ns = search.parse(["find", "t", "--newest", "--skip", ""])
+        self.assertEqual(search.forward(ns)[-1], "--newest")
+        self.assertEqual(search.forward(search.parse(["show", "f", "--users"]))[-1], "--users")
 
     def test_remote_command_is_one_shell_command(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".conf") as conf:

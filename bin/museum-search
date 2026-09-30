@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Search the museum store in one call.
 
-  museum-search find TERM [PROJECT] [--limit N]   matching sessions, ranked
-  museum-search show FILE [TERM]                  a session's user and assistant
+  museum-search find TERM [PROJECT] [--limit N] [--newest]
+                                                  matching sessions, ranked
+  museum-search show FILE [TERM] [--users]        a session's user and assistant
                                                   text; with TERM, only the turns
                                                   that mention it, plus one on
-                                                  either side
+                                                  either side; --users, only the
+                                                  user turns, one line each
   museum-search --remote-command ...              print the command that runs the
                                                   search on the store host, for a
                                                   transport like mule
@@ -19,7 +21,9 @@ or assistant turn come before those where only tool output does; sessions where
 only the recorded system prompt does (AGENTS.md, docs, skills: the same in every
 session of a project) are left out. Within each tier, project folders come before
 mu workspace folders (.../mu/workspaces/...), because orchestrator sessions hold
-the decisions and worker sessions carry them out; then the newest comes first.
+the decisions and worker sessions carry them out. Then the sessions that discuss
+TERM in the most turns come first, because the session that debated a topic
+outranks a newer one that mentions it in passing; --newest orders by date.
 The session running the search ($PI_SESSION_ID, sent as --skip) is left out too.
 
 For an ssh store the script runs on the store host: ssh starts `python3 -` there
@@ -76,10 +80,9 @@ class Session(NamedTuple):
     def id(self) -> str:
         return self.name.removesuffix(".jsonl").rpartition("_")[2]
 
-    def rank(self) -> tuple[bool, str]:
-        """Sort key within a tier: project folders first, then newest first (by
-        name, which starts with the ISO start time). Use with a reverse sort."""
-        return (MU_WORKSPACE not in self.folder, self.name)
+    def project(self) -> bool:
+        """In a project folder, not a mu workspace: where decisions are made."""
+        return MU_WORKSPACE not in self.folder
 
     def started(self) -> str:
         m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})", self.name)
@@ -165,56 +168,70 @@ def said(line: str, term: str) -> bool:
     return body is not None and term.lower() in body.lower()
 
 
-def matching_files(dirs: list[str], term: str) -> dict[str, int]:
-    """Store-relative paths of the sessions that mention TERM, each with the
-    best tier it appears in."""
-    raw = needle(term)
+class Match(NamedTuple):
+    tier: int
+    turns: int  # lines that may be a turn saying TERM: the ranking weight
+
+
+def counts(lines: list[str]) -> dict[str, int]:
+    """`rg -c` output lines (path:count) as a map."""
+    out = {}
+    for line in lines:
+        path, _, n = line.rpartition(":")
+        out[path.removeprefix("./")] = int(n)
+    return out
+
+
+def matching_files(dirs: list[str], term: str) -> dict[str, Match]:
+    """Store-relative paths of the sessions that mention TERM outside the
+    system prompt, each with its best tier and weight."""
     if not shutil.which("rg"):
         found = {}
         for d in dirs:
             # The store is <host>/<folder>/<session>.jsonl; a PROJECT dir is <host>/<folder>.
             for path in Path(d).glob("*/*/*.jsonl" if d == "." else "*.jsonl"):
-                t = best_tier(path, term)
-                if t is not None:
-                    found[str(path)] = t
+                m = scan(path, term)
+                if m is not None:
+                    found[str(path)] = m
         return found
-    # Three rg passes, about 0.5s each on a 1.3GB store, where reading every
-    # mention in Python takes about 6s. rg's regex syntax rejects some of
-    # re.escape's escapes (a space), so escape only what is special in both.
+    # Three rg passes, about 0.5s each on a 1.3GB store, and no file read in
+    # Python: reading every mention takes about 6s. rg's regex syntax rejects
+    # some of re.escape's escapes (a space), so escape only what both treat as
+    # special.
+    raw = needle(term)
     lit = re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", raw)
-    anywhere = {p.removeprefix("./") for p in rg(["-l", "-F", raw], dirs)}
-    tiers = dict.fromkeys(anywhere, TOOL)
-    # Lines that may be a turn saying TERM; Python confirms one per session.
-    for hit in rg(
-        ["--with-filename", "-e", rf'"message":\{{"role":"(user|assistant)".*{lit}'], dirs
-    ):
+    # A session whose every mention sits in the recorded system prompt is not
+    # a mention: comparing the two counts says so.
+    mentions = counts(rg(["-c", "-F", raw], dirs))
+    system = counts(rg(["-c", "-e", rf'"message":\{{"role":"system".*{lit}'], dirs))
+    found = {p: Match(TOOL, 0) for p, n in mentions.items() if system.get(p, 0) < n}
+    # Lines that may be a turn saying TERM. The regex cannot tell a turn's text
+    # from its thinking or tool calls, so Python confirms until one passes.
+    turn = rf'"message":\{{"role":"(user|assistant)".*{lit}'
+    for hit in rg(["--with-filename", "-e", turn], dirs):
         path, _, line = hit.partition(":")
-        path = path.removeprefix("./")
-        if tiers.get(path) == TOOL and said(line, term):
-            tiers[path] = CONVERSATION
-    # A session left at TOOL whose mentions all sit in the recorded system
-    # prompt is not a mention. System lines are few, so this pass is cheap.
-    in_system = rg(["-l", "-e", rf'"message":\{{"role":"system".*{lit}'], dirs)
-    for path in {p.removeprefix("./") for p in in_system}:
-        best = best_tier(Path(path), term)
-        if tiers.get(path) == TOOL and best is not None:
-            tiers[path] = best
-    return tiers
+        m = found.get(path.removeprefix("./"))
+        if m is None:
+            continue
+        said_it = m.tier == CONVERSATION or said(line, term)
+        found[path.removeprefix("./")] = Match(CONVERSATION if said_it else TOOL, m.turns + 1)
+    return found
 
 
-def best_tier(path: Path, term: str) -> int | None:
-    raw, best = needle(term), None
+def scan(path: Path, term: str) -> Match | None:
+    """matching_files for one session, without rg."""
+    raw, best, turns = needle(term), SYSTEM + 1, 0
     with path.open(encoding="utf-8", errors="replace") as f:
         for line in f:
             if raw not in line.lower():
                 continue
             t = tier(line)
-            if t == CONVERSATION and not said(line, term):
-                t = TOOL
-            best = t if best is None else min(best, t)
-            if best == CONVERSATION:
-                break
-    return best
+            if t == CONVERSATION:
+                turns += 1
+                if best != CONVERSATION and not said(line, term):
+                    t = TOOL
+            best = min(best, t)
+    return Match(best, turns) if best < SYSTEM else None
 
 
 class Summary(NamedTuple):
@@ -279,36 +296,37 @@ def strings(value: object) -> Iterator[str]:
             yield from strings(v)
 
 
-def find(term: str, project: str | None, limit: int, skip: str) -> int:
+def find(term: str, project: str | None, limit: int, skip: str, newest: bool) -> int:
     if project:
         dirs = sorted(str(p) for p in Path().glob(f"*/*{project}*") if p.is_dir())
         if not dirs:
             return fail(f"no store folder matches *{project}*")
     else:
         dirs = ["."]
-    tiers = {
-        s: t for p, t in matching_files(dirs, term).items() if (s := Session.of(p)).id() != skip
-    }
-    talk = [s for s, t in tiers.items() if t == CONVERSATION]
-    tools = [s for s, t in tiers.items() if t == TOOL]
-    ranked = sorted(talk, key=Session.rank, reverse=True)
-    ranked += sorted(tools, key=Session.rank, reverse=True)
-    skipped = len(tiers) - len(ranked)
-    note = f"; {skipped} more only in a system prompt (AGENTS.md, docs, skills)" if skipped else ""
+    found = matching_files(dirs, term)
+    matches = {s: m for p, m in found.items() if (s := Session.of(p)).id() != skip}
+
+    def key(s: Session) -> tuple[bool, int, str]:
+        return (s.project(), 0 if newest else matches[s].turns, s.name)
+
+    talk = [s for s, m in matches.items() if m.tier == CONVERSATION]
+    tools = [s for s, m in matches.items() if m.tier == TOOL]
+    ranked = sorted(talk, key=key, reverse=True) + sorted(tools, key=key, reverse=True)
     if not ranked:
-        print(f'no session mentions "{term}"{note}')
+        print(f'no session mentions "{term}" outside a system prompt (AGENTS.md, docs, skills)')
         return 0
     shown = ranked[:limit]
+    order = "newest" if newest else "most turns"
     print(
-        f'"{term}": {len(talk)} sessions in conversation, {len(tools)} only in tool output{note}. '
+        f'"{term}": {len(talk)} sessions in conversation, {len(tools)} only in tool output. '
         f"Showing {len(shown)}: conversation first, project folders before mu workspaces, "
-        "newest first."
+        f"{order} first."
     )
     for s in shown:
         sm = summarize(Path(s.path), term)
         where = "@".join(str(sm.meta[k]) for k in ("project", "branch") if sm.meta.get(k))
-        counts = f"{sm.hits} turns, {sm.tool} tool entries"
-        print(f"\n{s.started()}  {s.host}  {where or label(s.folder)}  ({counts})")
+        tally = f"{sm.hits} turns, {sm.tool} tool entries"
+        print(f"\n{s.started()}  {s.host}  {where or label(s.folder)}  ({tally})")
         print(f"  file:  {s.path}\n  first: {sm.first}\n  match: {sm.match}")
     return 0
 
@@ -323,7 +341,7 @@ def window(texts: list[str], term: str | None) -> list[int]:
     return sorted({j for i in hits for j in (i - 1, i, i + 1) if 0 <= j < len(texts)})
 
 
-def show(file: str, term: str | None) -> int:
+def show(file: str, term: str | None, users: bool) -> int:
     path = Path(file)
     if not path.is_file():
         return fail(f"no such session in the store: {file}")
@@ -337,11 +355,14 @@ def show(file: str, term: str | None) -> int:
         if body:
             turns.append((entry.get("timestamp", ""), entry["message"]["role"], body))
     keep = window([body for _, _, body in turns], term)
+    if users:
+        # The session's arc: what the user asked, in order, one line each.
+        keep = [i for i in keep if turns[i][1] == "user"]
     for n, i in enumerate(keep):
-        if n > 0 and i != keep[n - 1] + 1:
+        if n > 0 and i != keep[n - 1] + 1 and not users:
             print("...")
         ts, role, body = turns[i]
-        print(f"[{ts}] {role}: {body[:1500]}")
+        print(f"[{ts}] {role}: {squash(body)[:200] if users else body[:1500]}")
     return 0
 
 
@@ -399,6 +420,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
     f.add_argument("term")
     f.add_argument("project", nargs="?")
     f.add_argument("--limit", type=int, default=int(os.environ.get("MUSEUM_LIMIT", "20")))
+    f.add_argument("--newest", action="store_true", help="newest first, not most turns first")
     f.add_argument(
         "--skip",
         metavar="SESSION_ID",
@@ -408,6 +430,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
     s = sub.add_parser("show", help="one session's conversation")
     s.add_argument("file")
     s.add_argument("term", nargs="?")
+    s.add_argument("--users", action="store_true", help="only user turns, one line each")
     return p.parse_args(argv)
 
 
@@ -417,8 +440,10 @@ def forward(ns: argparse.Namespace) -> list[str]:
     ssh."""
     if ns.cmd == "find":
         words = ["find", ns.term, *([ns.project] if ns.project else [])]
-        return [*words, "--limit", str(ns.limit), "--skip", ns.skip]
-    return ["show", ns.file, *([ns.term] if ns.term else [])]
+        words += ["--limit", str(ns.limit), "--skip", ns.skip]
+        return [*words, "--newest"] if ns.newest else words
+    words = ["show", ns.file, *([ns.term] if ns.term else [])]
+    return [*words, "--users"] if ns.users else words
 
 
 def main(argv: list[str]) -> int:
@@ -441,8 +466,8 @@ def main(argv: list[str]) -> int:
     except OSError:
         return fail(f"cannot enter store {store}")
     if ns.cmd == "find":
-        return find(ns.term, ns.project, ns.limit, ns.skip)
-    return show(ns.file, ns.term)
+        return find(ns.term, ns.project, ns.limit, ns.skip, ns.newest)
+    return show(ns.file, ns.term, ns.users)
 
 
 if __name__ == "__main__":
