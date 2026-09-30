@@ -7,7 +7,8 @@
                                                   text; with TERM, only the turns
                                                   that mention it, plus one on
                                                   either side; --users, only the
-                                                  user turns, one line each
+                                                  user turns, one line each, with
+                                                  the question a terse reply answers
   museum-search --remote-command ...              print the command that runs the
                                                   search on the store host, for a
                                                   transport like mule
@@ -47,6 +48,12 @@ from typing import Any, NamedTuple
 
 MU_WORKSPACE = "-mu-workspaces-"
 SNIPPET = 100  # characters of context either side of a match
+# A user turn that answers the assistant turn before it: short ("yes", "mule"),
+# or picking options by number ("1, also consider...", "q6 1, q7 1 q8. lets
+# workshop this"). `show --users` prints the asking turn's tail beside it.
+TERSE = 40
+PICK = re.compile(r"(q\d+\W*)?\d+\b", re.IGNORECASE)
+ASKED = 300  # characters of the asking turn's tail to print
 
 
 # Where a mention sits, best first: the text of a user or assistant turn, then
@@ -356,14 +363,34 @@ def show(file: str, term: str | None, users: bool) -> int:
             turns.append((entry.get("timestamp", ""), entry["message"]["role"], body))
     keep = window([body for _, _, body in turns], term)
     if users:
-        # The session's arc: what the user asked, in order, one line each.
-        keep = [i for i in keep if turns[i][1] == "user"]
+        arc(turns, keep)
+        return 0
     for n, i in enumerate(keep):
-        if n > 0 and i != keep[n - 1] + 1 and not users:
+        if n > 0 and i != keep[n - 1] + 1:
             print("...")
         ts, role, body = turns[i]
-        print(f"[{ts}] {role}: {squash(body)[:200] if users else body[:1500]}")
+        print(f"[{ts}] {role}: {body[:1500]}")
     return 0
+
+
+def arc(turns: list[tuple[str, str, str]], keep: list[int]) -> None:
+    """The session's arc: what the user said, in order, one line each. A terse
+    reply gets the end of the assistant turn it answers, where the question
+    and its options usually are, so "1" still says what was chosen."""
+    for i in keep:
+        ts, role, body = turns[i]
+        if role != "user":
+            continue
+        said = squash(body)
+        answers = len(said) <= TERSE or PICK.match(said)
+        if answers and i > 0 and turns[i - 1][1] == "assistant":
+            asked = squash(turns[i - 1][2])
+            print(
+                f"[{ts}]   asked: ...{asked[-ASKED:]}"
+                if len(asked) > ASKED
+                else f"[{ts}]   asked: {asked}"
+            )
+        print(f"[{ts}] user: {said[:200]}")
 
 
 def fail(msg: str) -> int:

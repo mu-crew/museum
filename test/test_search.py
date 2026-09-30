@@ -230,7 +230,52 @@ class Store(unittest.TestCase):
     def test_show_users_prints_the_arc(self) -> None:
         out = self.run_search("show", f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl", "--users")
         turns = [line.split("] ", 1)[1] for line in out.stdout.splitlines()[1:]]
-        self.assertEqual(turns, ["user: brainstorm a hey.com clone", "user: go is out, rust vs ts"])
+        self.assertEqual(
+            turns,
+            [
+                "user: brainstorm a hey.com clone",
+                # Terse, so it comes with the turn it answers.
+                "  asked: Use Stalwart as the mail server.",
+                "user: go is out, rust vs ts",
+            ],
+        )
+
+    def test_show_users_pairs_a_numbered_answer_with_its_question(self) -> None:
+        rel = "pc/--x--/2026-01-01T00-00-00-000Z_q.jsonl"
+        long_intro = "context " * 60
+        write_session(
+            self.dir,
+            rel,
+            [
+                msg("user", "the tools need a home: pick a GitHub org name for all three of them"),
+                msg("assistant", f"{long_intro} Q1: 1. mu-crew 2. mu-works. I recommend **1**."),
+                # Over TERSE, but it starts by picking an option.
+                msg("user", "1, also consider renaming coop to mu-something"),
+                msg("assistant", "Done."),
+                msg("user", "now write the README for the new org, with the zen section first"),
+                msg("assistant", "Should it link pi?"),
+                msg("user", "yes"),
+            ],
+        )
+        # No session header in this fixture, so no cwd: line to skip.
+        lines = self.run_search("show", rel, "--users").stdout.splitlines()
+        body = [line.split("] ", 1)[1] for line in lines]
+        self.assertEqual(
+            body[0], "user: the tools need a home: pick a GitHub org name for all three of them"
+        )
+        # The asking turn's tail, cut from the front, keeps the question.
+        self.assertTrue(body[1].startswith("  asked: ..."))
+        self.assertTrue(body[1].endswith("Q1: 1. mu-crew 2. mu-works. I recommend **1**."))
+        self.assertEqual(body[2], "user: 1, also consider renaming coop to mu-something")
+        # A long request stands alone; a terse reply gets its question.
+        self.assertEqual(
+            body[3:],
+            [
+                "user: now write the README for the new org, with the zen section first",
+                "  asked: Should it link pi?",
+                "user: yes",
+            ],
+        )
 
     def test_show_missing_file(self) -> None:
         r = self.run_search("show", "nope.jsonl")
