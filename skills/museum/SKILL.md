@@ -5,7 +5,7 @@ description: Museum, the archive of all past pi sessions from every machine. Use
 
 # Museum
 
-Every machine rsyncs `~/.pi/agent/sessions/` into one central store. The store location is the `STORE=` line in `~/.config/museum/config`, either `host:/path` (ssh) or a local `/path`. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends. `~/.cache/museum/state` says when this machine last synced and why it failed, if it did.
+Every machine rsyncs `~/.pi/agent/sessions/` into one central store. The store location is the `[store]` table in `~/.config/museum/config.toml`: `path` on `host` over ssh, or a local `path` when there is no `host`. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends. `~/.cache/museum/state` says when this machine last synced and why it failed, if it did.
 
 ## Layout
 
@@ -49,6 +49,6 @@ Use this when the user asks whether museum is working, or pi's footer shows `mus
    "$(dirname "$(readlink -f ~/.agents/skills/museum)")/../bin/museum-sync"
    ```
    Exit 0 means the sync succeeded, or another sync on this machine will cover it.
-3. Common causes: ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), the store folder is not writable, or, with `SSH_MUX_ONLY=1` in the config, no ssh master is running (`no ssh master for <host>`: the user runs `ssh -MNf <host>`, which may need their key).
+3. Common causes: `python3` on PATH is older than 3.11 (`needs Python 3.11+`: on macOS, `brew install python`), a key in `config.toml` is misspelled or wrong (`unknown key`, `must be absolute`), ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), the store folder is not writable, or, with `ssh_mux_only = true` in the config, no ssh master is running (`no ssh master for <host>`: the user runs `ssh -MNf <host>`, which may need their key).
 
-Report the error to the user. Do not change `~/.config/museum/config` or the ssh setup without asking.
+Report the error to the user. Do not change `~/.config/museum/config.toml` or the ssh setup without asking.

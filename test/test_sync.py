@@ -12,8 +12,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 
-from helpers import BIN, load
+from helpers import BIN, ROOT, SCRIPTS, load
 
 sync = load("museum-sync")
 RSYNC = sync.find_rsync()
@@ -25,12 +26,16 @@ class Sandbox(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir)
         self.src = self.dir / "sessions"
         self.store = self.dir / "store"
+        self.store.mkdir()  # a local store folder exists: install.sh made it
         self.state = self.dir / "state"
         (self.src / "--proj--").mkdir(parents=True)
         (self.src / "--proj--" / "s1.jsonl").write_text('{"a":1}\n')
         (self.src / "--proj--" / "notes.txt").write_text("not a session\n")
-        self.config = self.dir / "config"
-        self.config.write_text(f"STORE='{self.store}'\nNAME=box  # pinned\n")
+        self.config = self.dir / "config.toml"
+        self.write_config(f'machine = "box"  # pinned\n\n[store]\npath = "{self.store}"\n')
+
+    def write_config(self, body: str) -> None:
+        self.config.write_text(body)
 
     def env(self, **extra: str) -> dict[str, str]:
         return {
@@ -109,16 +114,32 @@ class LocalStore(Sandbox):
         self.assertFalse((self.state / "pending").exists())
 
     def test_unwritable_store_records_the_error(self) -> None:
-        self.config.write_text("STORE=/dev/null/store\n")
+        self.store.chmod(0o500)
+        self.addCleanup(self.store.chmod, 0o700)
         r = self.run_sync()
         self.assertEqual(r.returncode, 1)
         self.assertEqual(self.state_field("status"), "error")
         self.assertIn("mkdir", self.state_field("message"))
 
+    def test_forgotten_host_fails_instead_of_backing_up_locally(self) -> None:
+        # An ssh store's path, with the host line gone: no such folder here.
+        missing = self.dir / "home" / "u" / "museum"
+        self.write_config(f'machine = "box"\n[store]\npath = "{missing}"\n')
+        r = self.run_sync()
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(
+            self.state_field("message"),
+            f"store.path {missing} does not exist here (is store.host missing?)",
+        )
+        self.assertFalse(missing.exists())
+
 
 class Failures(Sandbox):
     def test_mux_only_without_a_master_skips(self) -> None:
-        self.config.write_text("STORE=museum-test-no-such-host.invalid:/srv\nSSH_MUX_ONLY=1\n")
+        self.write_config(
+            'machine = "box"\n[store]\nhost = "museum-test-no-such-host.invalid"\n'
+            'path = "/srv"\nssh_mux_only = true\n'
+        )
         r = self.run_sync()
         self.assertEqual(r.returncode, 1)
         self.assertNotIn("retrying", r.stderr)
@@ -133,6 +154,40 @@ class Failures(Sandbox):
         r = self.run_sync()
         self.assertEqual(r.returncode, 1)
         self.assertIn("missing", r.stderr)
+        # Recorded, so pi's footer says what is wrong.
+        self.assertEqual(self.state_field("status"), "error")
+        self.assertIn("run install.sh", self.state_field("message"))
+
+    def test_bad_config_is_recorded_not_synced(self) -> None:
+        self.write_config('machine = "box"\n[store]\npath = "/tmp/x"\nhots = "typo"\n')
+        r = self.run_sync()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("unknown key store.hots", self.state_field("message"))
+        self.assertFalse((self.state / "last-start").exists())
+
+    def test_old_python_says_so_in_the_footer(self) -> None:
+        old = shutil.which("python3.9") or "/usr/bin/python3"
+        version = subprocess.run(
+            [
+                old,
+                "-c",
+                "import sys; print(sys.version_info >= (3, 9) and sys.version_info < (3, 11))",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if version.stdout.strip() != "True":
+            self.skipTest("no Python 3.9 or 3.10 here")
+        r = subprocess.run(
+            [old, str(BIN / "museum-sync")],
+            capture_output=True,
+            text=True,
+            env=self.env(),
+            check=False,
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("needs Python 3.11+", self.state_field("message"))
 
     def test_bad_flag(self) -> None:
         self.assertEqual(self.run_sync("--later").returncode, 2)
@@ -243,7 +298,9 @@ class FakeRsync(Sandbox):
         self.assertEqual(self.state_field("status"), "ok")
 
     def mux(self) -> None:
-        self.config.write_text("STORE=box:/srv/museum\nSSH_MUX_ONLY=1\n")
+        self.write_config(
+            'machine = "box"\n[store]\nhost = "box"\npath = "/srv/museum"\nssh_mux_only = true\n'
+        )
 
     def test_mux_only_retries_a_failure_once(self) -> None:
         self.mux()
@@ -265,7 +322,7 @@ class FakeRsync(Sandbox):
         )
 
     def test_without_mux_only_a_failure_waits_for_the_next_sync(self) -> None:
-        self.config.write_text("STORE=box:/srv/museum\n")
+        self.write_config('machine = "box"\n[store]\nhost = "box"\npath = "/srv/museum"\n')
         (self.fake / "fail").write_text("1")
         r = self.run_sync()
         self.assertEqual(r.returncode, 1)
@@ -292,11 +349,93 @@ class Units(unittest.TestCase):
         self.assertEqual(sync.error_line("a\nlast\n\n"), "last")
         self.assertEqual(sync.error_line(""), "")
 
-    def test_read_config(self) -> None:
-        with tempfile.NamedTemporaryFile("w") as f:
-            f.write("# c\nSTORE='host:/a b'\nNAME=x # pinned\n\n")
+    def load(self, body: str) -> Any:
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as f:
+            f.write(body)
             f.flush()
-            self.assertEqual(sync.read_config(Path(f.name)), {"STORE": "host:/a b", "NAME": "x"})
+            return sync.load_config(Path(f.name))
+
+    def test_load_config(self) -> None:
+        c = self.load('machine = "x"\n[store]\nhost = "devbox"\npath = "/data/a b/"\n')
+        self.assertEqual(c, sync.Config("x", "devbox", "/data/a b", False))
+        self.assertEqual(c.target(), "devbox:/data/a b")
+        local = self.load('machine = "x"\n[store]\npath = "/srv"\n')
+        self.assertEqual(local.target(), "/srv")
+
+    def test_load_config_rejects_what_would_silently_misbehave(self) -> None:
+        cases = {
+            "unknown key store.hots": '[store]\nhots = "x"\npath = "/a"\nmachine = "m"',
+            "unknown key mashine": 'mashine = "m"\n[store]\npath = "/a"',
+            "machine must be a non-empty string": '[store]\npath = "/a"',
+            "store must be a table": 'machine = "m"\nstore = "devbox:/a"',
+            "put the folder in store.path": 'machine = "m"\n[store]\nhost = "devbox:/a"\npath = "/a"',
+            "store.path must be absolute": 'machine = "m"\n[store]\npath = "museum"',
+            "true or false": 'machine = "m"\n[store]\nhost = "h"\npath = "/a"\nssh_mux_only = 1',
+            "needs store.host": 'machine = "m"\n[store]\npath = "/a"\nssh_mux_only = true',
+            "without /": 'machine = "a/b"\n[store]\npath = "/a"',
+        }
+        for message, body in cases.items():
+            with self.subTest(message), self.assertRaises(sync.ConfigError) as e:
+                self.load(body)
+            self.assertIn(message, str(e.exception))
+
+    def test_install_and_sync_write_the_same_config(self) -> None:
+        """install.sh and convert_legacy each write config.toml; the files, and
+        so their comments, must not drift."""
+        for store, machine in (("devbox:/data/a b", 'mac"mini'), ("LOCAL", "pc")):
+            with self.subTest(store=store), tempfile.TemporaryDirectory() as d:
+                home = Path(d)
+                if store == "LOCAL":  # install.sh creates it: keep it in the temp dir
+                    store = str(home / "store")
+                # install.sh up to the config, without the ssh probe, links
+                # and first sync that need a real host and pi.
+                src = (ROOT / "install.sh").read_text()
+                probe = 'ssh -o BatchMode=yes "$HOST" "test -d \'$STORE_PATH/$MACHINE\'"'
+                self.assertIn(probe, src)
+                src = src[: src.index("# Skill: symlink")].replace(probe, "false")
+                script = home / "install.sh"
+                script.write_text(
+                    src.replace('ROOT="$(cd "$(dirname "$0")" && pwd)"', f"ROOT={ROOT}")
+                )
+                subprocess.run(
+                    ["sh", str(script), store, machine],
+                    env={**os.environ, "HOME": str(home)},
+                    capture_output=True,
+                    check=True,
+                )
+                if not store.count(":"):
+                    self.assertTrue(Path(store).is_dir())
+                written = (home / ".config/museum/config.toml").read_text()
+                c = sync.load_config(home / ".config/museum/config.toml")
+                self.assertEqual(c.machine, machine)
+                self.assertEqual(written, sync.toml(c))
+
+    def test_legacy_config_converts_once(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            old = Path(d, "config")
+            old.write_text("STORE='devbox:/data/museum'\nNAME=mac  # pinned\nSSH_MUX_ONLY=1\n")
+            new = Path(d, "config.toml")
+            sync.convert_legacy(new)
+            self.assertEqual(
+                sync.load_config(new), sync.Config("mac", "devbox", "/data/museum", True)
+            )
+            self.assertFalse(old.exists())
+            self.assertTrue(Path(d, "config.old").exists())
+            Path(d, "config").write_text("STORE=/elsewhere\n")
+            sync.convert_legacy(new)  # config.toml exists: left alone
+            self.assertEqual(sync.load_config(new).host, "devbox")
+            local = Path(d, "local.toml")
+            Path(d, "config").write_text("STORE=/srv/museum\nNAME=pc\n")
+            sync.convert_legacy(local)
+            self.assertEqual(sync.load_config(local), sync.Config("pc", None, "/srv/museum", False))
+
+    def test_both_scripts_carry_the_same_config_code(self) -> None:
+        def block(path: Path) -> str:
+            src = path.read_text()
+            start = src.index("\n", src.index("# --- config:"))
+            return src[start : src.index("# --- end config ---")]
+
+        self.assertEqual(block(BIN / "museum-sync"), block(SCRIPTS / "museum-search"))
 
 
 if __name__ == "__main__":

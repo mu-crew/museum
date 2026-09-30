@@ -10,18 +10,26 @@ reboot cannot leave it held. A caller that finds the lock taken exits 0 at once;
 with --now it first leaves a `pending` mark, and the holder syncs again before it
 lets go.
 
-Config: ~/.config/museum/config, KEY=value lines
-  STORE=host:/path   or   STORE=/local/path
-  NAME=my-laptop     (optional, defaults to the short hostname)
-  SSH_MUX_ONLY=1     (optional) sync only through a running ssh ControlMaster,
-                     never a fresh connection: for hosts whose auth needs a
-                     security-key touch or other human step
+Config: ~/.config/museum/config.toml
+
+  machine = "my-laptop"      this machine's folder in the store: <store>/<machine>/
+
+  [store]
+  host = "devbox"            the store host, over ssh; leave it out for a local store
+  path = "/data/museum"      the store folder, absolute, on the store host
+  ssh_mux_only = false       sync only through an ssh ControlMaster that is already
+                             open, never a new connection: for a store host whose
+                             login needs a security-key touch or other human step
+
+A machine still on the old KEY=value `config` is converted to config.toml on its
+first sync, and the old file is kept as config.old.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -34,7 +42,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 HOME = Path.home()
-# Exit status of copy() when SSH_MUX_ONLY is set and no master is running.
+# Exit status of copy() when ssh_mux_only is set and no master is running.
 NO_MASTER = 90
 # rsync's "some files vanished before they could be transferred": fine here.
 RSYNC_VANISHED = 24
@@ -57,14 +65,153 @@ NO_AUTH = [
 ]
 
 
+# --- config: the same in museum-search; test_config checks they match ---
+
+
+class ConfigError(Exception):
+    pass
+
+
+class Config(NamedTuple):
+    machine: str
+    host: str | None
+    path: str
+    ssh_mux_only: bool
+
+    def target(self) -> str:
+        """The store folder in rsync's syntax: host:/path or /path."""
+        return f"{self.host}:{self.path}" if self.host else self.path
+
+
+def config_path() -> Path:
+    return Path(os.environ.get("MUSEUM_CONFIG", Path.home() / ".config/museum/config.toml"))
+
+
+def load_config(path: Path) -> Config:
+    """config.toml, checked strictly: a typo is an error, not a default."""
+    # Deliberately unreachable on the 3.11 target: an older python3 found on
+    # PATH gets this message, in pi's footer too, not an ImportError.
+    if sys.version_info < (3, 11):  # noqa: UP036
+        raise ConfigError(
+            f"needs Python 3.11+ for tomllib; {sys.executable} is {sys.version.split()[0]}"
+        )
+    import tomllib
+
+    try:
+        doc = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        raise ConfigError(f"missing {path}; run install.sh") from None
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"{path}: {e}") from None
+
+    def table(value: object, where: str, keys: set[str]) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise ConfigError(f"{path}: {where} must be a table")
+        unknown = sorted(set(value) - keys)
+        if unknown:
+            raise ConfigError(f"{path}: unknown key {where}.{unknown[0]}".replace(" .", " "))
+        return value
+
+    def text(value: object, key: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{path}: {key} must be a non-empty string")
+        return value
+
+    top = table(doc, "", {"machine", "store"})
+    store = table(top.get("store"), "store", {"host", "path", "ssh_mux_only"})
+    machine = text(top.get("machine"), "machine")
+    if "/" in machine:
+        raise ConfigError(f"{path}: machine is a folder name, without /")
+    host = text(store["host"], "store.host") if "host" in store else None
+    if host and (":" in host or "/" in host):
+        raise ConfigError(f"{path}: store.host is an ssh host; put the folder in store.path")
+    folder = text(store.get("path"), "store.path")
+    if not folder.startswith("/"):
+        raise ConfigError(f"{path}: store.path must be absolute")
+    mux = store.get("ssh_mux_only", False)
+    if not isinstance(mux, bool):
+        raise ConfigError(f"{path}: store.ssh_mux_only must be true or false")
+    if mux and not host:
+        raise ConfigError(f"{path}: store.ssh_mux_only needs store.host")
+    return Config(machine, host, folder.rstrip("/") or "/", mux)
+
+
+# --- end config ---
+
+
+TEMPLATE = """\
+# museum: https://github.com/mu-crew/museum
+
+# This machine's folder in the store: sessions go to <store path>/<machine>/.
+# Pinned at install, so a hostname change keeps using the same folder.
+machine = {machine}
+
+[store]
+# The store is on another host, over ssh, when `host` is set, and in a folder
+# on this machine when it is not. Only `host` decides.
+#
+#   ssh:    host = "devbox"            local:  (no host line)
+#           path = "/data/museum"              path = "/data/museum"
+#
+# `path` is absolute, on whichever host holds the store. A local store's
+# folder must already exist, so a forgotten `host` line fails instead of
+# quietly backing up to this machine.
+{host}path = {path}
+
+# ssh only. true: sync only over an ssh ControlMaster that is already open,
+# never a new connection, for a store host whose login needs a security-key
+# touch or another human step. Open one with `ssh -MNf <host>`.
+ssh_mux_only = {mux}
+"""
+
+
+def toml(c: Config) -> str:
+    """A Config as config.toml, commented. JSON strings are valid TOML basic
+    strings. install.sh writes the same file from its own copy of TEMPLATE."""
+
+    def q(s: str) -> str:
+        return json.dumps(s, ensure_ascii=False)
+
+    return TEMPLATE.format(
+        machine=q(c.machine),
+        host=f"host = {q(c.host)}\n" if c.host else "",
+        path=q(c.path),
+        mux="true" if c.ssh_mux_only else "false",
+    )
+
+
+def convert_legacy(path: Path) -> None:
+    """Write config.toml from the old KEY=value `config` beside it, once, and
+    keep the old file as config.old. Remove when no machine has one left."""
+    old = path.with_name("config")
+    if path.exists() or not old.is_file():
+        return
+    values = {}
+    for line in old.read_text().splitlines():
+        for word in shlex.split(line, comments=True):
+            key, eq, value = word.partition("=")
+            if eq:
+                values[key] = value
+    store = values.get("STORE", "")
+    host, sep, folder = store.partition(":") if ":" in store else ("", "", store)
+    legacy = Config(
+        machine=values.get("NAME") or socket.gethostname().split(".")[0],
+        host=host if sep else None,
+        path=folder,
+        ssh_mux_only=bool(values.get("SSH_MUX_ONLY")),
+    )
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(toml(legacy))
+    tmp.replace(path)
+    old.replace(old.with_name("config.old"))
+
+
 class Settings(NamedTuple):
-    store: str
-    name: str
+    config: Config
     src: Path
     state: Path
     interval: int
     retry_delay: int
-    mux_only: bool
 
 
 class Result(NamedTuple):
@@ -72,38 +219,21 @@ class Result(NamedTuple):
     output: str
 
 
-def die(msg: str, code: int = 1) -> None:
-    print(f"museum: {msg}", file=sys.stderr)
-    sys.exit(code)
-
-
-def read_config(path: Path) -> dict[str, str]:
-    """KEY=value lines, shell-quoted values allowed, # comments ignored."""
-    config = {}
-    for line in path.read_text().splitlines():
-        for word in shlex.split(line, comments=True):
-            key, eq, value = word.partition("=")
-            if eq:
-                config[key] = value
-    return config
+def state_dir() -> Path:
+    return Path(os.environ.get("MUSEUM_STATE_DIR", Path.home() / ".cache/museum"))
 
 
 def settings() -> Settings:
+    path = config_path()
+    if sys.version_info >= (3, 11):  # noqa: UP036 (see load_config)
+        convert_legacy(path)
     env = os.environ
-    path = Path(env.get("MUSEUM_CONFIG", HOME / ".config/museum/config"))
-    if not path.is_file():
-        die(f"missing {path} (set STORE=host:/path)")
-    config = read_config(path)
-    if not config.get("STORE"):
-        die(f"STORE not set in {path}")
     return Settings(
-        store=config["STORE"],
-        name=config.get("NAME") or socket.gethostname().split(".")[0],
+        config=load_config(path),
         src=Path(env.get("PI_SESSIONS_DIR", HOME / ".pi/agent/sessions")),
-        state=Path(env.get("MUSEUM_STATE_DIR", HOME / ".cache/museum")),
+        state=state_dir(),
         interval=int(env.get("MUSEUM_INTERVAL", "600")),
         retry_delay=int(env.get("MUSEUM_RETRY_DELAY", "30")),
-        mux_only=bool(config.get("SSH_MUX_ONLY") or env.get("SSH_MUX_ONLY")),
     )
 
 
@@ -144,19 +274,24 @@ def run(cmd: list[str]) -> Result:
 
 
 def copy(s: Settings, rsync: str) -> Result:
-    ssh = SSH + NO_AUTH if s.mux_only else SSH
+    c = s.config
+    ssh = SSH + NO_AUTH if c.ssh_mux_only else SSH
     extra = []
-    if ":" in s.store:
-        host, path = s.store.split(":", 1)
+    if c.host:
         # `-O check` only asks the local control socket; it never connects.
-        if s.mux_only and run([*ssh, "-O", "check", host]).code != 0:
-            return Result(NO_MASTER, f"no ssh master for {host} (run: ssh -MNf {host})")
+        if c.ssh_mux_only and run([*ssh, "-O", "check", c.host]).code != 0:
+            return Result(NO_MASTER, f"no ssh master for {c.host} (run: ssh -MNf {c.host})")
         # The remote mkdir rides rsync's own connection, so a sync opens one
         # ssh connection, not two.
-        extra = [f"--rsync-path=mkdir -p {shlex.quote(f'{path}/{s.name}')} && rsync"]
+        extra = [f"--rsync-path=mkdir -p {shlex.quote(f'{c.path}/{c.machine}')} && rsync"]
     else:
+        # Only the machine's folder is created, never the store folder: a
+        # missing one most likely means a forgotten `host` line, and creating
+        # it would back up to this machine and report success.
+        if not Path(c.path).is_dir():
+            return Result(1, f"store.path {c.path} does not exist here (is store.host missing?)")
         try:
-            Path(s.store, s.name).mkdir(parents=True, exist_ok=True)
+            Path(c.path, c.machine).mkdir(exist_ok=True)
         except OSError as e:
             return Result(1, f"mkdir: {e}")
     r = run(
@@ -172,7 +307,7 @@ def copy(s: Settings, rsync: str) -> Result:
             "-e",
             " ".join(ssh),
             f"{s.src}/",
-            f"{s.store}/{s.name}/",
+            f"{c.target()}/{c.machine}/",
         ]
     )
     return Result(0, r.output) if r.code == RSYNC_VANISHED else r
@@ -186,31 +321,31 @@ def error_line(output: str) -> str:
     return (why or lines or [""])[-1]
 
 
-def record(s: Settings, status: str, message: str) -> None:
-    tmp = s.state / "state.tmp"
+def record(state: Path, status: str, message: str) -> None:
+    tmp = state / "state.tmp"
     message = " ".join(message.split())
     tmp.write_text(f"status={status}\ntime={int(time.time())}\nmessage={message}\n")
-    tmp.replace(s.state / "state")
+    tmp.replace(state / "state")
 
 
 def sync_once(s: Settings, rsync: str | None) -> bool:
     (s.state / "pending").unlink(missing_ok=True)
     (s.state / "last-start").write_text(f"{int(time.time())}\n")
     if rsync is None:
-        record(s, "error", "rsync 3.x not found (macOS: brew install rsync)")
+        record(s.state, "error", "rsync 3.x not found (macOS: brew install rsync)")
         return False
     r = copy(s, rsync)
     # One retry, for a blip, only in mux-only mode with a live master: there it
     # costs no human step. A fresh connection may need a key touch, and a
     # missing master will not appear in retry_delay seconds.
-    if r.code != 0 and s.mux_only and r.code != NO_MASTER:
+    if r.code != 0 and s.config.ssh_mux_only and r.code != NO_MASTER:
         print(f"{r.output}museum: retrying in {s.retry_delay}s", file=sys.stderr)
         time.sleep(s.retry_delay)
         r = copy(s, rsync)
     if r.code == 0:
-        record(s, "ok", "")
+        record(s.state, "ok", "")
         return True
-    record(s, "error", error_line(r.output))
+    record(s.state, "error", error_line(r.output))
     print(r.output, file=sys.stderr, end="")
     return False
 
@@ -248,8 +383,15 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     if_due = parse(argv).if_due
-    s = settings()
-    s.state.mkdir(parents=True, exist_ok=True)
+    state = state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    try:
+        s = settings()
+    except ConfigError as e:
+        # Recorded like a failed sync, so pi's footer shows it at once.
+        record(state, "error", str(e))
+        print(f"museum: {e}", file=sys.stderr)
+        return 1
     # Marked BEFORE trying the lock, so a holder that is mid-sync sees it.
     if not if_due:
         (s.state / "pending").touch()

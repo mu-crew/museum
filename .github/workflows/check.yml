@@ -18,4 +18,4 @@ jobs:
         with:
           enable-cache: false # no lockfile to key it on; four pinned wheels
       - run: make check
-      - run: make test PYTHON="uv run --no-project --python 3.9 python"
+      - run: make test PYTHON="uv run --no-project --python 3.11 python"

@@ -398,15 +398,78 @@ def fail(msg: str) -> int:
     return 1
 
 
-def read_config(path: Path) -> dict[str, str]:
-    """KEY=value lines, shell-quoted values allowed, # comments ignored."""
-    config = {}
-    for line in path.read_text().splitlines():
-        for word in shlex.split(line, comments=True):
-            key, eq, value = word.partition("=")
-            if eq:
-                config[key] = value
-    return config
+# --- config: the same in bin/museum-sync; test_config checks they match ---
+
+
+class ConfigError(Exception):
+    pass
+
+
+class Config(NamedTuple):
+    machine: str
+    host: str | None
+    path: str
+    ssh_mux_only: bool
+
+    def target(self) -> str:
+        """The store folder in rsync's syntax: host:/path or /path."""
+        return f"{self.host}:{self.path}" if self.host else self.path
+
+
+def config_path() -> Path:
+    return Path(os.environ.get("MUSEUM_CONFIG", Path.home() / ".config/museum/config.toml"))
+
+
+def load_config(path: Path) -> Config:
+    """config.toml, checked strictly: a typo is an error, not a default."""
+    # Deliberately unreachable on the 3.11 target: an older python3 found on
+    # PATH gets this message, in pi's footer too, not an ImportError.
+    if sys.version_info < (3, 11):  # noqa: UP036
+        raise ConfigError(
+            f"needs Python 3.11+ for tomllib; {sys.executable} is {sys.version.split()[0]}"
+        )
+    import tomllib
+
+    try:
+        doc = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        raise ConfigError(f"missing {path}; run install.sh") from None
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"{path}: {e}") from None
+
+    def table(value: object, where: str, keys: set[str]) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise ConfigError(f"{path}: {where} must be a table")
+        unknown = sorted(set(value) - keys)
+        if unknown:
+            raise ConfigError(f"{path}: unknown key {where}.{unknown[0]}".replace(" .", " "))
+        return value
+
+    def text(value: object, key: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{path}: {key} must be a non-empty string")
+        return value
+
+    top = table(doc, "", {"machine", "store"})
+    store = table(top.get("store"), "store", {"host", "path", "ssh_mux_only"})
+    machine = text(top.get("machine"), "machine")
+    if "/" in machine:
+        raise ConfigError(f"{path}: machine is a folder name, without /")
+    host = text(store["host"], "store.host") if "host" in store else None
+    if host and (":" in host or "/" in host):
+        raise ConfigError(f"{path}: store.host is an ssh host; put the folder in store.path")
+    folder = text(store.get("path"), "store.path")
+    if not folder.startswith("/"):
+        raise ConfigError(f"{path}: store.path must be absolute")
+    mux = store.get("ssh_mux_only", False)
+    if not isinstance(mux, bool):
+        raise ConfigError(f"{path}: store.ssh_mux_only must be true or false")
+    if mux and not host:
+        raise ConfigError(f"{path}: store.ssh_mux_only needs store.host")
+    return Config(machine, host, folder.rstrip("/") or "/", mux)
+
+
+# --- end config ---
 
 
 def remote(host: str, store: str, args: list[str], mux_only: bool, print_only: bool) -> int:
@@ -475,23 +538,21 @@ def forward(ns: argparse.Namespace) -> list[str]:
 
 def main(argv: list[str]) -> int:
     ns = parse(argv)
+    # --store is how the local side hands the store folder to the store host,
+    # which has no museum config of its own and may run an older Python.
     store = ns.store
     if store is None:
-        config_path = Path(os.environ.get("MUSEUM_CONFIG", Path.home() / ".config/museum/config"))
-        if not config_path.is_file():
-            return fail(f"missing {config_path}; search ~/.pi/agent/sessions by hand")
-        config = read_config(config_path)
-        store = config.get("STORE") or ""
-        if not store:
-            return fail(f"STORE not set in {config_path}")
-        if ":" in store:
-            host, path = store.split(":", 1)
-            mux_only = bool(config.get("SSH_MUX_ONLY"))
-            return remote(host, path, forward(ns), mux_only, ns.remote_command)
+        try:
+            c = load_config(config_path())
+        except ConfigError as e:
+            return fail(f"{e}; or search ~/.pi/agent/sessions by hand")
+        if c.host:
+            return remote(c.host, c.path, forward(ns), c.ssh_mux_only, ns.remote_command)
+        store = c.path
     try:
         os.chdir(store)
     except OSError:
-        return fail(f"cannot enter store {store}")
+        return fail(f"cannot enter store {store} (is store.host missing?)")
     if ns.cmd == "find":
         return find(ns.term, ns.project, ns.limit, ns.skip, ns.newest)
     return show(ns.file, ns.term, ns.users)

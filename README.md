@@ -27,17 +27,17 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 ## Install (per machine)
 
 ```sh
-./install.sh devbox:/data/museum          # first time, ssh store: writes ~/.config/museum/config
+./install.sh devbox:/data/museum          # first time, ssh store: writes ~/.config/museum/config.toml
 ./install.sh /data/museum                 # first time, local store (this machine is the store host)
 ./install.sh /Volumes/backup/museum       # local path on a mounted disk or network share
-./install.sh devbox:/data/museum work-mbp # first time, with an explicit machine name
+./install.sh devbox:/data/museum work-mbp # first time, with an explicit machine folder name
 ./install.sh                              # later runs: re-link the skill and the extension
 ```
 
 The store uses rsync's syntax: `host:/path` goes over ssh, anything else is a local path. On the store host itself, use the local path rather than `localhost:`, which would need sshd and a key for your own account.
 
 The install script:
-1. writes `~/.config/museum/config` with `STORE=` and `NAME=`. `NAME` defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<NAME>` already exists, the install stops unless you pass `NAME` explicitly
+1. writes `~/.config/museum/config.toml` (see [Configuration](#configuration)). The machine name defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<machine>` already exists, the install stops unless you pass the name explicitly
 2. symlinks `skills/museum` into `~/.agents/skills/`
 3. symlinks `pi/museum.ts` into `~/.pi/agent/extensions/`. Running pi agents pick it up on restart or `/reload`
 4. runs the first sync
@@ -64,17 +64,30 @@ For an ssh store it runs on the store host in one ssh call. The `museum` skill t
 
 ## Configuration
 
-`~/.config/museum/config` holds `STORE=` and `NAME=`, and optionally `SSH_MUX_ONLY=1`.
+`~/.config/museum/config.toml`:
 
-`SSH_MUX_ONLY=1` is for an ssh store whose login needs a human, such as a security-key touch. The sync then runs only over an ssh ControlMaster that is already open, and never opens a new connection. If no master is running, it records `no ssh master for <host> (run: ssh -MNf <host>)` and skips, so the footer tells you what to run and nothing asks for your key. In this mode a failed sync retries once after 30 seconds, because a retry over the master costs no touch. Without the setting, a failed sync waits for the next one: a new connection might need a touch.
+```toml
+machine = "macmini"          # this machine's folder in the store: <path>/macmini/
+
+[store]
+host = "devbox"              # set: an ssh store on devbox. Left out: a local store
+path = "/data/museum"        # absolute, on whichever host holds the store
+ssh_mux_only = false         # ssh only, see below
+```
+
+`host` alone decides between an ssh and a local store. A local store's folder must already exist: `install.sh` creates it, and the sync only ever creates `<path>/<machine>/` inside it. So a forgotten `host` line fails with `store.path ... does not exist here (is store.host missing?)` instead of backing up to this machine. The file `install.sh` writes explains all of this in comments.
+
+Both scripts check the file strictly: an unknown key, a relative `path` or `ssh_mux_only` without a `host` is an error, which the pi footer shows. A machine still on the old `KEY=value` `config` file is converted on its first sync, and the old file is kept as `config.old`.
+
+`ssh_mux_only = true` is for an ssh store whose login needs a human, such as a security-key touch. The sync then runs only over an ssh ControlMaster that is already open, and never opens a new connection. If no master is running, it records `no ssh master for <host> (run: ssh -MNf <host>)` and skips, so the footer tells you what to run and nothing asks for your key. In this mode a failed sync retries once after 30 seconds, because a retry over the master costs no touch. Without the setting, a failed sync waits for the next one: a new connection might need a touch.
 
 These environment variables are for tests and unusual layouts:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `MUSEUM_INTERVAL` | `600` | Seconds between routine syncs |
-| `MUSEUM_RETRY_DELAY` | `30` | Seconds before the one retry (`SSH_MUX_ONLY` only) |
-| `MUSEUM_CONFIG` | `~/.config/museum/config` | Config file |
+| `MUSEUM_RETRY_DELAY` | `30` | Seconds before the one retry (`ssh_mux_only` only) |
+| `MUSEUM_CONFIG` | `~/.config/museum/config.toml` | Config file |
 | `MUSEUM_STATE_DIR` | `~/.cache/museum` | Lock, `pending`, `last-start` and `state` |
 | `PI_SESSIONS_DIR` | `~/.pi/agent/sessions` | What gets backed up |
 | `MUSEUM_SYNC` | `bin/museum-sync` beside the extension | Script the extension runs |
@@ -84,7 +97,7 @@ The extension and the script read the environment of the pi process, so set thes
 ## Requirements
 
 - pi with extensions enabled. The sync runs only while pi runs.
-- Python 3.9 or later on each client and on the store host, standard library only. macOS ships 3.9 with the Command Line Tools.
+- Python 3.11 or later on each client, standard library only, for `tomllib`. The Command Line Tools' `/usr/bin/python3` on macOS is 3.9, so install one with `brew install python`, which also puts it first on PATH. The store host needs `python3` of any recent version for searching.
 - rsync 3.x on the client. On macOS, `/usr/bin/rsync` is openrsync and lacks `--append-verify`, so install rsync with `brew install rsync`.
 - rsync on the store host.
 - Non-interactive ssh from each client to the store host (the scripts use `BatchMode=yes`). The sync runs in pi's environment, so a key held by your ssh agent works.
@@ -108,7 +121,7 @@ test/                 unittest suite for both scripts
 
 ## Develop
 
-`bin/museum-sync` and `skills/museum/scripts/museum-search` are single-file, stdlib-only Python, so any system `python3` runs them with nothing installed. They are linted and formatted with ruff and type-checked with ty; `install.sh` and the git hook are shell, checked with shellcheck and shfmt. All four run through `uvx` at pinned versions, so you only need [uv](https://docs.astral.sh/uv/). Tests are stdlib `unittest` in `test/`, against a temporary local store. The same `make check` runs in CI, where the tests run again on Python 3.9.
+`bin/museum-sync` and `skills/museum/scripts/museum-search` are single-file, stdlib-only Python, so any system `python3` runs them with nothing installed. They are linted and formatted with ruff and type-checked with ty; `install.sh` and the git hook are shell, checked with shellcheck and shfmt. All four run through `uvx` at pinned versions, so you only need [uv](https://docs.astral.sh/uv/). Tests are stdlib `unittest` in `test/`, against a temporary local store. The same `make check` runs in CI, where the tests run again on Python 3.11, the oldest supported.
 
 ```sh
 make check   # lint (shellcheck, ruff, ty), tests, format check (shfmt, ruff)

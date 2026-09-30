@@ -1,8 +1,9 @@
 # Config for the Python gates only: museum is not a Python package. The
-# scripts (bin/museum-sync, skills/museum/scripts/museum-search) are stdlib-only single files that must run on a store host's or a
-# Mac's system python3 (macOS ships 3.9), hence the 3.9 target.
+# scripts (bin/museum-sync, skills/museum/scripts/museum-search) are
+# stdlib-only single files. They need Python 3.11 for tomllib, hence the
+# 3.11 target; museum-search's store-host side runs on any python3.
 [tool.ruff]
-target-version = "py39"
+target-version = "py311"
 line-length = 100
 extend-include = ["bin/museum-sync", "skills/museum/scripts/museum-search"]
 
@@ -10,7 +11,7 @@ extend-include = ["bin/museum-sync", "skills/museum/scripts/museum-search"]
 extend-select = ["I", "UP", "B", "SIM", "RUF", "PTH"]
 
 [tool.ty.environment]
-python-version = "3.9"
+python-version = "3.11"
 
 [tool.ty.src]
 include = ["bin/museum-sync", "skills/museum/scripts/museum-search", "test"]

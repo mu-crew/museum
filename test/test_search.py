@@ -325,8 +325,8 @@ class Units(unittest.TestCase):
         self.assertEqual(search.forward(search.parse(["show", "f", "--users"]))[-1], "--users")
 
     def test_remote_command_is_one_shell_command(self) -> None:
-        with tempfile.NamedTemporaryFile("w", suffix=".conf") as conf:
-            conf.write("STORE=box:/srv/museum\n")
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as conf:
+            conf.write('machine = "m"\n[store]\nhost = "box"\npath = "/srv/museum"\n')
             conf.flush()
             r = subprocess.run(
                 [
