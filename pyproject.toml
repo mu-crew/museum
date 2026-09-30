@@ -1,10 +1,10 @@
-# Config for the Python gates only: museum is not a Python package. The bin/
-# scripts are stdlib-only single files that must run on a store host's or a
+# Config for the Python gates only: museum is not a Python package. The
+# scripts (bin/museum-sync, skills/museum/scripts/museum-search) are stdlib-only single files that must run on a store host's or a
 # Mac's system python3 (macOS ships 3.9), hence the 3.9 target.
 [tool.ruff]
 target-version = "py39"
 line-length = 100
-extend-include = ["bin/museum-sync", "bin/museum-search"]
+extend-include = ["bin/museum-sync", "skills/museum/scripts/museum-search"]
 
 [tool.ruff.lint]
 extend-select = ["I", "UP", "B", "SIM", "RUF", "PTH"]
@@ -13,4 +13,4 @@ extend-select = ["I", "UP", "B", "SIM", "RUF", "PTH"]
 python-version = "3.9"
 
 [tool.ty.src]
-include = ["bin/museum-sync", "bin/museum-search", "test"]
+include = ["bin/museum-sync", "skills/museum/scripts/museum-search", "test"]

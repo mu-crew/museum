@@ -3,7 +3,7 @@
 # Escape hatch: git commit --no-verify.
 set -e
 
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '^(bin/|test/|install\.sh$|\.githooks/|Makefile$|\.editorconfig$|pyproject\.toml$)'; then
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '^(bin/|skills/museum/scripts/|test/|install\.sh$|\.githooks/|Makefile$|\.editorconfig$|pyproject\.toml$)'; then
 	exit 0
 fi
 

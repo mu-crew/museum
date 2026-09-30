@@ -17,10 +17,10 @@ The path records the machine, the project, and the start time. Pi encodes the cw
 
 ## Searching
 
-`museum-search` lives in the museum repo's `bin/`, next to this skill:
+`museum-search` is in this skill's `scripts/` folder:
 
 ```
-S="$(dirname "$(readlink -f ~/.agents/skills/museum)")/../bin/museum-search"
+S=~/.agents/skills/museum/scripts/museum-search
 ```
 
 It reads the config, reaches an ssh store in one ssh call, and needs no quoting from you: pass `TERM` as a plain argument.
@@ -44,7 +44,7 @@ For a search `museum-search` does not cover, use `rg` and `jq` on the store host
 Use this when the user asks whether museum is working, or pi's footer shows `museum: backup failing` or `museum: no backup for`.
 
 1. Read this machine's last result: `cat ~/.cache/museum/state`. `status` is `ok` or `error`, `time` is epoch seconds, and `message` is the last error.
-2. Sync by hand to see the full error. The script is in the museum repo, next to `museum-search`:
+2. Sync by hand to see the full error. The script is in the museum repo's `bin/`, which the skill folder links into:
    ```
    "$(dirname "$(readlink -f ~/.agents/skills/museum)")/../bin/museum-sync"
    ```

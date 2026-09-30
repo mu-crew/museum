@@ -12,9 +12,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from helpers import BIN, load
+from helpers import SCRIPTS, load
 
-search = load("museum-search")
+search = load("museum-search", SCRIPTS)
 
 HAIL = "--home-u-hacking-hail--"
 WORKER = "--home-u-.local-state-mu-workspaces-hail-worker-1--"
@@ -129,7 +129,7 @@ class Store(unittest.TestCase):
             env["PATH"] = str(Path(sys.executable).parent)
         env["PI_SESSION_ID"] = SELF
         return subprocess.run(
-            [sys.executable, str(BIN / "museum-search"), "--store", str(self.dir), *args],
+            [sys.executable, str(SCRIPTS / "museum-search"), "--store", str(self.dir), *args],
             capture_output=True,
             text=True,
             env=env,
@@ -284,7 +284,13 @@ class Units(unittest.TestCase):
             conf.write("STORE=box:/srv/museum\n")
             conf.flush()
             r = subprocess.run(
-                [sys.executable, str(BIN / "museum-search"), "--remote-command", "find", "it's"],
+                [
+                    sys.executable,
+                    str(SCRIPTS / "museum-search"),
+                    "--remote-command",
+                    "find",
+                    "it's",
+                ],
                 capture_output=True,
                 text=True,
                 env={**os.environ, "MUSEUM_CONFIG": conf.name},

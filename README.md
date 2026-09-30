@@ -6,7 +6,7 @@ That's easy to answer when one machine holds all your sessions. Across a fleet
 of laptops, devservers and throwaway worktrees, the session you need is on a
 host you've forgotten, or on one that no longer exists.
 
-museum is a central, append-only backup of pi coding-agent sessions from every machine, searchable by agents with `bin/museum-search`.
+museum is a central, append-only backup of pi coding-agent sessions from every machine, searchable by agents with the `museum` skill and its `museum-search` script.
 
 ## How it works
 
@@ -19,7 +19,7 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 - **The store** is any ssh host plus folder (`host:/path`), or a local path.
 - **Append-only:** the sync never passes `--delete`, so sessions you delete locally stay in the store.
 - **No collisions:** each machine writes only its own `<hostname>/` folder, so nothing in the store needs locking or merging.
-- **No daemon, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly with `bin/museum-search`, as the `museum` skill describes.
+- **No daemon, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly with `skills/museum/scripts/museum-search`, as the `museum` skill describes.
 - **Repo metadata:** at session start the extension adds a `museum` custom entry to the session (not sent to the model) with the git repo, remote, branch, commit and mu workstream, so a session in a throwaway mu worktree still names its project.
 - **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock(2)`) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
 - **Failures show up in pi:** the footer says `museum: backup failing: <error>` or `museum: no backup for 3d`, and says nothing while backups work.
@@ -54,8 +54,10 @@ The pi footer shows the same state: nothing while backups work, `museum: backup 
 ## Search
 
 ```sh
-bin/museum-search find stalwart hail     # sessions mentioning TERM, in store folders matching *hail*
-bin/museum-search show FILE stalwart     # that session's turns about TERM, with neighbours
+S=skills/museum/scripts/museum-search
+$S find stalwart hail     # sessions mentioning TERM, in store folders matching *hail*
+$S show FILE --users      # a session's arc: its user turns, one line each
+$S show FILE stalwart     # that session's turns about TERM, with neighbours
 ```
 
 For an ssh store it runs on the store host in one ssh call. The `museum` skill tells agents how to use it.
@@ -96,17 +98,17 @@ The store holds the only complete copy of every machine's sessions. Snapshot it 
 
 ```
 bin/museum-sync      the rsync backup, one at a time per node
-bin/museum-search    search the store: ranked triage, then one session's conversation
 pi/museum.ts          pi extension: triggers the sync, warns in the footer
 install.sh            per-machine setup
 skills/museum/       agent skill: where the store is and how to search it
+  scripts/museum-search  search the store: ranked triage, then one session's conversation
 docs/                 design notes
-test/                 unittest suite for bin/
+test/                 unittest suite for both scripts
 ```
 
 ## Develop
 
-The `bin/` scripts are single-file, stdlib-only Python, so any system `python3` runs them with nothing installed. They are linted and formatted with ruff and type-checked with ty; `install.sh` and the git hook are shell, checked with shellcheck and shfmt. All four run through `uvx` at pinned versions, so you only need [uv](https://docs.astral.sh/uv/). Tests are stdlib `unittest` in `test/`, against a temporary local store. The same `make check` runs in CI, where the tests run again on Python 3.9.
+`bin/museum-sync` and `skills/museum/scripts/museum-search` are single-file, stdlib-only Python, so any system `python3` runs them with nothing installed. They are linted and formatted with ruff and type-checked with ty; `install.sh` and the git hook are shell, checked with shellcheck and shfmt. All four run through `uvx` at pinned versions, so you only need [uv](https://docs.astral.sh/uv/). Tests are stdlib `unittest` in `test/`, against a temporary local store. The same `make check` runs in CI, where the tests run again on Python 3.9.
 
 ```sh
 make check   # lint (shellcheck, ruff, ty), tests, format check (shfmt, ruff)
