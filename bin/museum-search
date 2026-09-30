@@ -1,0 +1,143 @@
+#!/bin/sh
+# Search the museum store in one call.
+#
+#   museum-search find TERM [PROJECT]   matching sessions, ranked, one block each
+#   museum-search show FILE [TERM]      a session's user and assistant text; with
+#                                       TERM, only the turns that mention it and
+#                                       the turn either side
+#   museum-search --remote-command ...  print the command that runs the search on
+#                                       the store host, for a transport like mule
+#
+# TERM is a literal, matched case-insensitively. PROJECT narrows `find` to store
+# folders whose name contains it. FILE is a path relative to the store, as `find`
+# prints it. MUSEUM_LIMIT (default 20) caps the sessions `find` shows.
+#
+# `find` ranks project folders before mu workspace folders (.../mu/workspaces/...),
+# because orchestrator sessions hold the decisions and worker sessions repeat
+# them; within each group the newest session comes first.
+#
+# For an ssh store the script ships itself to the store host as one quoted
+# `sh -c` argument, so the remote login shell (zsh, bash, anything) only parses
+# a quoted string, and the store host needs rg and jq but no copy of museum.
+set -eu
+
+die() {
+  echo "museum-search: $*" >&2
+  exit 1
+}
+
+# Single-quote one word for a POSIX shell.
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Escape a literal for an rg regex.
+re() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|/]/\\&/g'; }
+
+# A store folder name as a short project label: the home prefix goes, and
+# mu workspaces become mu:<workstream>-<agent>.
+label() {
+  printf '%s' "$1" | sed -E 's/^--//; s/--$//; s/^(Users|home|var-home)-[^-]+-//; s/^\.local-state-mu-workspaces-/mu:/'
+}
+
+# The text blocks of a user or assistant message; content is a string or blocks.
+JQ_TEXT='[.message.content | if type == "string" then . else (.[]? | select(.type == "text") | .text) end] | join(" ")'
+
+cmd_find() {
+  [ $# -ge 1 ] && [ -n "$1" ] || die "usage: museum-search find TERM [PROJECT]"
+  term=$1 project=${2:-}
+  if [ -n "$project" ]; then
+    set -- */*"$project"*/
+    [ -d "$1" ] || die "no store folder matches *$project*"
+  else
+    set -- .
+  fi
+  tab=$(printf '\t')
+  files=$(rg -l -i -F -g '*.jsonl' -- "$term" "$@" < /dev/null | sed 's|^\./||' |
+    awk -F/ '{ print ($2 ~ /-mu-workspaces-/ ? 1 : 0) "\t" $NF "\t" $0 }' |
+    sort -t "$tab" -k1,1n -k2,2r | cut -f3)
+  [ -n "$files" ] || {
+    echo "no session mentions: $term"
+    return 0
+  }
+  total=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
+  limit=${MUSEUM_LIMIT:-20}
+  echo "$total sessions mention \"$term\"; showing $((total < limit ? total : limit)). Project folders first, then mu workspaces; newest first."
+  pattern=".{0,100}$(re "$term").{0,100}"
+  printf '%s\n' "$files" | head -n "$limit" | while IFS= read -r f; do
+    rest=${f#*/} name=${f##*/}
+    when=$(printf '%s' "$name" | sed -E 's/^([0-9-]{10})T([0-9]{2})-([0-9]{2}).*/\1 \2:\3/')
+    meta=$(rg -m1 -F '"customType":"museum"' "$f" < /dev/null |
+      jq -r '.data | [.project, .branch] | map(select(. != null and . != "")) | join("@")' 2> /dev/null || true)
+    hits=$(rg -c -i -F -- "$term" "$f" < /dev/null || true)
+    first=$(rg -m1 -F '"role":"user"' "$f" < /dev/null |
+      jq -r "select(.type == \"message\") | $JQ_TEXT | gsub(\"\\\\s+\"; \" \") | .[0:160]" 2> /dev/null || true)
+    # The first mention in conversation text; tool output (tables, file dumps)
+    # is the fallback, because it rarely says what was decided.
+    snip=$(rg -i -F -- "$term" "$f" < /dev/null |
+      jq -R -r "fromjson? | select(.type == \"message\" and (.message.role == \"user\" or .message.role == \"assistant\")) | $JQ_TEXT | gsub(\"\\\\s+\"; \" \")" 2> /dev/null |
+      rg -o -m1 -i -- "$pattern" | head -n 1 || true)
+    [ -n "$snip" ] || snip=$(rg -o -m1 -i -- "$pattern" "$f" < /dev/null | head -n 1 | sed 's/\\[nt]/ /g; s/\\"/"/g' || true)
+    snip=$(printf '%s' "$snip" | cut -c1-240)
+    printf '\n%s  %s  %s  (%s matching entries)\n' "$when" "${f%%/*}" "${meta:-$(label "${rest%%/*}")}" "$hits"
+    printf '  file:  %s\n  first: %s\n  match: %s\n' "$f" "$first" "$snip"
+  done
+}
+
+cmd_show() {
+  [ $# -ge 1 ] || die "usage: museum-search show FILE [TERM]"
+  [ -f "$1" ] || die "no such session in the store: $1"
+  head -n 1 "$1" | jq -r '"cwd: \(.cwd)"' 2> /dev/null || true
+  rg -m1 -F '"customType":"museum"' "$1" < /dev/null | jq -c '"repo: \(.data)"' -r 2> /dev/null || true
+  # -R with fromjson? skips a torn last line from a session still being written.
+  jq -R -n -r --arg t "${2:-}" "
+    [inputs | fromjson? | select(.type == \"message\" and (.message.role == \"user\" or .message.role == \"assistant\"))
+      | {ts: .timestamp, role: .message.role, text: ($JQ_TEXT)} | select(.text != \"\")] as \$m
+    | (\$t | ascii_downcase) as \$lt
+    | [range(0; \$m | length) | select(\$lt == \"\" or (\$m[.].text | ascii_downcase | contains(\$lt)))]
+    | [.[] | (. - 1, ., . + 1)] | unique | map(select(. >= 0 and . < (\$m | length))) as \$keep
+    | \$keep | to_entries[]
+    | (if .key > 0 and .value != \$keep[.key - 1] + 1 then \"...\n\" else \"\" end)
+      + (\$m[.value] | \"[\\(.ts)] \\(.role): \\(.text[0:1500])\")
+  " "$1"
+}
+
+main() {
+  print=
+  [ "${1:-}" = --remote-command ] && print=1 && shift
+  if [ "${1:-}" = --store ]; then
+    dir=$2
+    shift 2
+  else
+    config="${MUSEUM_CONFIG:-$HOME/.config/museum/config}"
+    [ -f "$config" ] || die "missing $config; search ~/.pi/agent/sessions by hand"
+    # shellcheck source=/dev/null
+    . "$config"
+    : "${STORE:?museum-search: STORE not set in $config}"
+    case "$STORE" in
+      *:*)
+        host=${STORE%%:*}
+        # env, not a VAR=x prefix: every login shell (fish too) runs `env`.
+        cmd="env MUSEUM_LIMIT=$(q "${MUSEUM_LIMIT:-20}") sh -c $(q "$(cat "$0")") museum-search --store $(q "${STORE#*:}")"
+        for a in "$@"; do cmd="$cmd $(q "$a")"; done
+        if [ -n "$print" ]; then
+          printf '%s\n' "$cmd"
+          return 0
+        fi
+        if [ -n "${SSH_MUX_ONLY:-}" ] && ! ssh -O check "$host" 2> /dev/null; then
+          die "no ssh master for $host (run: ssh -MNf $host)"
+        fi
+        exec ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "$cmd"
+        ;;
+      *) dir=$STORE ;;
+    esac
+  fi
+  cd "$dir" || die "cannot enter store $dir"
+  sub=${1:-}
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    find) cmd_find "$@" ;;
+    show) cmd_show "$@" ;;
+    *) die "usage: museum-search find TERM [PROJECT] | show FILE [TERM]" ;;
+  esac
+}
+
+main "$@"

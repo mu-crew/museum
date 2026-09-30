@@ -8,6 +8,11 @@
  *   agent_settled     sync if the node's last sync started over 10 minutes ago
  *   session_shutdown  flush: sync this session's final turns, 5s after exit
  *
+ * At session start it also records where the session ran as a `museum` custom
+ * entry (not sent to the model): the git repo behind the cwd and the mu
+ * workstream. A mu worktree's folder name says `worker-1`, not the project, so
+ * this is what lets a search group worker sessions under their repo.
+ *
  * All the coordination is in `museum-sync`: one sync per node however many
  * agents call it, and a flush that arrives mid-sync re-runs it. This file only
  * spawns it detached (never blocking a turn, surviving pi's exit) and shows a
@@ -23,12 +28,34 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Declared, not imported, so the extension needs nothing installed beside it.
-type Ctx = { hasUI: boolean; ui: { setStatus(key: string, text: string | undefined): void } };
+type Ctx = {
+  hasUI: boolean;
+  cwd: string;
+  ui: { setStatus(key: string, text: string | undefined): void };
+  sessionManager: { getEntries(): Array<{ type: string; customType?: string }> };
+};
 type ExtensionAPI = {
   on(
     event: "session_start" | "agent_settled" | "session_shutdown",
     handler: (event: unknown, ctx: Ctx) => void,
   ): void;
+  appendEntry(customType: string, data: unknown): void;
+  exec(
+    command: string,
+    args: string[],
+    options?: { cwd?: string; timeout?: number },
+  ): Promise<{ stdout: string; code: number }>;
+};
+
+/** What `museum-search` shows for a session; every field may be missing. */
+export type Meta = {
+  project?: string; // main repo's folder name, else the mu workstream
+  repo?: string; // main repo path, the same for all of its worktrees
+  remote?: string;
+  branch?: string;
+  commit?: string;
+  workstream?: string;
+  agent?: string;
 };
 
 const INTERVAL_S = Number(process.env.MUSEUM_INTERVAL) || 600;
@@ -84,6 +111,43 @@ export function warning(state: string, lastStart: string, now: number): string |
   return undefined;
 }
 
+/**
+ * `git rev-parse --path-format=absolute --git-common-dir HEAD --abbrev-ref HEAD`
+ * output and the origin URL, plus mu's pane variables, as one Meta.
+ */
+export function meta(revParse: string, remote: string, env: Record<string, string | undefined>): Meta {
+  // --abbrev-ref applies to every argument after it, so the commit comes first.
+  const [common, commit, branch] = revParse.trim().split("\n");
+  // The common dir is <repo>/.git for a plain repo and for every worktree of it.
+  const repo = common?.endsWith("/.git") ? dirname(common) : undefined;
+  const m: Meta = {
+    project: repo ? repo.split("/").pop() : env.MU_WORKSTREAM,
+    repo,
+    remote: remote.trim() || undefined,
+    branch: branch && branch !== "HEAD" ? branch : undefined,
+    commit: commit || undefined,
+    workstream: env.MU_WORKSTREAM || undefined,
+    agent: env.MU_AGENT_NAME || undefined,
+  };
+  return Object.fromEntries(Object.entries(m).filter(([, v]) => v)) as Meta;
+}
+
+async function record(pi: ExtensionAPI, ctx: Ctx): Promise<void> {
+  // A resumed or reloaded session already has its entry.
+  if (ctx.sessionManager.getEntries().some((e) => e.type === "custom" && e.customType === "museum")) return;
+  const git = (args: string[]) =>
+    pi.exec("git", args, { cwd: ctx.cwd, timeout: 3000 }).then(
+      (r) => (r.code === 0 ? r.stdout : ""),
+      () => "",
+    );
+  const [revParse, remote] = await Promise.all([
+    git(["rev-parse", "--path-format=absolute", "--git-common-dir", "HEAD", "--abbrev-ref", "HEAD"]),
+    git(["config", "--get", "remote.origin.url"]),
+  ]);
+  const m = meta(revParse, remote, process.env);
+  if (Object.keys(m).length > 0) pi.appendEntry("museum", m);
+}
+
 export default function museum(pi: ExtensionAPI): void {
   const show = (ctx: Ctx) => {
     if (!ctx.hasUI) return;
@@ -94,6 +158,8 @@ export default function museum(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     show(ctx);
     run("--if-due");
+    // Not awaited: git must never delay pi's startup.
+    record(pi, ctx).catch(() => {});
   });
   pi.on("agent_settled", (_event, ctx) => {
     show(ctx);

@@ -3,7 +3,7 @@
 # installed globally. Style comes from .editorconfig.
 SHELLCHECK := uvx --from shellcheck-py==0.11.0.1 shellcheck
 SHFMT      := uvx --from shfmt-py==4.2.0 shfmt
-SCRIPTS    := bin/museum-sync install.sh .githooks/pre-commit
+SCRIPTS    := bin/museum-sync bin/museum-search install.sh .githooks/pre-commit
 
 .PHONY: check lint fmt hooks
 
