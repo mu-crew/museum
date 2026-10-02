@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import shutil
 import signal
@@ -56,12 +57,8 @@ class Sandbox(unittest.TestCase):
             timeout=60,
         )
 
-    def state_field(self, key: str) -> str:
-        for line in (self.state / "state").read_text().splitlines():
-            k, _, v = line.partition("=")
-            if k == key:
-                return v
-        raise KeyError(key)
+    def state_field(self, key: str) -> Any:
+        return json.loads((self.state / "state.json").read_text())[key]
 
 
 @unittest.skipUnless(RSYNC, "rsync 3 not installed")
@@ -72,7 +69,18 @@ class LocalStore(Sandbox):
         copied = self.store / "box" / "--proj--"
         self.assertEqual(sorted(p.name for p in copied.iterdir()), ["s1.jsonl"])
         self.assertEqual(self.state_field("status"), "ok")
+        self.assertEqual(self.state_field("warning"), "")
         self.assertFalse((self.state / "pending").exists())
+
+    def test_warning_follows_the_latest_sync(self) -> None:
+        # Every pi on the node shows this one file, so a recovery by any
+        # agent's sync clears the label for all of them.
+        self.store.chmod(0o500)
+        self.run_sync()
+        self.assertTrue(self.state_field("warning").startswith("museum: backup failing: mkdir"))
+        self.store.chmod(0o700)
+        self.run_sync()
+        self.assertEqual(self.state_field("warning"), "")
 
     def test_append_only_keeps_deleted_sessions_and_appends(self) -> None:
         self.run_sync()
@@ -157,6 +165,7 @@ class Failures(Sandbox):
         # Recorded, so pi's footer says what is wrong.
         self.assertEqual(self.state_field("status"), "error")
         self.assertIn("run install.sh", self.state_field("message"))
+        self.assertIn("run install.sh", self.state_field("warning"))
 
     def test_bad_config_is_recorded_not_synced(self) -> None:
         self.write_config('machine = "box"\n[store]\npath = "/tmp/x"\nhots = "typo"\n')

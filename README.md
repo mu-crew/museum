@@ -23,7 +23,7 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 - **No daemon, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly with `skills/museum/scripts/museum-search`, as the `museum` skill describes.
 - **Repo metadata:** at session start the extension adds a `museum` custom entry to the session (not sent to the model) with the git repo, remote, branch, commit and mu workstream, so a session in a throwaway mu worktree still names its project.
 - **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock(2)`) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
-- **Failures show up in pi:** the footer says `museum: backup failing: <error>` or `museum: no backup for 3d`, and says nothing while backups work.
+- **Failures show up in pi:** the footer says `museum: backup failing: <error>`, and says nothing while backups work. `museum-sync` writes the label into one `state.json` per node and every pi re-reads it every 5 seconds, so when one agent's sync fails or recovers, every agent's footer follows.
 
 ## Install (per machine)
 
@@ -46,11 +46,11 @@ The install script:
 ## Check and sync by hand
 
 ```sh
-cat ~/.cache/museum/state        # status=ok|error, time (epoch), message (last error)
+cat ~/.local/state/museum/state.json  # status ok|error, time (epoch), message (last error), warning (footer label)
 bin/museum-sync                  # sync now, and print rsync or ssh errors
 ```
 
-The pi footer shows the same state: nothing while backups work, `museum: backup failing: <error>` after a failed sync, `museum: no backup for 3d` when no sync has succeeded for over a day.
+The pi footer shows the `warning` field of `state.json`, which the sync writes: nothing while backups work, `museum: backup failing: <error>` after a failed sync. pi adds `museum: no backup yet` before the first sync finishes, and `museum: cannot run museum-sync` when it cannot start the script.
 
 ## Search
 
@@ -89,7 +89,7 @@ These environment variables are for tests and unusual layouts:
 | `MUSEUM_INTERVAL` | `600` | Seconds between routine syncs |
 | `MUSEUM_RETRY_DELAY` | `30` | Seconds before the one retry (`ssh_mux_only` only) |
 | `MUSEUM_CONFIG` | `~/.config/museum/config.toml` | Config file |
-| `MUSEUM_STATE_DIR` | `~/.cache/museum` | Lock, `pending`, `last-start` and `state` |
+| `MUSEUM_STATE_DIR` | `$XDG_STATE_HOME/museum`, else `~/.local/state/museum` | Lock, `pending`, `last-start` and `state.json` |
 | `PI_SESSIONS_DIR` | `~/.pi/agent/sessions` | What gets backed up |
 | `MUSEUM_SYNC` | `bin/museum-sync` beside the extension | Script the extension runs |
 
@@ -112,7 +112,7 @@ The store holds the only complete copy of every machine's sessions. Snapshot it 
 
 ```
 bin/museum-sync      the rsync backup, one at a time per node
-pi/museum.ts          pi extension: triggers the sync, warns in the footer
+pi/museum.ts          pi extension: triggers the sync, shows its warning in the footer
 install.sh            per-machine setup
 skills/museum/       agent skill: where the store is and how to search it
   scripts/museum-search  search the store: ranked triage, then one session's conversation

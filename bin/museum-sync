@@ -28,6 +28,7 @@ first sync, and the old file is kept as config.old.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -220,7 +221,10 @@ class Result(NamedTuple):
 
 
 def state_dir() -> Path:
-    return Path(os.environ.get("MUSEUM_STATE_DIR", Path.home() / ".cache/museum"))
+    if "MUSEUM_STATE_DIR" in os.environ:
+        return Path(os.environ["MUSEUM_STATE_DIR"])
+    xdg = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state"
+    return Path(xdg) / "museum"
 
 
 def settings() -> Settings:
@@ -321,11 +325,29 @@ def error_line(output: str) -> str:
     return (why or lines or [""])[-1]
 
 
+def write(path: Path, text: str) -> None:
+    """Atomically, so a pi polling the file never reads half of it."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def warning(status: str, message: str) -> str:
+    """pi's footer label, empty while backups work. Every pi on the node shows
+    this file as it is, so the rule for the label lives here, in one place."""
+    return f"museum: backup failing: {message}"[:120] if status == "error" else ""
+
+
 def record(state: Path, status: str, message: str) -> None:
-    tmp = state / "state.tmp"
+    """state.json: the last sync's result, and the footer label every pi shows."""
     message = " ".join(message.split())
-    tmp.write_text(f"status={status}\ntime={int(time.time())}\nmessage={message}\n")
-    tmp.replace(state / "state")
+    doc = {
+        "status": status,
+        "time": int(time.time()),
+        "message": message,
+        "warning": warning(status, message),
+    }
+    write(state / "state.json", json.dumps(doc) + "\n")
 
 
 def sync_once(s: Settings, rsync: str | None) -> bool:
@@ -417,5 +439,16 @@ def main(argv: list[str]) -> int:
     return 0 if ok else 1
 
 
+def guarded(argv: list[str]) -> int:
+    """main, with a crash recorded like a failed sync: pi shows only what this
+    script writes, so a traceback that wrote nothing would leave it silent."""
+    try:
+        return main(argv)
+    except Exception as e:
+        with contextlib.suppress(OSError):
+            record(state_dir(), "error", f"museum-sync crashed: {type(e).__name__}: {e}")
+        raise
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(guarded(sys.argv[1:]))

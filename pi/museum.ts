@@ -15,8 +15,15 @@
  *
  * All the coordination is in `museum-sync`: one sync per node however many
  * agents call it, and a flush that arrives mid-sync re-runs it. This file only
- * spawns it detached (never blocking a turn, surviving pi's exit) and shows a
- * footer warning when the last backup failed or is old.
+ * spawns it detached (never blocking a turn, surviving pi's exit).
+ *
+ * The footer warning is separate from the triggers. `museum-sync` writes the
+ * label into the node's one `state.json`, empty while backups work, and every
+ * pi shows it, re-read every few seconds rather than at its own events.
+ * Otherwise, with many agents, an idle one keeps saying "ok" through an outage
+ * that another agent's sync hit, and keeps saying "failing" after another
+ * agent's sync recovered. The only label decided here is the one the script
+ * cannot write: it did not start at all.
  *
  * Installed by museum's install.sh as a symlink to the repo, so MUSEUM_SYNC
  * resolves next to it; override with $MUSEUM_SYNC.
@@ -59,8 +66,11 @@ export type Meta = {
 };
 
 const INTERVAL_S = Number(process.env.MUSEUM_INTERVAL) || 600;
-const STALE_S = 24 * 60 * 60;
-const STATE_DIR = process.env.MUSEUM_STATE_DIR || join(homedir(), ".cache", "museum");
+const POLL_MS = 5000;
+const STATE_DIR =
+  process.env.MUSEUM_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "museum");
+// 126/127: the shell or env could not run it (no python3 on PATH, say).
+const NOT_RUN = new Set([126, 127]);
 
 function syncPath(): string {
   if (process.env.MUSEUM_SYNC) return process.env.MUSEUM_SYNC;
@@ -68,19 +78,23 @@ function syncPath(): string {
   return join(here, "..", "bin", "museum-sync");
 }
 
-function read(name: string): string {
+function read(name: string): string | undefined {
   try {
     return readFileSync(join(STATE_DIR, name), "utf8");
   } catch {
-    return "";
+    return undefined;
   }
 }
+
+// Set when this pi could not start museum-sync, so no sync can write
+// state.json. Cleared by the next start that works.
+let notRun: string | undefined;
 
 function run(mode: "--if-due" | "--now", delayS = 0): void {
   // Cheap pre-check, so ten agents settling does not start ten Pythons. The
   // script re-checks under its lock; this is only an optimisation.
   if (mode === "--if-due") {
-    const last = Number(read("last-start").trim()) || 0;
+    const last = Number(read("last-start")?.trim()) || 0;
     if (Date.now() / 1000 - last < INTERVAL_S) return;
   }
   try {
@@ -91,24 +105,37 @@ function run(mode: "--if-due" | "--now", delayS = 0): void {
             stdio: "ignore",
           })
         : spawn(syncPath(), [mode], { detached: true, stdio: "ignore" });
-    child.on("error", () => {});
+    child.on("error", (e) => (notRun = `museum: cannot run museum-sync: ${e.message}`));
+    child.on("exit", (code) => {
+      notRun = code !== null && NOT_RUN.has(code) ? `museum: cannot run museum-sync (exit ${code})` : undefined;
+    });
     child.unref();
-  } catch {
-    // A missing script shows up as a stale backup in the footer.
+  } catch (e) {
+    notRun = `museum: cannot run museum-sync: ${(e as Error).message}`;
   }
 }
 
-/** One footer line when something is wrong, nothing when all is well. */
-export function warning(state: string, lastStart: string, now: number): string | undefined {
-  const field = (key: string) => state.match(new RegExp(`^${key}=(.*)$`, "m"))?.[1] ?? "";
-  const status = field("status");
-  const message = field("message");
-  const okAt = status === "ok" ? Number(field("time")) : 0;
-  if (!status && !lastStart.trim()) return "museum: no backup yet";
-  if (status === "error") return `museum: backup failing: ${message}`.slice(0, 120);
-  const age = now - okAt;
-  if (age > STALE_S) return `museum: no backup for ${Math.floor(age / 86400)}d`;
-  return undefined;
+/** What `museum-sync` records after each sync, in state.json. */
+export type State = {
+  status: "ok" | "error";
+  time: number; // epoch seconds
+  message: string; // the error, empty when ok
+  warning: string; // the footer label, empty when ok
+};
+
+/**
+ * The footer label: state.json's `warning`, empty while backups work. No file
+ * means no sync has finished since install. The script writes it atomically,
+ * so a file that does not parse is not a half-written one.
+ */
+export function warning(file: string | undefined, notRun?: string): string | undefined {
+  if (notRun) return notRun.slice(0, 120);
+  if (file === undefined) return "museum: no backup yet";
+  try {
+    return (JSON.parse(file) as State).warning || undefined;
+  } catch {
+    return "museum: state.json does not parse";
+  }
 }
 
 /**
@@ -149,24 +176,38 @@ async function record(pi: ExtensionAPI, ctx: Ctx): Promise<void> {
 }
 
 export default function museum(pi: ExtensionAPI): void {
+  let timer: ReturnType<typeof setInterval> | undefined;
+  // null: nothing set yet, so the first show() always sets the status.
+  let shown: string | undefined | null = null;
   const show = (ctx: Ctx) => {
-    if (!ctx.hasUI) return;
-    ctx.ui.setStatus("museum", warning(read("state"), read("last-start"), Date.now() / 1000));
+    const text = warning(read("state.json"), notRun);
+    if (text !== shown) ctx.ui.setStatus("museum", text);
+    shown = text;
+  };
+  const stop = () => {
+    clearInterval(timer);
+    timer = undefined;
   };
   // --if-due, not --now: mu starts agents in batches, and each start forcing
   // a sync would turn a crew launch into a sync storm for nothing.
   pi.on("session_start", (_event, ctx) => {
-    show(ctx);
+    if (ctx.hasUI) {
+      stop();
+      shown = null;
+      show(ctx);
+      timer = setInterval(() => show(ctx), POLL_MS);
+      timer.unref?.();
+    }
     run("--if-due");
     // Not awaited: git must never delay pi's startup.
     record(pi, ctx).catch(() => {});
   });
-  pi.on("agent_settled", (_event, ctx) => {
-    show(ctx);
-    run("--if-due");
-  });
+  pi.on("agent_settled", () => run("--if-due"));
   // Delayed: other extensions still write to the session after this handler
   // (a session name, for one), and a sync that starts now would miss them
   // until the next one. The child is detached, so pi does not wait.
-  pi.on("session_shutdown", () => run("--now", 5));
+  pi.on("session_shutdown", () => {
+    stop();
+    run("--now", 5);
+  });
 }

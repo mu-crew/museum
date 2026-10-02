@@ -5,7 +5,7 @@ description: Museum, the archive of all past pi sessions from every machine. Use
 
 # Museum
 
-Every machine rsyncs `~/.pi/agent/sessions/` into one central store. The store location is the `[store]` table in `~/.config/museum/config.toml`: `path` on `host` over ssh, or a local `path` when there is no `host`. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends. `~/.cache/museum/state` says when this machine last synced and why it failed, if it did.
+Every machine rsyncs `~/.pi/agent/sessions/` into one central store. The store location is the `[store]` table in `~/.config/museum/config.toml`: `path` on `host` over ssh, or a local `path` when there is no `host`. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends. `~/.local/state/museum/state.json` says when this machine last synced and why it failed, if it did.
 
 ## Layout
 
@@ -41,9 +41,9 @@ For a search `museum-search` does not cover, use `rg` and `jq` on the store host
 
 ## Backup health
 
-Use this when the user asks whether museum is working, or pi's footer shows `museum: backup failing` or `museum: no backup for`.
+Use this when the user asks whether museum is working, or pi's footer shows `museum: backup failing`, `museum: no backup yet` or `museum: cannot run museum-sync`.
 
-1. Read this machine's last result: `cat ~/.cache/museum/state`. `status` is `ok` or `error`, `time` is epoch seconds, and `message` is the last error.
+1. Read this machine's last result: `cat ~/.local/state/museum/state.json`. `status` is `ok` or `error`, `time` is epoch seconds, `message` is the last error, and `warning` is the footer label, empty when all is well. The footer shows `warning`, and every pi on the machine picks up a change within 5 seconds, so a successful sync clears it everywhere.
 2. Sync by hand to see the full error. The script is in the museum repo's `bin/`, which the skill folder links into:
    ```
    "$(dirname "$(readlink -f ~/.agents/skills/museum)")/../bin/museum-sync"
