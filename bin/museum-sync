@@ -405,6 +405,9 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     if_due = parse(argv).if_due
+    # pi starts this in its own cwd, often a mu workspace deleted since, and
+    # rsync exits 3 when getcwd() fails. Every path here is absolute.
+    os.chdir(HOME)
     state = state_dir()
     state.mkdir(parents=True, exist_ok=True)
     try:

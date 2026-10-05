@@ -68,6 +68,30 @@ class LocalStore(Sandbox):
         self.assertEqual(r.returncode, 0, r.stderr)
         copied = self.store / "box" / "--proj--"
         self.assertEqual(sorted(p.name for p in copied.iterdir()), ["s1.jsonl"])
+
+    def test_syncs_from_a_deleted_cwd(self) -> None:
+        # pi starts the sync in its own cwd, often a mu workspace that has since
+        # been deleted; rsync's getcwd() then fails with code 3.
+        gone = self.dir / "gone"
+        gone.mkdir()
+        r = subprocess.run(
+            [
+                "sh",
+                "-c",
+                'rmdir "$PWD" && exec "$0" "$1"',
+                sys.executable,
+                str(BIN / "museum-sync"),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env(),
+            check=False,
+            timeout=60,
+            cwd=gone,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.state_field("status"), "ok")
+        self.assertTrue((self.store / "box" / "--proj--" / "s1.jsonl").exists())
         self.assertEqual(self.state_field("status"), "ok")
         self.assertEqual(self.state_field("warning"), "")
         self.assertFalse((self.state / "pending").exists())
