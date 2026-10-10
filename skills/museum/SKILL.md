@@ -1,6 +1,6 @@
 ---
 name: museum
-description: Museum, the archive of all past pi sessions from every machine. Use when the user refers to earlier work ("we did X before", "what did we decide about Y", "find the session where…"), or when past sessions would help answer the question.
+description: Museum, the archive of all past pi sessions from every machine. Use when the user refers to earlier work ("we did X before", "what did we decide about Y", "find the session where…", "prior art"), or when past sessions would help answer the question.
 ---
 
 # Museum
