@@ -1,6 +1,8 @@
 # `museum-search stats` and `calls`: where agent time goes
 
-Status: approved design; implementation under review.
+Status: implemented in `cb222a7`; Sol review findings addressed and release
+gate verified. The clarifications below supersede the initial design where
+the archive cannot support the proposed measurement.
 
 ## Implementation clarifications
 
