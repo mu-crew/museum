@@ -9,9 +9,28 @@
                                                   either side; --users, only the
                                                   user turns, one line each, with
                                                   the question a terse reply answers
+  museum-search stats [PROJECT] [FILTERS] [--by day|6h|hour] [--slow N]
+                                                  where time goes: model, tool and
+                                                  wait time by role, and a trend
+  museum-search calls [PROJECT] [FILTERS] [--group-by session|agent|workstream|role]
+                                                  the tool calls behind stats
   museum-search --remote-command ...              print the command that runs the
                                                   search on the store host, for a
                                                   transport like mule
+
+FILTERS select tool calls the same way for stats and calls: --match/--exclude
+(regex, tested per shell segment, so `cat contrib/gate` can be excluded while
+`make && contrib/gate` matches), --tool, --min-secs/--max-secs, --result (regex
+on the tool's output), --error, --background/--foreground, --role/--agent/
+--workstream (globs on the session's museum entry), --since/--until. Model time
+is the gap before each assistant message, tool time the gap before each tool
+result, wait time every other gap (the user, a follow-up). A call's duration is
+its recorded durationMs, else an estimated call-to-result gap; duration_source
+labels which. Request timestamps do not establish execution intervals, so no
+concurrency is reported. Model/tool wall spans split across UTC windows;
+--since/--until select session-start cohorts by filename, not event-time slices.
+Shell heredoc and background detection are launch/matching heuristics, not a
+shell parser or proof of execution.
 
 TERM is a literal, matched case-insensitively. PROJECT narrows `find` to store
 folders whose name contains it. FILE is a path relative to the store, as `find`
@@ -40,9 +59,12 @@ import os
 import re
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -393,6 +415,626 @@ def arc(turns: list[tuple[str, str, str]], keep: list[int]) -> None:
         print(f"[{ts}] user: {said[:200]}")
 
 
+# --- stats and calls: where agent time goes ---
+
+COMMAND = 300  # characters of a tool call's command kept for display
+# A shell command's segments: --match and --exclude test each one, so
+# `cat contrib/gate` is a read but `make && contrib/gate` is a run. Separators
+# inside quotes do not split: `bash -c "cd x && contrib/gate"` is one segment.
+SEPARATOR = re.compile(r"&&|\|\||;")
+
+
+def segments(command: str) -> list[str]:
+    """COMMAND split at ;, && and || outside quotes, and at every newline.
+    Quote state resets at a newline, so an apostrophe in a heredoc line does
+    not swallow the lines after it."""
+    out: list[str] = []
+    end = None  # heredoc terminator; shell bodies are retained, data is skipped
+    shell_body = False
+    for line in command.split("\n"):
+        if end is not None:
+            if line.strip() == end:
+                end = None
+                continue
+            if not shell_body:
+                continue
+        elif m := HEREDOC.search(line):
+            end = m[2]
+            shell_body = any(SHELL_HEREDOC.match(p) for p in segments(line[: m.start()]))
+        quote, start, i = "", 0, 0
+        while i < len(line):
+            ch = line[i]
+            if quote:
+                if ch == "\\" and quote == '"':
+                    i += 1
+                elif ch == quote:
+                    quote = ""
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "\\":
+                i += 1
+            elif m := SEPARATOR.match(line, i):
+                out.append(line[start:i])
+                start = i = m.end()
+                continue
+            i += 1
+        out.append(line[start:])
+    return out
+
+
+# A command that puts itself in the background: a lone & (not &&, >&, &>).
+BACKGROUND = re.compile(r"(?<![&>|<])&(?![&>])")
+# Simple heredocs only: retain bodies fed to bash/sh (optionally via env),
+# suppress other bodies. Not a shell parser: wrappers/nesting may be missed.
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+SHELL_HEREDOC = re.compile(r"^\s*(?:env\s+)?(?:/[^\s]+/)?(?:bash|sh)\b")
+
+
+def background_launch(command: str) -> bool:
+    """Launch heuristic: unquoted redirect and lone &, unless followed by wait.
+    Shell quoting is masked; this does not parse control flow or job lifetimes.
+    """
+    parts = []
+    for part in segments(command):
+        quote, escaped = "", False
+        visible = []
+        for ch in part:
+            if escaped:
+                visible.append(" ")
+                escaped = False
+            elif ch == "\\" and quote != "'":
+                visible.append(" ")
+                escaped = True
+            elif quote:
+                visible.append(" ")
+                if ch == quote:
+                    quote = ""
+            elif ch in "'\"":
+                visible.append(" ")
+                quote = ch
+            else:
+                visible.append(ch)
+        parts.append("".join(visible))
+    visible_command = ";".join(parts)
+    launches = [m.start() for m in BACKGROUND.finditer(visible_command)]
+    if any(re.search(r"(?:^|[;&()])\s*wait\b", visible_command[pos + 1 :]) for pos in launches):
+        return False
+    return any(">" in part and BACKGROUND.search(part) is not None for part in parts)
+
+
+class Call(NamedTuple):
+    start: str  # ISO timestamp, UTC: when the model asked for the call
+    secs: float
+    duration_source: str  # "durationMs" measured, or "estimated" call-to-result gap
+    tool: str
+    command: str  # the first COMMAND characters
+    error: bool
+    background: bool
+    session: int  # index into the scanned sessions
+
+
+class Timeline(NamedTuple):
+    path: str
+    started: str  # ISO timestamp of the first message
+    role: str
+    agent: str
+    workstream: str
+    first: str  # the first user message
+    # (start, kind, seconds) for every gap between messages, kind being
+    # "model" (ends at an assistant message), "tool" (ends at a tool result)
+    # or "wait" (ends at anything else: the user, a follow-up, a nudge).
+    spans: list[tuple[str, str, float]]
+    calls: int  # every tool call, filtered or not
+
+
+class Filters(NamedTuple):
+    match: re.Pattern[str] | None
+    exclude: re.Pattern[str] | None
+    tools: set[str]
+    min_secs: float | None
+    max_secs: float | None
+    result: re.Pattern[str] | None
+    error: bool
+    background: bool | None  # True: only background, False: only foreground
+    role: str | None  # fnmatch globs on the session's museum entry
+    agent: str | None
+    workstream: str | None
+
+    def session(self, role: str, agent: str, workstream: str) -> bool:
+        return all(
+            glob is None or fnmatch(value, glob)
+            for glob, value in (
+                (self.role, role),
+                (self.agent, agent),
+                (self.workstream, workstream),
+            )
+        )
+
+    def command(self, tool: str, command: str) -> bool:
+        if self.tools and tool not in self.tools:
+            return False
+        if self.match is None and self.exclude is None:
+            return True
+        parts = segments(command) if tool == "bash" else [command]
+        return any(
+            (self.match is None or self.match.search(s))
+            and not (self.exclude and self.exclude.search(s))
+            for s in parts
+            if s.strip()
+        )
+
+    def outcome(self, secs: float, error: bool, background: bool, result: str) -> bool:
+        return not (
+            (self.min_secs is not None and secs < self.min_secs)
+            or (self.max_secs is not None and secs > self.max_secs)
+            or (self.error and not error)
+            or (self.background is not None and background != self.background)
+            or (self.result and not self.result.search(result))
+        )
+
+
+def role_of(meta: dict[str, Any]) -> str:
+    """A session's role: the leading word of its mu agent name (worker-3 is a
+    worker, delegate-ref-x a delegate), "main" for a session with a museum
+    entry but no agent (the one a human drives), "other" without one."""
+    if not meta:
+        return "other"
+    m = re.match(r"[a-z]+", str(meta.get("agent") or ""))
+    return m[0] if m else "main"
+
+
+def stamp(entry: dict[str, Any]) -> datetime | None:
+    ts = entry.get("timestamp")
+    if not isinstance(ts, str):
+        return None
+    try:
+        # Not datetime.fromisoformat(ts) alone: the store host may run a python3
+        # older than 3.11, whose fromisoformat rejects a trailing Z.
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))  # noqa: FURB162
+    except ValueError:
+        return None
+
+
+def iso(t: datetime) -> str:
+    # timezone.utc, not datetime.UTC (3.11+): see stamp().
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")  # noqa: UP017
+
+
+def command_of(name: str, args: object) -> str:
+    if isinstance(args, dict):
+        for key in ("command", "code", "path"):
+            if isinstance(args.get(key), str):
+                return args[key]
+    return json.dumps(args, ensure_ascii=False)
+
+
+def head_meta(path: Path) -> dict[str, Any]:
+    """The museum entry, which pi writes in a session's first few lines."""
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for n, line in enumerate(f):
+            if n > 20:
+                break
+            if '"museum"' in line:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("customType") == "museum":
+                    return entry.get("data") or {}
+    return {}
+
+
+def session_files(project: str | None, since: str | None, until: str | None) -> list[Path]:
+    """The sessions to scan: started in [since, until] (by file name), in a
+    folder matching PROJECT or with a museum entry whose project or
+    workstream does."""
+    out = []
+    for path in sorted(Path().glob("*/*/*.jsonl")):
+        started = Session.of(str(path)).name[:19]  # 2026-10-21T12-14-38
+        day_time = started[:10] + started[10:].replace("-", ":")
+        if since and day_time < since:
+            continue
+        if until and day_time[: len(until)] > until:
+            continue
+        if project and project not in path.parent.name:
+            meta = head_meta(path)
+            if not any(project in str(meta.get(k) or "") for k in ("project", "workstream")):
+                continue
+        out.append(path)
+    return out
+
+
+def timeline(path: Path, index: int, flt: Filters) -> tuple[Timeline, list[Call]] | None:
+    """One session's time split and its tool calls that pass the filters;
+    None when the session's role, agent or workstream does not."""
+    meta: dict[str, Any] = {}
+    first, started = "", None
+    prev: datetime | None = None
+    spans: list[tuple[str, str, float]] = []
+    asked: dict[str, tuple[datetime, str, str]] = {}
+    calls: list[Call] = []
+    ncalls = 0
+    for entry in entries(path):
+        if entry.get("customType") == "museum" and not meta:
+            meta = entry.get("data") or {}
+            if not flt.session(
+                role_of(meta), meta.get("agent") or "", meta.get("workstream") or ""
+            ):
+                return None
+        if entry.get("type") != "message":
+            continue
+        t = stamp(entry)
+        message = entry.get("message") or {}
+        if t is None or not isinstance(message, dict):
+            continue
+        started = started or t
+        role = message.get("role")
+        if prev is not None and role != "system":
+            kind = {"assistant": "model", "toolResult": "tool"}.get(role, "wait")
+            spans.append((iso(prev), kind, max(0.0, (t - prev).total_seconds())))
+        prev = t
+        if role == "user" and not first:
+            first = squash(text(entry) or "")[:160]
+        content = message.get("content")
+        if role == "assistant" and isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "toolCall":
+                    ncalls += 1
+                    name = str(c.get("name") or "")
+                    cmd = command_of(name, c.get("arguments"))
+                    if flt.command(name, cmd):
+                        asked[str(c.get("id"))] = (t, name, cmd)
+        elif role == "toolResult":
+            call = asked.pop(str(message.get("toolCallId")), None)
+            if call is None:
+                continue
+            at, name, cmd = call
+            ms = message.get("durationMs")
+            secs = ms / 1000 if isinstance(ms, (int, float)) else (t - at).total_seconds()
+            error = message.get("isError") is True
+            bg = name == "bash" and background_launch(cmd)
+            result = " ".join(strings(content)) if flt.result else ""
+            if flt.outcome(secs, error, bg, result):
+                source = "durationMs" if isinstance(ms, (int, float)) else "estimated"
+                calls.append(Call(iso(at), secs, source, name, cmd[:COMMAND], error, bg, index))
+    if started is None:
+        return None
+    if not meta and not flt.session("other", "", ""):
+        return None
+    agent, ws = str(meta.get("agent") or ""), str(meta.get("workstream") or "")
+    tl = Timeline(str(path), iso(started), role_of(meta), agent, ws, first, spans, ncalls)
+    return tl, calls
+
+
+def scan_all(ns: argparse.Namespace) -> tuple[list[Timeline], list[Call]]:
+    def rx(s: str | None) -> re.Pattern[str] | None:
+        return re.compile(s) if s else None
+
+    flt = Filters(
+        rx(ns.match),
+        rx(ns.exclude),
+        set(ns.tool.split(",")) if ns.tool else set(),
+        ns.min_secs,
+        ns.max_secs,
+        rx(ns.result),
+        ns.error,
+        ns.background,
+        ns.role,
+        ns.agent,
+        ns.workstream,
+    )
+    sessions: list[Timeline] = []
+    calls: list[Call] = []
+    for path in session_files(ns.project, ns.since, ns.until):
+        got = timeline(path, len(sessions), flt)
+        if got:
+            sessions.append(got[0])
+            calls.extend(got[1])
+    return sessions, calls
+
+
+def period(ts: str, by: str) -> str:
+    if by == "day":
+        return ts[:10]
+    if by == "hour":
+        return ts[:10] + " " + ts[11:13] + "h"
+    return f"{ts[:10]} {int(ts[11:13]) // 6 * 6:02d}h"
+
+
+def quantile(xs: list[float], q: float) -> float:
+    """Upper-index quantile (sorted index floor(n*q), capped), used for p90."""
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * q))] if xs else 0.0
+
+
+def print_table(headers: list[str], rows: list[list[object]]) -> None:
+    def cell(v: object) -> str:
+        return f"{v:.1f}" if isinstance(v, float) else str(v)
+
+    cells = [[cell(v) for v in r] for r in rows]
+    widths = [max([len(h), *(len(r[i]) for r in cells)]) for i, h in enumerate(headers)]
+    for r in [headers, *cells]:
+        print(
+            "  ".join(
+                v.ljust(w) if i == 0 else v.rjust(w)
+                for i, (v, w) in enumerate(zip(r, widths))  # noqa: B905 - remote Python 3.9
+            )
+        )
+
+
+def call_row(c: Call, s: Timeline) -> dict[str, Any]:
+    return {
+        "start": c.start,
+        "secs": round(c.secs, 3),
+        "duration_source": c.duration_source,
+        "tool": c.tool,
+        "role": s.role,
+        "agent": s.agent,
+        "workstream": s.workstream,
+        "error": c.error,
+        "background": c.background,
+        "file": s.path,
+        "command": c.command,
+    }
+
+
+def print_calls(rows: list[dict[str, Any]]) -> None:
+    for r in rows:
+        flags = " ".join(
+            f
+            for f, on in (
+                ("estimated", r["duration_source"] == "estimated"),
+                ("error", r["error"]),
+                ("background", r["background"]),
+            )
+            if on
+        )
+        who = r["agent"] or r["role"]
+        print(
+            f"\n{r['start'].replace('T', ' ')}  {r['secs']:.0f}s  {r['tool']}  {who}  {flags}".rstrip()
+        )
+        print(f"  cmd:  {squash(r['command'])[:200]}\n  file: {r['file']}")
+
+
+def filtered(ns: argparse.Namespace) -> bool:
+    return any(
+        getattr(ns, k) not in (None, False)
+        for k in (
+            "match",
+            "exclude",
+            "tool",
+            "min_secs",
+            "max_secs",
+            "result",
+            "error",
+            "background",
+        )
+    )
+
+
+def stats(ns: argparse.Namespace) -> int:
+    sessions, calls = scan_all(ns)
+    if not sessions and not ns.json:
+        print("no sessions match")
+        return 0
+    hours = 3600.0
+    by_role: dict[str, dict[str, float]] = {}
+    for s in sessions:
+        r = by_role.setdefault(
+            s.role,
+            dict.fromkeys(
+                ("sessions", "calls", "model", "tool", "wait", "matched", "matched_secs"), 0.0
+            ),
+        )
+        r["sessions"] += 1
+        r["calls"] += s.calls
+        for _, kind, secs in s.spans:
+            r[kind] += secs
+    for c in calls:
+        by_role[sessions[c.session].role]["matched"] += 1
+        by_role[sessions[c.session].role]["matched_secs"] += c.secs
+
+    trend: dict[str, dict[str, Any]] = {}
+
+    def bucket(ts: str) -> dict[str, Any]:
+        return trend.setdefault(
+            period(ts, ns.by),
+            {
+                "sessions": 0,
+                "calls": 0,
+                "model": 0.0,
+                "tool": 0.0,
+                "matched": [],
+            },
+        )
+
+    for s in sessions:
+        bucket(s.started)["sessions"] += 1
+        for ts, kind, secs in s.spans:
+            if kind != "wait":
+                start = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)  # noqa: UP017
+                width = {"day": 24, "6h": 6, "hour": 1}[ns.by]
+                step = timedelta(hours=width)
+                end = start + timedelta(seconds=secs)
+                while start < end:
+                    boundary = start.replace(minute=0, second=0, microsecond=0)
+                    boundary = boundary.replace(hour=start.hour // width * width) + step
+                    stop = min(end, boundary)
+                    bucket(iso(start))[kind] += (stop - start).total_seconds()
+                    start = stop
+    for c in calls:
+        b = bucket(c.start)
+        b["calls"] += 1
+        b["matched"].append(c.secs)
+
+    slow = sorted(calls, key=lambda c: -c.secs)[: ns.slow]
+    if ns.json:
+        out = {
+            "roles": {k: {**v} for k, v in sorted(by_role.items())},
+            "trend": {
+                k: {
+                    **{x: v[x] for x in ("sessions", "model", "tool")},
+                    "matched": len(v["matched"]),
+                    "matched_secs": sum(v["matched"]),
+                    "median_secs": statistics.median(v["matched"]) if v["matched"] else 0.0,
+                    "p90_secs": quantile(v["matched"], 0.9),
+                }
+                for k, v in sorted(trend.items())
+            },
+            "slow": [call_row(c, sessions[c.session]) for c in slow],
+        }
+        print(json.dumps(out, indent=1))
+        return 0
+
+    what = "tool calls passing the filters" if filtered(ns) else "all tool calls"
+    print(
+        f"{len(sessions)} sessions, {sessions and min(s.started for s in sessions)[:10]} to "
+        f"{max(s.started for s in sessions)[:10]}. matched = {what}. Times in UTC.\n"
+    )
+    print_table(
+        [
+            "role",
+            "sessions",
+            "calls",
+            "model h",
+            "tool h",
+            "wait h",
+            "tool %",
+            "matched",
+            "matched h",
+        ],
+        [
+            [
+                k,
+                int(v["sessions"]),
+                int(v["calls"]),
+                v["model"] / hours,
+                v["tool"] / hours,
+                v["wait"] / hours,
+                round(100 * v["tool"] / max(v["model"] + v["tool"], 1)),
+                int(v["matched"]),
+                v["matched_secs"] / hours,
+            ]
+            for k, v in sorted(by_role.items(), key=lambda kv: -kv[1]["sessions"])
+        ],
+    )
+    print()
+    print_table(
+        [
+            "window",
+            "sessions",
+            "model h",
+            "tool h",
+            "matched",
+            "matched h",
+            "median s",
+            "p90 s",
+        ],
+        [
+            [
+                k,
+                v["sessions"],
+                v["model"] / hours,
+                v["tool"] / hours,
+                len(v["matched"]),
+                sum(v["matched"]) / hours,
+                round(statistics.median(v["matched"])) if v["matched"] else 0,
+                round(quantile(v["matched"], 0.9)),
+            ]
+            for k, v in sorted(trend.items())
+        ],
+    )
+    if slow:
+        print(f"\nslowest {len(slow)} matched calls:")
+        print_calls([call_row(c, sessions[c.session]) for c in slow])
+    return 0
+
+
+class Group(NamedTuple):
+    key: str
+    calls: int
+    secs: float
+    median_secs: float
+    max_secs: float
+    errors: int
+    background: int
+    agent: str  # of the group's first session: meaningful per session
+    first: str
+
+
+def group(key: str, cs: list[Call], s: Timeline) -> Group:
+    secs = [c.secs for c in cs]
+    return Group(
+        key,
+        len(cs),
+        round(sum(secs), 1),
+        round(statistics.median(secs), 1),
+        round(max(secs), 1),
+        sum(c.error for c in cs),
+        sum(c.background for c in cs),
+        s.agent,
+        s.first,
+    )
+
+
+def calls_cmd(ns: argparse.Namespace) -> int:
+    sessions, calls = scan_all(ns)
+    if ns.group_by:
+        groups: dict[str, list[Call]] = {}
+        for c in calls:
+            s = sessions[c.session]
+            key = {
+                "session": s.path,
+                "agent": s.agent or "-",
+                "workstream": s.workstream or "-",
+                "role": s.role,
+            }[ns.group_by]
+            groups.setdefault(key, []).append(c)
+        rows = sorted(
+            (group(k, cs, sessions[cs[0].session]) for k, cs in groups.items()),
+            key=lambda g: (-g.secs, g.key) if ns.sort == "secs" else (0.0, g.key),
+        )[: ns.limit]
+        if ns.json:
+            per_session = ns.group_by == "session"
+            out = [
+                {k: v for k, v in g._asdict().items() if per_session or k not in ("agent", "first")}
+                for g in rows
+            ]
+            print(json.dumps(out, indent=1))
+            return 0
+        print(
+            f"{len(calls)} calls in {len(groups)} groups by {ns.group_by}"
+            f"{f'; showing {len(rows)}' if len(rows) < len(groups) else ''}.\n"
+        )
+        if ns.group_by == "session":
+            for g in rows:
+                print(
+                    f"{g.calls} calls, {g.secs / 60:.1f} min (median {g.median_secs:.0f}s, "
+                    f"max {g.max_secs:.0f}s, {g.errors} errors, {g.background} background)"
+                    f"  {g.agent}"
+                )
+                print(f"  file:  {g.key}\n  first: {g.first}\n")
+            return 0
+        print_table(
+            [ns.group_by, "calls", "min", "median s", "max s", "errors", "background"],
+            [
+                [g.key, g.calls, g.secs / 60, g.median_secs, g.max_secs, g.errors, g.background]
+                for g in rows
+            ],
+        )
+        return 0
+    ordered = sorted(calls, key=(lambda c: -c.secs) if ns.sort == "secs" else (lambda c: c.start))
+    rows = [call_row(c, sessions[c.session]) for c in ordered[: ns.limit]]
+    if ns.json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    print(
+        f"{len(calls)} calls in {len(sessions)} sessions; showing {len(rows)}, by {ns.sort}. Times in UTC."
+    )
+    print_calls(rows)
+    return 0
+
+
 def fail(msg: str) -> int:
     print(f"museum-search: {msg}", file=sys.stderr)
     return 1
@@ -521,7 +1163,76 @@ def parse(argv: list[str]) -> argparse.Namespace:
     s.add_argument("file")
     s.add_argument("term", nargs="?")
     s.add_argument("--users", action="store_true", help="only user turns, one line each")
-    return p.parse_args(argv)
+    st = sub.add_parser("stats", help="where time goes: model, tools, waiting; by role and window")
+    scope(st)
+    st.add_argument("--by", choices=("day", "6h", "hour"), default="day", help="trend window")
+    st.add_argument("--slow", type=int, default=0, metavar="N", help="list the N slowest calls")
+    c = sub.add_parser("calls", help="the tool calls behind stats, one per row or grouped")
+    scope(c)
+    c.add_argument("--group-by", choices=("session", "agent", "workstream", "role"))
+    c.add_argument("--sort", choices=("secs", "time"), default="secs")
+    c.add_argument("--limit", type=int, default=50)
+    ns = p.parse_args(argv)
+    if ns.cmd in ("stats", "calls"):
+        for key in ("match", "exclude", "result"):
+            value = getattr(ns, key)
+            if value is not None:
+                try:
+                    re.compile(value)
+                except re.error as e:
+                    p.error(f"--{key}: {e}")
+    return ns
+
+
+# The options stats and calls share, in the order forward() sends them.
+VALUE_OPTS = (
+    "since",
+    "until",
+    "match",
+    "exclude",
+    "tool",
+    "min_secs",
+    "max_secs",
+    "result",
+    "role",
+    "agent",
+    "workstream",
+)
+
+
+def scope(p: argparse.ArgumentParser) -> None:
+    p.add_argument("project", nargs="?", help="store folder, museum project or workstream contains")
+    p.add_argument(
+        "--since", metavar="DATE", help="sessions started on or after (YYYY-MM-DD[THH:MM])"
+    )
+    p.add_argument("--until", metavar="DATE", help="sessions started on or before")
+    f = p.add_argument_group("call filters (a call must pass all given)")
+    f.add_argument("--match", metavar="REGEX", help="command matches (per shell segment)")
+    f.add_argument("--exclude", metavar="REGEX", help="and that segment does not match")
+    f.add_argument("--tool", metavar="NAME[,NAME]", help="tool name: bash, read, codemode, ...")
+    f.add_argument("--min-secs", type=float, metavar="N")
+    f.add_argument("--max-secs", type=float, metavar="N")
+    f.add_argument("--result", metavar="REGEX", help="tool result text matches")
+    f.add_argument("--error", action="store_true", help="tool result is an error")
+    bg = f.add_mutually_exclusive_group()
+    bg.add_argument(
+        "--background",
+        dest="background",
+        action="store_const",
+        const=True,
+        help="launch heuristic: unquoted & plus redirect, no explicit later wait",
+    )
+    bg.add_argument(
+        "--foreground",
+        dest="background",
+        action="store_const",
+        const=False,
+        help="not classified as a background launch (includes explicit wait)",
+    )
+    f.add_argument("--role", metavar="GLOB", help="worker, reviewer, delegate, main, other, ...")
+    f.add_argument("--agent", metavar="GLOB")
+    f.add_argument("--workstream", metavar="GLOB")
+    p.add_argument("--json", action="store_true")
 
 
 def forward(ns: argparse.Namespace) -> list[str]:
@@ -532,6 +1243,18 @@ def forward(ns: argparse.Namespace) -> list[str]:
         words = ["find", ns.term, *([ns.project] if ns.project else [])]
         words += ["--limit", str(ns.limit), "--skip", ns.skip]
         return [*words, "--newest"] if ns.newest else words
+    if ns.cmd in ("stats", "calls"):
+        words = [ns.cmd, *([ns.project] if ns.project else [])]
+        for k in VALUE_OPTS:
+            if getattr(ns, k) is not None:
+                words += ["--" + k.replace("_", "-"), str(getattr(ns, k))]
+        words += ["--error"] if ns.error else []
+        words += {True: ["--background"], False: ["--foreground"], None: []}[ns.background]
+        words += ["--json"] if ns.json else []
+        if ns.cmd == "stats":
+            return [*words, "--by", ns.by, "--slow", str(ns.slow)]
+        words += ["--group-by", ns.group_by] if ns.group_by else []
+        return [*words, "--sort", ns.sort, "--limit", str(ns.limit)]
     words = ["show", ns.file, *([ns.term] if ns.term else [])]
     return [*words, "--users"] if ns.users else words
 
@@ -555,6 +1278,10 @@ def main(argv: list[str]) -> int:
         return fail(f"cannot enter store {store} (is store.host missing?)")
     if ns.cmd == "find":
         return find(ns.term, ns.project, ns.limit, ns.skip, ns.newest)
+    if ns.cmd == "stats":
+        return stats(ns)
+    if ns.cmd == "calls":
+        return calls_cmd(ns)
     return show(ns.file, ns.term, ns.users)
 
 

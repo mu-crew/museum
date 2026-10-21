@@ -1,6 +1,42 @@
 # `museum-search stats` and `calls`: where agent time goes
 
-Status: approved design, not implemented.
+Status: approved design; implementation under review.
+
+## Implementation clarifications
+
+- Timing categories are observed gaps between message entries: model before
+  assistant messages, tool before tool results, waiting before other messages.
+  They are harness wall-time estimates, not provider-only inference latency.
+  Model/tool wall spans split across UTC window boundaries. Call rows carry
+  `duration_source`: `durationMs` for recorded measurements, `estimated` for
+  call-to-result gaps (marked in text too). Calls in one assistant message
+  share a request timestamp, not an execution start. Estimates may include
+  earlier calls; sums are not tool wall time. No execution sequence, parallelism
+  or concurrency can be inferred or is reported.
+- `--since`/`--until` select session-start date cohorts by filename, not
+  event-time slices. Selected sessions can contribute wall time to later
+  windows. Session counts use the first message window; call counts and
+  duration summaries stay in the request timestamp window.
+- Roles use the leading word of the metadata agent name. A metadata entry with
+  no agent is `main`; a session without metadata is `other`.
+- Shell matching retains simple bash/sh heredoc bodies (optionally via env),
+  suppresses Python/data bodies, and splits separators outside quotes.
+  Background is a launch heuristic: unquoted lone `&` plus redirect, unless
+  followed by explicit `wait`. Quoted operators do not count. This is not a
+  shell parser: wrappers, nested/multiple heredocs, multiline quotes and
+  conditional waits can be misclassified. Restrict to bash and inspect
+  examples; text matches do not prove execution.
+- Median uses `statistics.median`, averaging the middle pair for even counts.
+  P90 separately uses sorted index floor(n × 0.9), capped at the last value.
+  Empty `stats --json` is `{"roles": {}, "trend": {}, "slow": []}`.
+- `--result` filters result text; `--error` counts the tool's `isError` flag.
+  Matching `gate: ok` is not a general pass classifier, and absence of the
+  marker is not a failure. Group output therefore reports errors, not inferred
+  pass/fail labels.
+- A session is not a task identifier. Grouping by session is useful for drilling
+  down, but repeated/resumed sessions and multiple tasks need separate accounting.
+- The original `/tmp` analysis included false-positive gate mentions. Reproduce
+  its questions and correct its figures, rather than requiring exact agreement.
 Date: 2026-10-21
 
 ## Problem
@@ -58,20 +94,19 @@ These are the cuts the swaywardlock gate analysis had to write by hand
 | `--min-secs N`, `--max-secs N` | call duration | drop instant calls, or find the polls |
 | `--result REGEX` | the tool result text matches | `gate: ok` vs `FAIL\|panicked`, to count passes and failures |
 | `--error` | calls whose result is an error | failed tool calls only |
-| `--background` / `--foreground` | the command backgrounds itself (`&` with a redirect) | a backgrounded gate returns at once, and its time shows up in later polls |
+| `--background` / `--foreground` | launch heuristic: unquoted lone `&` plus redirect, with no explicit later `wait` | inspect later polls; not proof of a running background job |
 
 ### `calls` output
 
-With no `--group-by`, one row per call: start time, duration, tool, role,
-agent, workstream, `ok`/`fail`/blank from `--result`, a background flag,
-the session file, and the first 120 characters of the command. `--sort`
+With no `--group-by`, one row per call: request time, duration and
+`duration_source`, tool, role, agent, workstream, the tool's error flag,
+a background-launch heuristic flag, the session file, and a command preview. `--sort`
 is by duration (the default) or by start time. `--limit` defaults to 50.
 
 `--group-by` adds up the calls per session, agent, workstream or role:
-count, total and median duration, passes/failures, and the first user
-message of the session (for `session`). Grouping by session gives full
-gate runs per task, because a worker or reviewer session covers one
-task.
+count, total and median duration, error count, and the first user
+message of the session (for `session`). Grouping by session shows where matches cluster; inspect its first user
+message to identify the task rather than assuming one session equals one task.
 
 Each session row includes the file path, so the next step is
 `museum-search show FILE TERM`.
@@ -79,12 +114,10 @@ Each session row includes the file path, so the next step is
 ## What it measures
 
 Per session, from the timestamps of its entries:
-- **model time:** from the previous entry to each assistant message
-  (inference, including streaming)
-- **tool time:** from each tool call to its matching tool result, per
-  call
-- **user wait:** from an assistant message that ended its turn to the
-  next user message (excluded from the other two)
+- **model time:** message gap ending at an assistant message (harness
+  estimate, including streaming, not provider-only inference)
+- **tool wall time:** message gap ending at a tool result, counted once
+- **waiting time:** all other message gaps (excluded from the other two)
 - the number of tool calls, and the calls the call filters selected,
   with their durations
 
@@ -102,11 +135,10 @@ Three plain-text tables:
    `calls --sort secs`, with the same columns, so `--slow` is a preview
    and `calls` does the drilling down.
 
-The trend table also shows **max concurrent matched calls** for each
-window: how many matched calls overlapped at their peak. Gates running
-side by side on one machine slow each other down, so a rising duration
-with a rising concurrency count tells a different story from a rising
-duration alone.
+The trend table does not report concurrency: request timestamps and
+durations do not establish reliable execution intervals. Only model/tool
+wall spans are split at window boundaries; matched call durations and
+percentiles belong to the request window.
 
 ## Decisions
 
@@ -120,8 +152,8 @@ duration alone.
   keep only timestamps, roles, tool names and the first 300 characters
   of each command. Select files by folder and by start time (taken from
   the file name) before opening any.
-- **A background run shows up as quick calls.** A gate started with `&`
-  returns at once, and the time goes to the later calls that poll its
+- **A background launch may show up as quick calls.** A gate started with
+  `&` without `wait` may return quickly; inspect later calls that poll its
   log. `--match` catches those polls too when the pattern names the log,
   so this is documented rather than worked around.
 
@@ -130,8 +162,10 @@ duration alone.
 `test/test_search.py` style: small JSONL fixtures with known timestamps.
 Check the model / tool / user-wait split, each call filter (including
 `--exclude` against a read-only command that mentions the match term,
-and `--background`), `calls --group-by`, the max concurrent count, the
-window grouping, the role fallback, and that `--json` round-trips.
+and `--background`), shell versus data heredocs, quoted operators and
+explicit waits, `calls --group-by`, duration sources on shared requests,
+absence of concurrency, wall-span window splitting, even-count medians,
+pre-3.10 zip compatibility, role fallback, and empty/nonempty JSON reports.
 
 ## Out of scope
 
@@ -162,6 +196,6 @@ $S calls swayward --match "$G" --result 'FAIL|panicked' --group-by role
 
 # what workers spend polling background gates
 $S calls swayward --role worker --match 'gate.*\.log' --group-by session
-``` Any
-mismatch is either a bug in the tool or a mistake in the spec's figures.
+``` Investigate mismatches: the archive changes as sessions sync, and the
+exploratory scripts counted some command mentions as executions.
 Then update the museum SKILL.md with a short "Stats" section.

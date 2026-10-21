@@ -39,6 +39,46 @@ If ssh to the store host stalls (session-capped devservers), use [mule](https://
 
 For a search `museum-search` does not cover, use `rg` and `jq` on the store host directly. Run `rg -l` before any command that prints matching lines, because a single session line can be several MB.
 
+## Timing and tool-call trends
+
+Use for slow sessions, repeated gates, tool-call trends, or time spent in
+models versus tools. `S` is the same `museum-search` script as above.
+
+```
+"$S" stats PROJECT --since YYYY-MM-DD --by 6h --slow 10
+"$S" calls PROJECT --tool bash --match 'contrib/gate' --min-secs 30
+"$S" calls PROJECT --match 'gate.*\.log' --group-by role
+```
+
+Start with `stats`, inspect suspicious calls with `calls`, then read a
+listed session with `show FILE TERM`. Both commands share filters:
+`--match`, `--exclude`, `--tool`, duration bounds, `--result`, `--error`,
+`--background`/`--foreground`, and role/agent/workstream globs. `--json`
+gives structured reports. Consult `--help` for argument details.
+
+Role comes from museum metadata, not prompt text; missing metadata is
+`other`, metadata without an agent is `main`. Model time includes harness
+gaps, not just provider inference. Model/tool wall spans split across UTC
+windows. `--since`/`--until` select session-start date cohorts by filename,
+not event-time slices; a selected session can contribute to later windows.
+
+Call rows carry `duration_source`: `durationMs` is measured; `estimated` is
+a call-to-result gap, also marked in text. Several calls can share one
+request timestamp, so estimates may include earlier calls. Do not equate
+summed call durations with tool wall time or infer sequence, parallelism
+or concurrency; concurrency reporting is deliberately absent. Median uses
+the average of the middle pair for even counts; p90 uses sorted index
+floor(n × 0.9), capped. Empty stats JSON keeps `roles`, `trend`, `slow`.
+
+Shell matching retains simple bash/sh heredoc bodies (optionally via env)
+and suppresses Python/data bodies. Background is a launch heuristic using
+unquoted lone `&` plus redirect; explicit later `wait` makes it foreground.
+It is not a shell parser: wrappers, nested/multiple heredocs, multiline
+quotes and conditional waits can mislead it. Inspect background polls
+separately. Restrict gate searches to bash, exclude reads, and inspect
+examples before reporting counts. Do not present regex matches as verified
+executions or sessions as uniquely identified tasks.
+
 ## Backup health
 
 Use this when the user asks whether museum is working, or pi's footer shows `museum: backup failing`, `museum: no backup yet` or `museum: cannot run museum-sync`.

@@ -52,6 +52,43 @@ bin/museum-sync                  # sync now, and print rsync or ssh errors
 
 The pi footer shows the `warning` field of `state.json`, which the sync writes: nothing while backups work, `museum: backup failing: <error>` after a failed sync. pi adds `museum: no backup yet` before the first sync finishes, and `museum: cannot run museum-sync` when it cannot start the script.
 
+## Session timing and tool calls
+
+```sh
+S=skills/museum/scripts/museum-search
+$S stats swayward --since 2026-10-19 --by 6h --slow 10
+$S calls swayward --tool bash --match 'contrib/gate' --min-secs 30
+$S calls swayward --match 'gate.*\.log' --group-by role
+$S calls swayward --result 'gate: ok' --group-by session --json
+```
+
+`stats` reports model, tool and waiting time by role and time window;
+`calls` lists the underlying tool calls or groups them by session, agent,
+workstream or role. Both run on the store host through the same ssh path
+as search. See `stats --help` and `calls --help` for shared filters.
+
+Model time is the gap before an assistant message, not provider latency
+alone. Tool wall time counts each gap before a tool result once. Model/tool
+wall spans are split across UTC window boundaries. `--since`/`--until` select
+session-start date cohorts by filename, not event-time slices; selected
+sessions can contribute to later windows.
+
+Call rows include `duration_source`: `durationMs` for recorded measurements,
+`estimated` for call-to-result gaps (also marked in text output). Calls in one
+assistant message share a request timestamp, not an execution start; fallback
+gaps may include earlier calls. Their sum is not tool wall time. No concurrency
+or sequential/parallel execution semantics are reported. Medians average the
+two middle values for even counts; p90 uses sorted index floor(n × 0.9), capped
+at the last value. Empty `stats --json` keeps `roles`, `trend` and `slow`.
+
+Shell matching retains simple bash/sh heredoc bodies (including `env bash`),
+but suppresses Python/data bodies. Background is a launch heuristic: unquoted
+lone `&` with a redirect, unless followed by explicit `wait`; quoted operators
+do not count. This is not a shell parser: wrappers, nested/multiple heredocs,
+multiline quotes and conditional waits can be misclassified. Inspect later
+log polls for background jobs. Matching text does not prove execution; use
+`--tool bash`, `--exclude` and duration filters, then inspect examples.
+
 ## Search
 
 ```sh
