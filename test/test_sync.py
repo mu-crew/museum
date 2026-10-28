@@ -420,12 +420,12 @@ class Units(unittest.TestCase):
                 home = Path(d)
                 if store == "LOCAL":  # install.sh creates it: keep it in the temp dir
                     store = str(home / "store")
-                # install.sh up to the config, without the ssh probe, links
+                # install.sh up to the config, without the ssh probe, pi install
                 # and first sync that need a real host and pi.
                 src = (ROOT / "install.sh").read_text()
                 probe = 'ssh -o BatchMode=yes "$HOST" "test -d \'$STORE_PATH/$MACHINE\'"'
                 self.assertIn(probe, src)
-                src = src[: src.index("# Skill: symlink")].replace(probe, "false")
+                src = src[: src.index("# Older installs symlinked")].replace(probe, "false")
                 script = home / "install.sh"
                 script.write_text(
                     src.replace('ROOT="$(cd "$(dirname "$0")" && pwd)"', f"ROOT={ROOT}")

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install museum on this machine: config, skill, pi extension.
+# Install museum on this machine: config, then the pi package (skill and extension).
 # Usage: ./install.sh [STORE [MACHINE]]     e.g. ./install.sh devbox:/data/museum
 # STORE is host:/path for an ssh store, or /path for a local one. MACHINE is this
 # machine's folder in the store; it defaults to `hostname -s`, pinned in config.
@@ -90,16 +90,23 @@ EOF
   echo "wrote $CONF"
 fi
 
-# Skill: symlink so edits in the repo are live.
-mkdir -p "$HOME/.agents/skills"
-ln -sfn "$ROOT/skills/museum" "$HOME/.agents/skills/museum"
-echo "linked skill -> ~/.agents/skills/museum"
+# Older installs symlinked the skill and the extension; with the package
+# installed too, pi would load both twice. Only symlinks are removed: a real
+# file or folder there is not ours.
+for link in "$HOME/.agents/skills/museum" "$HOME/.pi/agent/extensions/museum.ts"; do
+  if [ -L "$link" ]; then
+    rm "$link"
+    echo "removed old link $link"
+  fi
+done
 
-# The pi extension runs museum-sync. Symlinked so it finds
-# bin/museum-sync beside it and repo edits are live.
-mkdir -p "$HOME/.pi/agent/extensions"
-ln -sfn "$ROOT/pi/museum.ts" "$HOME/.pi/agent/extensions/museum.ts"
-echo "linked pi extension -> ~/.pi/agent/extensions/museum.ts (running pi agents pick it up on restart or /reload)"
+# The skill and the extension, as a pi package loaded from this folder, so
+# repo edits are live. Running pi agents pick it up on restart or /reload.
+command -v pi > /dev/null || {
+  echo "museum: needs pi on PATH" >&2
+  exit 1
+}
+pi install "$ROOT"
 
 # The first sync also converts an old KEY=value config to config.toml.
 echo "running first sync..."

@@ -32,16 +32,18 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 ./install.sh /data/museum                 # first time, local store (this machine is the store host)
 ./install.sh /Volumes/backup/museum       # local path on a mounted disk or network share
 ./install.sh devbox:/data/museum work-mbp # first time, with an explicit machine folder name
-./install.sh                              # later runs: re-link the skill and the extension
+./install.sh                              # later runs: re-register the pi package, sync
 ```
 
 The store uses rsync's syntax: `host:/path` goes over ssh, anything else is a local path. On the store host itself, use the local path rather than `localhost:`, which would need sshd and a key for your own account.
 
 The install script:
 1. writes `~/.config/museum/config.toml` (see [Configuration](#configuration)). The machine name defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<machine>` already exists, the install stops unless you pass the name explicitly
-2. symlinks `skills/museum` into `~/.agents/skills/`
-3. symlinks `pi/museum.ts` into `~/.pi/agent/extensions/`. Running pi agents pick it up on restart or `/reload`
+2. removes the symlinks older installs made, `~/.agents/skills/museum` and `~/.pi/agent/extensions/museum.ts`, so pi does not load museum twice
+3. runs `pi install <this folder>`, which adds the repo to `packages` in `~/.pi/agent/settings.json`. pi loads the extension (`pi/museum.ts`) and the skill (`skills/museum`) from the repo, so edits are live. Running pi agents pick it up on restart or `/reload`
 4. runs the first sync
+
+`pi list` shows the package, and `pi remove <this folder>` takes it out. The repo must stay where it was installed from: the package entry is its path. To use the skill with another agent CLI, link or copy `skills/museum` into that CLI's skills folder; the extension, and so the backup, runs only in pi.
 
 ## Check and sync by hand
 
@@ -150,7 +152,8 @@ The store holds the only complete copy of every machine's sessions. Snapshot it 
 ```
 bin/museum-sync      the rsync backup, one at a time per node
 pi/museum.ts          pi extension: triggers the sync, shows its warning in the footer
-install.sh            per-machine setup
+install.sh            per-machine setup: config, pi package, first sync
+package.json          pi package manifest (the extension and the skill)
 skills/museum/       agent skill: where the store is and how to search it
   scripts/museum-search  search the store: ranked triage, then one session's conversation
 docs/                 design notes

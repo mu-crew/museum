@@ -1,0 +1,12 @@
+{
+  "name": "museum",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Central, append-only backup of pi sessions from every machine, searchable by agents.",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./pi/museum.ts"],
+    "skills": ["./skills"]
+  }
+}

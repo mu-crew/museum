@@ -25,8 +25,8 @@
  * agent's sync recovered. The only label decided here is the one the script
  * cannot write: it did not start at all.
  *
- * Installed by museum's install.sh as a symlink to the repo, so MUSEUM_SYNC
- * resolves next to it; override with $MUSEUM_SYNC.
+ * Loaded from the museum repo as a pi package, so museum-sync resolves at
+ * ../bin beside it; override with $MUSEUM_SYNC.
  */
 import { spawn } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";

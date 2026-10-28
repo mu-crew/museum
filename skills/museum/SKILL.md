@@ -17,10 +17,10 @@ The path records the machine, the project, and the start time. Pi encodes the cw
 
 ## Searching
 
-`museum-search` is in this skill's `scripts/` folder:
+`museum-search` is in this skill's `scripts/` folder. Set `S` to its absolute path, from the folder this file is in:
 
 ```
-S=~/.agents/skills/museum/scripts/museum-search
+S=<this skill's folder>/scripts/museum-search
 ```
 
 It reads the config, reaches an ssh store in one ssh call, and needs no quoting from you: pass `TERM` as a plain argument.
@@ -84,9 +84,9 @@ executions or sessions as uniquely identified tasks.
 Use this when the user asks whether museum is working, or pi's footer shows `museum: backup failing`, `museum: no backup yet` or `museum: cannot run museum-sync`.
 
 1. Read this machine's last result: `cat ~/.local/state/museum/state.json`. `status` is `ok` or `error`, `time` is epoch seconds, `message` is the last error, and `warning` is the footer label, empty when all is well. The footer shows `warning`, and every pi on the machine picks up a change within 5 seconds, so a successful sync clears it everywhere.
-2. Sync by hand to see the full error. The script is in the museum repo's `bin/`, which the skill folder links into:
+2. Sync by hand to see the full error. The script is in the museum repo's `bin/`, two folders up from this skill's folder:
    ```
-   "$(dirname "$(readlink -f ~/.agents/skills/museum)")/../bin/museum-sync"
+   <this skill's folder>/../../bin/museum-sync
    ```
    Exit 0 means the sync succeeded, or another sync on this machine will cover it.
 3. Common causes: `python3` on PATH is older than 3.11 (`needs Python 3.11+`: on macOS, `brew install python`), a key in `config.toml` is misspelled or wrong (`unknown key`, `must be absolute`), ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), the store folder is not writable, or, with `ssh_mux_only = true` in the config, no ssh master is running (`no ssh master for <host>`: the user runs `ssh -MNf <host>`, which may need their key).
