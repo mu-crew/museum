@@ -1,17 +1,22 @@
 ---
 name: museum
-description: Museum, the archive of all past pi sessions from every machine. Use when the user refers to earlier work ("we did X before", "what did we decide about Y", "find the session where…", "prior art"), or when past sessions would help answer the question.
+description: Museum, the archive of all past agent sessions (pi, Claude Code, Codex) from every machine. Use when the user refers to earlier work ("we did X before", "what did we decide about Y", "find the session where…", "prior art"), or when past sessions would help answer the question.
 ---
 
 # Museum
 
-Every machine rsyncs `~/.pi/agent/sessions/` into one central store. The store location is the `[store]` table in `~/.config/museum/config.toml`: `path` on `host` over ssh, or a local `path` when there is no `host`. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends. `~/.local/state/museum/state.json` says when this machine last synced and why it failed, if it did.
+Every machine rsyncs `~/.pi/agent/sessions/`, and filtered copies of `~/.claude/projects/` and `~/.codex/sessions/`, into one central store. The store location is the `[store]` table in `~/.config/museum/config.toml`: `path` on `host` over ssh, or a local `path` when there is no `host`. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends. `~/.local/state/museum/state.json` says when this machine last synced and why it failed, if it did.
 
 ## Layout
 
 ```
 <store>/<hostname>/<pi cwd folder>/<ISO timestamp>_<session id>.jsonl
+<store>/<hostname>/claude/<project folder>/<session id>.jsonl      (and <session id>/subagents/)
+<store>/<hostname>/codex/<project folder>/rollout-<timestamp>-<id>.jsonl
+<store>/<hostname>/<harness>/meta/<session id>.json                 (repo, branch, mu agent, workstream)
 ```
+
+`museum-search` reads only the pi folders so far, and skips these; search the `claude` and `codex` folders with `rg -l` on the store host. Their project folders spell the cwd with every non-alphanumeric character as `-`, so `/home/u/proj` is `-home-u-proj`. The filtered copies leave out API request records (and their system prompts), file snapshots, encrypted reasoning and repeated compaction histories, and cut tool output at 64 KB.
 
 The path records the machine, the project, and the start time. Pi encodes the cwd folder by replacing `/` with `-`, so `/Users/x/hacking/hail` is stored as `--Users-x-hacking-hail--`. mu agents run in worktrees such as `--…-.local-state-mu-workspaces-hail-worker-1--`, and those folders still contain the project name. Newer sessions also carry a `museum` custom entry that records the git repo, branch, commit and mu workstream.
 

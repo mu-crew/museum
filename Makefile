@@ -8,7 +8,7 @@ SHFMT      := uvx --from shfmt-py==4.2.0 shfmt
 RUFF       := uvx --from ruff==0.16.9 ruff
 TY         := uvx --from ty==0.0.84 ty
 PYTHON     ?= python3
-SHELL_SCRIPTS := install.sh .githooks/pre-commit
+SHELL_SCRIPTS := install.sh bin/museum .githooks/pre-commit
 
 .PHONY: check lint fmt test hooks
 

@@ -1,0 +1,238 @@
+#!/bin/sh
+# museum: the one command that tmux, timers and harness hooks call.
+#
+#   museum tick            start a sync, detached, if one is due; prints nothing
+#   museum hook HARNESS    a harness hook (claude, codex, muse); payload on stdin
+#   museum sync [ARGS]     museum-sync, in the foreground (--now, --if-due)
+#   museum timer install   run `museum tick` every 5 minutes (launchd or systemd)
+#   museum timer remove    stop and remove that timer
+#
+# Harness hooks may run in a sandbox that refuses rsync and ssh, so they only
+# leave stamps, and `tick` starts the sync from outside every sandbox: a tmux
+# status line's #(museum tick), which the tmux server runs, and the timer.
+# `tick` is cheap enough for a status line: unless a sync is due it reads two
+# small files and exits without starting Python.
+set -u
+
+LABEL=museum.tick
+PERIOD=300
+
+state_dir() {
+  if [ -n "${MUSEUM_STATE_DIR+x}" ]; then
+    printf '%s\n' "$MUSEUM_STATE_DIR"
+  else
+    printf '%s/museum\n' "${XDG_STATE_HOME:-$HOME/.local/state}"
+  fi
+}
+
+# Where `museum hook` leaves the flush stamp: fixed, unlike the state folder,
+# because hooks and timers run with different environments (museum-sync's
+# hook_dir).
+hook_dir() {
+  if [ -n "${MUSEUM_STATE_DIR+x}" ]; then
+    printf '%s\n' "$MUSEUM_STATE_DIR"
+  else
+    printf '%s/.local/state/museum\n' "$HOME"
+  fi
+}
+
+# This script's absolute path, through any symlinks to it.
+self() {
+  s=$0
+  while [ -L "$s" ]; do
+    l=$(readlink "$s")
+    case $l in
+      /*) s=$l ;;
+      *) s=$(dirname "$s")/$l ;;
+    esac
+  done
+  printf '%s/%s\n' "$(cd "$(dirname "$s")" && pwd -P)" "$(basename "$s")"
+}
+
+sync_path() {
+  if [ -n "${MUSEUM_SYNC:-}" ]; then
+    printf '%s\n' "$MUSEUM_SYNC"
+  else
+    printf '%s/museum-sync\n' "$(dirname "$(self)")"
+  fi
+}
+
+# A file's number, 0 when it is missing or holds anything else.
+number() {
+  n=$(cat "$1" 2> /dev/null) || n=
+  case $n in
+    '' | *[!0-9]*) echo 0 ;;
+    *) echo "$n" ;;
+  esac
+}
+
+# Due when the flush stamp exists (a session ended), or when neither a sync nor
+# an earlier tick started in the last MUSEUM_INTERVAL seconds. The tick's own
+# stamp keeps a sync that cannot start (no config, old Python) from being
+# retried on every status-line refresh; its error is in state.json already.
+tick() {
+  dir=$(state_dir)
+  stamp=$(hook_dir)/flush
+  if [ -e "$stamp" ]; then
+    # Taken by a rename, so two ticks start one flush. `pending` is the mark
+    # museum-sync honours: due at once, and a sync that is already running
+    # goes round once more.
+    mkdir -p "$dir" 2> /dev/null || return 0
+    mv "$stamp" "$dir/pending" 2> /dev/null || return 0
+  else
+    now=$(date +%s)
+    last=$(number "$dir/last-start")
+    tried=$(number "$dir/last-tick")
+    [ "$tried" -gt "$last" ] && last=$tried
+    [ $((now - last)) -ge "${MUSEUM_INTERVAL:-600}" ] || return 0
+    mkdir -p "$dir" 2> /dev/null && echo "$now" > "$dir/last-tick" || return 0
+  fi
+  # Detached, so a status line or a timer never waits for rsync. museum-sync
+  # takes the node's lock, so a tick that races another sync adds nothing.
+  nohup "$(sync_path)" --if-due < /dev/null > /dev/null 2>&1 &
+}
+
+# Text for an XML element.
+xml() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
+timer_kind() {
+  if [ -n "${MUSEUM_TIMER_KIND:-}" ]; then
+    echo "$MUSEUM_TIMER_KIND"
+  elif [ "$(uname -s)" = Darwin ]; then
+    echo launchd
+  else
+    echo systemd
+  fi
+}
+
+launchd_plist() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$LABEL"; }
+systemd_dir() { printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+# The timer gets this shell's PATH: launchd's and systemd's own leave out the
+# Homebrew or user folders that hold python3 3.11+. It also gets this shell's
+# XDG_STATE_HOME and MUSEUM_STATE_DIR, when set, so its syncs share pi's state
+# folder: the lock, the cursors and state.json.
+timer_env() {
+  plist_env="$plist_env<key>$1</key><string>$(xml "$2")</string>"
+  unit_env="$unit_env
+Environment=\"$1=$2\""
+}
+
+timer_install() {
+  me=$(self)
+  plist_env='' unit_env=''
+  [ -z "${XDG_STATE_HOME:-}" ] || timer_env XDG_STATE_HOME "$XDG_STATE_HOME"
+  [ -z "${MUSEUM_STATE_DIR+x}" ] || timer_env MUSEUM_STATE_DIR "$MUSEUM_STATE_DIR"
+  case $(timer_kind) in
+    launchd)
+      plist=$(launchd_plist)
+      mkdir -p "$(dirname "$plist")"
+      # AbandonProcessGroup: the detached sync outlives `tick`, launchd's job.
+      cat > "$plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$(xml "$me")</string><string>tick</string></array>
+  <key>StartInterval</key><integer>$PERIOD</integer>
+  <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>$(xml "$PATH")</string>$plist_env</dict>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
+</dict>
+</plist>
+EOF
+      domain=gui/$(id -u)
+      launchctl bootout "$domain/$LABEL" > /dev/null 2>&1 || true
+      # bootout returns before launchd lets go of the job, and a bootstrap
+      # that lands first fails, so wait for it to be gone.
+      i=0
+      while launchctl print "$domain/$LABEL" > /dev/null 2>&1 && [ $i -lt 50 ]; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      launchctl bootstrap "$domain" "$plist" || return 1
+      echo "installed $plist"
+      ;;
+    systemd)
+      dir=$(systemd_dir)
+      mkdir -p "$dir"
+      # KillMode=process: the detached sync outlives `tick`, the unit's process.
+      cat > "$dir/museum-tick.service" << EOF
+[Unit]
+Description=museum: back up agent sessions if a sync is due
+
+[Service]
+Type=oneshot
+KillMode=process
+Environment="PATH=$PATH"$unit_env
+ExecStart="$me" tick
+EOF
+      cat > "$dir/museum-tick.timer" << EOF
+[Unit]
+Description=museum: run museum tick every $PERIOD seconds
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=$PERIOD
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl --user daemon-reload || return 1
+      systemctl --user enable --now museum-tick.timer || return 1
+      echo "installed $dir/museum-tick.timer"
+      ;;
+    *)
+      echo "museum: unknown timer kind $(timer_kind)" >&2
+      return 2
+      ;;
+  esac
+}
+
+timer_remove() {
+  case $(timer_kind) in
+    launchd)
+      launchctl bootout "gui/$(id -u)/$LABEL" > /dev/null 2>&1 || true
+      rm -f "$(launchd_plist)"
+      ;;
+    systemd)
+      systemctl --user disable --now museum-tick.timer > /dev/null 2>&1 || true
+      rm -f "$(systemd_dir)/museum-tick.service" "$(systemd_dir)/museum-tick.timer"
+      systemctl --user daemon-reload > /dev/null 2>&1 || true
+      ;;
+    *)
+      echo "museum: unknown timer kind $(timer_kind)" >&2
+      return 2
+      ;;
+  esac
+}
+
+usage() {
+  sed -n '4,8s/^# \{0,1\}//p' "$(self)" >&2
+  exit 2
+}
+
+case ${1-} in
+  tick) tick ;;
+  hook)
+    [ $# -eq 2 ] || usage
+    exec "$(sync_path)" --hook "$2"
+    ;;
+  sync)
+    shift
+    exec "$(sync_path)" "$@"
+    ;;
+  timer)
+    case ${2-} in
+      install) timer_install ;;
+      remove) timer_remove ;;
+      *) usage ;;
+    esac
+    ;;
+  *) usage ;;
+esac

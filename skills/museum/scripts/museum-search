@@ -69,6 +69,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 MU_WORKSPACE = "-mu-workspaces-"
+# The other harnesses' folders, <host>/<harness>/<project>/...: not read yet,
+# so kept out of every search.
+HARNESS_FOLDERS = frozenset({"claude", "codex", "muse"})
 SNIPPET = 100  # characters of context either side of a match
 # A user turn that answers the assistant turn before it: short ("yes", "mule"),
 # or picking options by number ("1, also consider...", "q6 1, q7 1 q8. lets
@@ -174,9 +177,12 @@ def snippet(s: str, term: str) -> str | None:
 
 
 def rg(args: list[str], dirs: list[str]) -> list[str]:
-    """rg's output lines over the store's session files."""
+    """rg's output lines over the store's pi session files: <host>/<folder>/
+    <file> from the store, <file> from a PROJECT dir. The depth keeps out the
+    other harnesses' deeper folders."""
+    depth = "3" if dirs == ["."] else "1"
     out = subprocess.run(
-        ["rg", "-i", "-g", "*.jsonl", *args, "--", *dirs],
+        ["rg", "-i", "-g", "*.jsonl", "--max-depth", depth, *args, "--", *dirs],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -327,7 +333,11 @@ def strings(value: object) -> Iterator[str]:
 
 def find(term: str, project: str | None, limit: int, skip: str, newest: bool) -> int:
     if project:
-        dirs = sorted(str(p) for p in Path().glob(f"*/*{project}*") if p.is_dir())
+        dirs = sorted(
+            str(p)
+            for p in Path().glob(f"*/*{project}*")
+            if p.is_dir() and p.name not in HARNESS_FOLDERS
+        )
         if not dirs:
             return fail(f"no store folder matches *{project}*")
     else:
@@ -1052,6 +1062,7 @@ class Config(NamedTuple):
     host: str | None
     path: str
     ssh_mux_only: bool
+    rsync_path: str | None = None  # the rsync the sync runs; found on PATH when unset
 
     def target(self) -> str:
         """The store folder in rsync's syntax: host:/path or /path."""
@@ -1092,11 +1103,14 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"{path}: {key} must be a non-empty string")
         return value
 
-    top = table(doc, "", {"machine", "store"})
+    top = table(doc, "", {"machine", "rsync_path", "store"})
     store = table(top.get("store"), "store", {"host", "path", "ssh_mux_only"})
     machine = text(top.get("machine"), "machine")
     if "/" in machine:
         raise ConfigError(f"{path}: machine is a folder name, without /")
+    rsync = text(top["rsync_path"], "rsync_path") if "rsync_path" in top else None
+    if rsync and not rsync.startswith("/"):
+        raise ConfigError(f"{path}: rsync_path must be absolute")
     host = text(store["host"], "store.host") if "host" in store else None
     if host and (":" in host or "/" in host):
         raise ConfigError(f"{path}: store.host is an ssh host; put the folder in store.path")
@@ -1108,7 +1122,7 @@ def load_config(path: Path) -> Config:
         raise ConfigError(f"{path}: store.ssh_mux_only must be true or false")
     if mux and not host:
         raise ConfigError(f"{path}: store.ssh_mux_only needs store.host")
-    return Config(machine, host, folder.rstrip("/") or "/", mux)
+    return Config(machine, host, folder.rstrip("/") or "/", mux, rsync)
 
 
 # --- end config ---

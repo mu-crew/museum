@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Back up local pi sessions to the museum store. Append-only: nothing is ever deleted.
+"""Back up local agent sessions to the museum store. Append-only: nothing is ever deleted.
 
-  museum-sync --if-due   sync if the last one started over MUSEUM_INTERVAL ago
-  museum-sync [--now]    sync now; if a sync is already running, it runs again after
+  museum-sync --if-due        sync if the last one started over MUSEUM_INTERVAL ago
+  museum-sync [--now]         sync now; if a sync is already running, it runs again after
+  museum-sync --hook HARNESS  a harness hook: SessionStart writes the meta record,
+                              SessionEnd leaves the flush stamp for `museum tick`
+
+pi's sessions are copied as they are, to <store>/<machine>/<pi cwd folder>/. claude's
+and codex's go through a filter first (see stage()), to
+<store>/<machine>/<harness>/<project folder>/.
 
 Many pi agents on one node call this at once, so at most one sync runs per node.
 The lock is flock(2) on a file descriptor: it dies with its holder, so a crash or
@@ -13,6 +19,8 @@ lets go.
 Config: ~/.config/museum/config.toml
 
   machine = "my-laptop"      this machine's folder in the store: <store>/<machine>/
+  rsync_path = "/opt/homebrew/bin/rsync"   the rsync 3 to run, pinned at install;
+                                          PATH's when left out
 
   [store]
   host = "devbox"            the store host, over ssh; leave it out for a local store
@@ -39,8 +47,10 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple, TextIO
 
 HOME = Path.home()
 # Exit status of copy() when ssh_mux_only is set and no master is running.
@@ -78,6 +88,7 @@ class Config(NamedTuple):
     host: str | None
     path: str
     ssh_mux_only: bool
+    rsync_path: str | None = None  # the rsync the sync runs; found on PATH when unset
 
     def target(self) -> str:
         """The store folder in rsync's syntax: host:/path or /path."""
@@ -118,11 +129,14 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"{path}: {key} must be a non-empty string")
         return value
 
-    top = table(doc, "", {"machine", "store"})
+    top = table(doc, "", {"machine", "rsync_path", "store"})
     store = table(top.get("store"), "store", {"host", "path", "ssh_mux_only"})
     machine = text(top.get("machine"), "machine")
     if "/" in machine:
         raise ConfigError(f"{path}: machine is a folder name, without /")
+    rsync = text(top["rsync_path"], "rsync_path") if "rsync_path" in top else None
+    if rsync and not rsync.startswith("/"):
+        raise ConfigError(f"{path}: rsync_path must be absolute")
     host = text(store["host"], "store.host") if "host" in store else None
     if host and (":" in host or "/" in host):
         raise ConfigError(f"{path}: store.host is an ssh host; put the folder in store.path")
@@ -134,7 +148,7 @@ def load_config(path: Path) -> Config:
         raise ConfigError(f"{path}: store.ssh_mux_only must be true or false")
     if mux and not host:
         raise ConfigError(f"{path}: store.ssh_mux_only needs store.host")
-    return Config(machine, host, folder.rstrip("/") or "/", mux)
+    return Config(machine, host, folder.rstrip("/") or "/", mux, rsync)
 
 
 # --- end config ---
@@ -146,6 +160,10 @@ TEMPLATE = """\
 # This machine's folder in the store: sessions go to <store path>/<machine>/.
 # Pinned at install, so a hostname change keeps using the same folder.
 machine = {machine}
+
+# The rsync 3 the sync runs, pinned at install: a timer, tmux and harness hooks
+# start the sync with a PATH of their own. Left out, the sync looks on PATH.
+{rsync}
 
 [store]
 # The store is on another host, over ssh, when `host` is set, and in a folder
@@ -166,6 +184,9 @@ ssh_mux_only = {mux}
 """
 
 
+RSYNC_EXAMPLE = '# rsync_path = "/opt/homebrew/bin/rsync"'
+
+
 def toml(c: Config) -> str:
     """A Config as config.toml, commented. JSON strings are valid TOML basic
     strings. install.sh writes the same file from its own copy of TEMPLATE."""
@@ -178,6 +199,7 @@ def toml(c: Config) -> str:
         host=f"host = {q(c.host)}\n" if c.host else "",
         path=q(c.path),
         mux="true" if c.ssh_mux_only else "false",
+        rsync=f"rsync_path = {q(c.rsync_path)}" if c.rsync_path else RSYNC_EXAMPLE,
     )
 
 
@@ -207,12 +229,20 @@ def convert_legacy(path: Path) -> None:
     old.replace(old.with_name("config.old"))
 
 
+class Source(NamedTuple):
+    """A harness's session folder, walked recursively."""
+
+    harness: str
+    root: Path
+
+
 class Settings(NamedTuple):
     config: Config
     src: Path
     state: Path
     interval: int
     retry_delay: int
+    sources: tuple[Source, ...] = ()
 
 
 class Result(NamedTuple):
@@ -227,6 +257,16 @@ def state_dir() -> Path:
     return Path(xdg) / "museum"
 
 
+def hook_dir() -> Path:
+    """Where `museum hook` leaves meta records and the flush stamp: a fixed
+    path, not state_dir(), because the hook and the sync run with different
+    environments. Muse clears its hooks' environment, and a timer has no
+    XDG_STATE_HOME. MUSEUM_STATE_DIR still wins, for tests."""
+    if "MUSEUM_STATE_DIR" in os.environ:
+        return Path(os.environ["MUSEUM_STATE_DIR"])
+    return Path.home() / ".local/state/museum"
+
+
 def settings() -> Settings:
     path = config_path()
     if sys.version_info >= (3, 11):  # noqa: UP036 (see load_config)
@@ -238,13 +278,25 @@ def settings() -> Settings:
         state=state_dir(),
         interval=int(env.get("MUSEUM_INTERVAL", "600")),
         retry_delay=int(env.get("MUSEUM_RETRY_DELAY", "30")),
+        sources=harness_sources(env),
     )
 
 
-def find_rsync() -> str | None:
-    """The first rsync 3: PATH's, then Homebrew's. macOS /usr/bin/rsync is
-    openrsync, which lacks --append-verify."""
-    for candidate in (shutil.which("rsync"), "/opt/homebrew/bin/rsync", "/usr/local/bin/rsync"):
+def harness_sources(env: Mapping[str, str]) -> tuple[Source, ...]:
+    """Where claude and codex keep sessions, honouring their own home variables.
+    cursor-agent's chats are live SQLite databases, unsafe to copy and not
+    greppable, so it has none; Muse Code's store is not known yet."""
+    claude = Path(env.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+    codex = Path(env.get("CODEX_HOME") or HOME / ".codex")
+    return (Source("claude", claude / "projects"), Source("codex", codex / "sessions"))
+
+
+def find_rsync(configured: str | None = None) -> str | None:
+    """The configured rsync_path if it is rsync 3, else none. Without one, the
+    first rsync 3: PATH's, then Homebrew's. macOS /usr/bin/rsync is openrsync,
+    which lacks --append-verify."""
+    found = (shutil.which("rsync"), "/opt/homebrew/bin/rsync", "/usr/local/bin/rsync")
+    for candidate in (configured,) if configured else found:
         if not candidate or not os.access(candidate, os.X_OK):
             continue
         try:
@@ -298,6 +350,14 @@ def copy(s: Settings, rsync: str) -> Result:
             Path(c.path, c.machine).mkdir(exist_ok=True)
         except OSError as e:
             return Result(1, f"mkdir: {e}")
+    # pi's sessions go as they are. The other harnesses' filtered copies ride
+    # the same rsync, so a sync still opens one ssh connection, and a machine
+    # without them runs the very command it always did.
+    stage = s.state / STAGE
+    sources, meta = [f"{s.src}/"], []
+    if stage.is_dir():
+        sources = [*([f"{s.src}/"] if s.src.is_dir() else []), f"{stage}/"]
+        meta = ["--include=/*/meta/*.json"]
     r = run(
         [
             rsync,
@@ -306,15 +366,448 @@ def copy(s: Settings, rsync: str) -> Result:
             "--timeout=120",
             "--include=*/",
             "--include=*.jsonl",
+            *meta,
             "--exclude=*",
             *extra,
             "-e",
             " ".join(ssh),
-            f"{s.src}/",
+            *sources,
             f"{c.target()}/{c.machine}/",
         ]
     )
     return Result(0, r.output) if r.code == RSYNC_VANISHED else r
+
+
+# --- the filter: claude and codex sessions, staged for the copy ---
+#
+# museum keeps a filtered copy of each claude and codex session under
+# <state>/stage/<harness>/<project folder>/, extended from a byte cursor, and
+# syncs that. Both harnesses only append, so the copy only grows and keeps
+# --append-verify. A source that shrank is filtered again from scratch.
+
+STAGE = "stage"
+CAP = 64 * 1024  # bytes kept of one tool result
+# claude: API request copies (every record type starting api-request: the
+# request, its blob, and its shape, which holds the whole system prompt) and
+# file snapshots, large and not the conversation.
+CLAUDE_DROP_PREFIX = "api-request"
+CLAUDE_DROP = frozenset({"file-history-snapshot"})
+# codex: opaque reasoning, and the histories every compaction repeats in full.
+CODEX_DROP = frozenset({"encrypted_content", "guardian_history", "replacement_history"})
+# codex: the payload fields that carry a tool's output.
+CODEX_OUTPUT = ("output", "aggregated_output", "formatted_output", "stdout", "stderr")
+# A line can need the filter only if it is long or names what it drops, so the
+# rest are copied without parsing.
+MARKERS = {
+    "claude": (b'"api-request', b'"file-history-snapshot"'),
+    "codex": tuple(f'"{key}"'.encode() for key in sorted(CODEX_DROP)),
+}
+
+
+def cap(value: object) -> object:
+    """A tool result of at most CAP bytes. A longer one is cut, as text: the
+    same object back means it was short enough. surrogatepass, because JSON
+    can carry a lone surrogate (a string cut inside an emoji); the cut drops
+    it."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    data = text.encode(errors="surrogatepass")
+    if len(data) <= CAP:
+        return value
+    return data[:CAP].decode(errors="ignore") + f"\n[museum: cut at {CAP} of {len(data)} bytes]"
+
+
+def strip(value: object, keys: frozenset[str]) -> bool:
+    """Delete `keys` at any depth, in place. True if anything went."""
+    changed = False
+    if isinstance(value, dict):
+        for key in keys & value.keys():
+            del value[key]
+            changed = True
+        items: list[object] = list(value.values())
+    elif isinstance(value, list):
+        items = value
+    else:
+        return False
+    for item in items:
+        changed = strip(item, keys) or changed
+    return changed
+
+
+def filter_entry(harness: str, entry: object) -> tuple[bool, bool]:
+    """(keep, changed) for one parsed record, which is changed in place."""
+    if not isinstance(entry, dict):
+        return True, False
+    changed = False
+
+    def capped(d: object, key: str) -> None:
+        nonlocal changed
+        if isinstance(d, dict) and key in d:
+            value = cap(d[key])
+            if value is not d[key]:
+                d[key] = value
+                changed = True
+
+    if harness == "claude":
+        kind = entry.get("type")
+        if isinstance(kind, str) and (kind.startswith(CLAUDE_DROP_PREFIX) or kind in CLAUDE_DROP):
+            return False, False
+        capped(entry, "toolUseResult")
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                capped(block, "content")
+    elif harness == "codex":
+        changed = strip(entry, CODEX_DROP)
+        for key in CODEX_OUTPUT:
+            capped(entry.get("payload"), key)
+    return True, changed
+
+
+def filter_line(harness: str, line: bytes) -> bytes | None:
+    """One JSONL line as the store keeps it, or None to drop it. A line that is
+    not JSON is kept as it is: this is a backup."""
+    if len(line) <= CAP and not any(m in line for m in MARKERS[harness]):
+        return line
+    # RecursionError: nested too deep to parse or walk, which no harness writes.
+    try:
+        entry = json.loads(line)
+        keep, changed = filter_entry(harness, entry)
+    except (ValueError, RecursionError):
+        return line
+    if not keep:
+        return None
+    if not changed:
+        return line
+    try:
+        text = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+        return (text + "\n").encode()
+    except UnicodeEncodeError:  # a lone surrogate: keep it as JSON's \uXXXX escape
+        return (json.dumps(entry, separators=(",", ":")) + "\n").encode()
+
+
+def slug(path: str) -> str:
+    """A cwd as a folder name, the way claude names its project folders:
+    /home/u/proj is -home-u-proj. The leading - keeps it apart from `meta`."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def codex_project(src: Path) -> str | None:
+    """A codex rollout's project folder, from session_meta's cwd in its first
+    line: the date folders say nothing about the project. None while that line
+    is still being written."""
+    with src.open("rb") as f:
+        first = f.readline()
+    if not first.endswith(b"\n"):
+        return None
+    try:
+        cwd = json.loads(first)["payload"]["cwd"]
+    except (ValueError, KeyError, TypeError):
+        cwd = None
+    return slug(cwd) if isinstance(cwd, str) and cwd else "-unknown"
+
+
+def destination(source: Source, src: Path) -> str | None:
+    """Where a source file's filtered copy goes, under the stage folder."""
+    if source.harness == "codex":
+        project = codex_project(src)
+        return None if project is None else f"codex/{project}/{src.name}"
+    # claude's own folders are already per project; subagents stay beside
+    # their session, in <uuid>/subagents/.
+    return f"{source.harness}/{src.relative_to(source.root).as_posix()}"
+
+
+Cursor = dict[str, Any]  # pos: source bytes read, out: bytes written, dest
+
+
+def extend(harness: str, src: Path, out: Path, cur: Cursor) -> Cursor:
+    """Filter the complete lines past the cursor onto the staged copy."""
+    pos, written = cur["pos"], cur["out"]
+    if src.stat().st_size < pos:  # shrank: not the file we read
+        pos = written = 0
+    have = out.stat().st_size if out.exists() else 0
+    if have < written:  # the copy went missing or was cut: start over
+        pos = written = 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("rb") as fi, out.open("ab") as fo:
+        # A crash after writing but before the cursor was saved leaves the
+        # copy longer than the cursor says; cut it back.
+        fo.truncate(written)
+        fi.seek(pos)
+        for line in fi:
+            if not line.endswith(b"\n"):  # still being written
+                break
+            pos += len(line)
+            kept = filter_line(harness, line)
+            if kept is not None:
+                fo.write(kept)
+                written += len(kept)
+    return {**cur, "pos": pos, "out": written}
+
+
+def stage(state: Path, sources: tuple[Source, ...], hooks: Path) -> None:
+    """Bring every staged copy, and every meta record under `hooks`, up to date. Every source file is
+    stat'ed, not just recent ones: a codex rollout can grow months after its
+    date folder. One file that cannot be read or filtered is skipped, never
+    the rest, and their cursors are saved."""
+    root = state / STAGE
+    cursors_file = state / "stage.json"
+    try:
+        cursors: dict[str, Cursor] = json.loads(cursors_file.read_text())
+    except (OSError, ValueError):
+        cursors = {}
+    for source in sources:
+        if not source.root.is_dir():
+            continue
+        for src in sorted(source.root.rglob("*.jsonl")):
+            key = str(src)
+            cur = cursors.get(key)
+            try:
+                if cur is not None and src.stat().st_size == cur["pos"]:
+                    continue
+                if cur is None:
+                    dest = destination(source, src)
+                    if dest is None:
+                        continue
+                    cur = {"pos": 0, "out": 0, "dest": dest}
+                cursors[key] = extend(source.harness, src, root / str(cur["dest"]), cur)
+            except Exception as e:  # noqa: BLE001 (one bad file must not stop the rest)
+                print(f"museum: skipped {src}: {type(e).__name__}: {e}", file=sys.stderr)
+    # The meta records `museum hook` wrote, as <harness>/meta/<session id>.json.
+    for record_file in sorted((hooks / "meta").glob("*/*.json")):
+        out = root / record_file.parent.name / "meta" / record_file.name
+        try:
+            if not out.exists() or out.stat().st_size != record_file.stat().st_size:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(record_file, out)
+        except OSError as e:
+            print(f"museum: skipped {record_file}: {e}", file=sys.stderr)
+    if cursors:
+        write(cursors_file, json.dumps(cursors, sort_keys=True) + "\n")
+
+
+# --- `museum hook HARNESS`: the meta record and the flush stamp ---
+
+HOOKED = ("claude", "codex", "muse")
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def git_meta(cwd: str) -> dict[str, str]:
+    """The cwd's repo, as pi/museum.ts's meta() records it."""
+
+    def git(*args: str) -> str:
+        try:
+            p = subprocess.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return p.stdout if p.returncode == 0 else ""
+
+    # --abbrev-ref applies to every argument after it, so the commit comes first.
+    rev = git(
+        "rev-parse", "--path-format=absolute", "--git-common-dir", "HEAD", "--abbrev-ref", "HEAD"
+    )
+    remote = git("config", "--get", "remote.origin.url").strip()
+    common, commit, branch = [*rev.strip().split("\n"), "", "", ""][:3]
+    # The common dir is <repo>/.git for a plain repo and for every worktree of it.
+    repo = common[: -len("/.git")] if common.endswith("/.git") else ""
+    return {
+        "project": Path(repo).name if repo else "",
+        "repo": repo,
+        "remote": remote,
+        "branch": branch if branch != "HEAD" else "",
+        "commit": commit,
+    }
+
+
+def process_table() -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, argv), from one `ps`."""
+    r = run(["ps", "-A", "-o", "pid=,ppid=,args="])
+    table = {}
+    for line in r.output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) == 3 else "")
+    return table
+
+
+# Every harness's process names, as mu's chain walk knows them. A launcher and
+# its binary (`codex < codex.real`) are one harness.
+HARNESSES = frozenset({"claude", "codex", "cursor-agent", "muse", "pi"})
+
+
+def harness_of(args: str) -> str | None:
+    """The harness a process runs, by argv, not by process name: pi and
+    cursor-agent can run as `node` or `bun`, with the harness in the script's
+    path."""
+    words = args.split(maxsplit=2)
+    if not words:
+        return None
+    exe = Path(words[0])
+    if exe.name in ("node", "bun"):
+        if len(words) < 2:
+            return None
+        script = Path(words[1])
+        return next((n for n in (script.stem, *script.parts) if n in HARNESSES), None)
+    name = exe.name.removesuffix(".real")
+    return name if name in HARNESSES else None
+
+
+def started(pid: int) -> float | None:
+    """A process's start time, epoch seconds, to the second."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout
+        return time.mktime(time.strptime(" ".join(out.split()), "%a %b %d %H:%M:%S %Y"))
+    except (OSError, ValueError):
+        return None
+
+
+def epoch(value: object) -> float | None:
+    """An anchor's start time: epoch seconds or milliseconds, ISO 8601, or ps's
+    lstart text."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e11 else float(value)
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            return datetime.fromisoformat(value).timestamp()
+        with contextlib.suppress(ValueError):
+            return time.mktime(time.strptime(" ".join(value.split()), "%a %b %d %H:%M:%S %Y"))
+    return None
+
+
+def pick(doc: dict[str, Any], *keys: str) -> Any:
+    return next((doc[k] for k in keys if doc.get(k) not in (None, "")), None)
+
+
+def find_anchor(harness: str) -> dict[str, Any] | None:
+    """mu's anchor for the agent this hook runs under: the first ancestor
+    with an anchor file whose start time matches the process, so a reused pid
+    cannot lend its identity. {} when that anchor is not this session's: it
+    is another harness's, or the walk left this session's harness before
+    reaching it, through a shell to an outer agent of any harness. Either way
+    the session is nested and has no mu identity of its own. None when there
+    is no anchor, and the environment is the fallback."""
+    anchors = Path.home() / ".local/state/mu-next/anchors"
+    if not anchors.is_dir():
+        return None
+    procs = process_table()
+    pid, seen = os.getppid(), set()
+    ours: str | None = None  # the first harness on the chain: this session's
+    left = False  # the walk has passed beyond it
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        doc = read_anchor(anchors / f"{pid}.json", pid)
+        if doc is not None:
+            cli = pick(doc, "cli", "harness")
+            return {} if left or (cli and cli != harness) else doc
+        ppid, args = procs.get(pid, (0, ""))
+        kind = harness_of(args)
+        if ours is None:
+            ours = kind
+        elif kind != ours:
+            left = True
+        pid = ppid
+    return None
+
+
+def read_anchor(path: Path, pid: int) -> dict[str, Any] | None:
+    """An anchor file, if it is there, parses, and was written for this very
+    process. One without a start time is taken as it is."""
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    when = pick(doc, "start_time", "started", "startTime")
+    if when is None:
+        return doc
+    actual, expected = started(pid), epoch(when)
+    return doc if actual and expected and abs(actual - expected) <= 2 else None
+
+
+def identity(harness: str, env: Mapping[str, str]) -> dict[str, str]:
+    """Agent, role and workstream exist only in mu's anchor or the agent's env."""
+    anchor = find_anchor(harness)
+    if anchor is not None:
+        agent = pick(anchor, "agent", "agent_name", "name")
+        workstream = pick(anchor, "workstream")
+        orchestrator = anchor.get("orchestrator") in (True, 1, "1", "true")
+    else:
+        agent, workstream = env.get("MU_AGENT_NAME"), env.get("MU_WORKSTREAM")
+        orchestrator = env.get("MU_ORCHESTRATOR") == "1"
+    return {
+        "agent": agent if isinstance(agent, str) else "",
+        "workstream": workstream if isinstance(workstream, str) else "",
+        "role": "orchestrator" if orchestrator else "",
+    }
+
+
+def write_meta(harness: str, payload: dict[str, Any], env: Mapping[str, str]) -> None:
+    """<state>/meta/<harness>/<session id>.json, once: a resumed session keeps
+    its first record. museum never writes into another harness's transcript."""
+    sid = payload.get("session_id")
+    if not isinstance(sid, str) or not SAFE_ID.fullmatch(sid):
+        return
+    path = hook_dir() / "meta" / harness / f"{sid}.json"
+    if path.exists():
+        return
+    cwd = payload.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and cwd else str(Path.cwd())
+    doc = {
+        "harness": harness,
+        "session_id": sid,
+        "cwd": cwd,
+        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        **git_meta(cwd),
+        **identity(harness, env),
+    }
+    if not doc["project"]:
+        doc["project"] = doc["workstream"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write(path, json.dumps({k: v for k, v in doc.items() if v}) + "\n")
+
+
+def hook(harness: str, stdin: TextIO) -> int:
+    """One harness hook call, its payload on stdin. SessionStart writes the
+    meta record; SessionEnd only leaves the flush stamp, since a sandboxed hook
+    cannot run rsync or ssh: `museum tick`, outside every sandbox, does the
+    sync. A hook never breaks a turn, so every problem is a line on stderr and
+    exit 0, and nothing goes to stdout, which claude would show the model."""
+    try:
+        if harness not in HOOKED:
+            print(f"museum: no backup for {harness} sessions", file=sys.stderr)
+            return 0
+        payload = json.loads(stdin.read() or "{}")
+        if not isinstance(payload, dict):
+            return 0
+        # codex's hidden title-generation session fires every event.
+        if harness == "codex" and "transcript_path" in payload and not payload["transcript_path"]:
+            return 0
+        event = str(payload.get("hook_event_name", "")).lower()
+        if event == "sessionstart":
+            write_meta(harness, payload, os.environ)
+        elif event == "sessionend":
+            state = hook_dir()
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "flush").touch()
+    except Exception as e:  # noqa: BLE001 (a hook never breaks a turn)
+        print(f"museum: hook {harness}: {type(e).__name__}: {e}", file=sys.stderr)
+    return 0
 
 
 def error_line(output: str) -> str:
@@ -354,8 +847,16 @@ def sync_once(s: Settings, rsync: str | None) -> bool:
     (s.state / "pending").unlink(missing_ok=True)
     (s.state / "last-start").write_text(f"{int(time.time())}\n")
     if rsync is None:
-        record(s.state, "error", "rsync 3.x not found (macOS: brew install rsync)")
+        configured = s.config.rsync_path
+        why = f"rsync_path {configured} is not rsync 3.x" if configured else "rsync 3.x not found"
+        record(s.state, "error", f"{why} (macOS: brew install rsync)")
         return False
+    # A filter failure must not cost pi its backup: the copy runs regardless,
+    # with whatever staged copies there are.
+    try:
+        stage(s.state, s.sources, hook_dir())
+    except Exception as e:  # noqa: BLE001 (pi's backup comes first)
+        print(f"museum: filter: {type(e).__name__}: {e}", file=sys.stderr)
     r = copy(s, rsync)
     # One retry, for a blip, only in mux-only mode with a live master: there it
     # costs no human step. A fresh connection may need a key touch, and a
@@ -387,7 +888,7 @@ def due(s: Settings, if_due: bool) -> bool:
 def parse(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="museum-sync",
-        description="Back up local pi sessions to the museum store.",
+        description="Back up local agent sessions to the museum store.",
     )
     mode = p.add_mutually_exclusive_group()
     mode.add_argument(
@@ -400,11 +901,19 @@ def parse(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="sync now; if a sync is running, it runs again after (the default)",
     )
+    mode.add_argument(
+        "--hook",
+        metavar="HARNESS",
+        help=f"run as a harness hook ({', '.join(HOOKED)}), the payload on stdin",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
-    if_due = parse(argv).if_due
+    ns = parse(argv)
+    if ns.hook:
+        return hook(ns.hook, sys.stdin)
+    if_due = ns.if_due
     # pi starts this in its own cwd, often a mu workspace deleted since, and
     # rsync exits 3 when getcwd() fails. Every path here is absolute.
     os.chdir(HOME)
@@ -420,7 +929,7 @@ def main(argv: list[str]) -> int:
     # Marked BEFORE trying the lock, so a holder that is mid-sync sees it.
     if not if_due:
         (s.state / "pending").touch()
-    rsync = find_rsync()
+    rsync = find_rsync(s.config.rsync_path)
     fd = os.open(s.state / "lock", os.O_WRONLY | os.O_CREAT, 0o644)
     ok = True
     while True:

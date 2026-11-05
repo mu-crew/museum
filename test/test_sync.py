@@ -44,6 +44,10 @@ class Sandbox(unittest.TestCase):
             "MUSEUM_CONFIG": str(self.config),
             "MUSEUM_STATE_DIR": str(self.state),
             "PI_SESSIONS_DIR": str(self.src),
+            # Never the real ones: these tests must not stage this machine's
+            # claude or codex sessions.
+            "CLAUDE_CONFIG_DIR": str(self.dir / "claude"),
+            "CODEX_HOME": str(self.dir / "codex"),
             **extra,
         }
 

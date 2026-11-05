@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install museum on this machine: config, then the pi package (skill and extension).
+# Install museum on this machine: config, the pi package (skill and extension)
+# when pi is here, and the timer that runs `museum tick` every 5 minutes.
 # Usage: ./install.sh [STORE [MACHINE]]     e.g. ./install.sh devbox:/data/museum
 # STORE is host:/path for an ssh store, or /path for a local one. MACHINE is this
 # machine's folder in the store; it defaults to `hostname -s`, pinned in config.
@@ -61,6 +62,16 @@ if [ ! -f "$CONF" ] && [ ! -f "$CONF_DIR/config" ]; then
   else
     HOST_LINE=''
   fi
+  # Pin the first rsync 3, as museum-sync's find_rsync looks for it: a timer,
+  # tmux and harness hooks start the sync with a PATH of their own.
+  RSYNC_LINE='# rsync_path = "/opt/homebrew/bin/rsync"'
+  for candidate in "$(command -v rsync || true)" /opt/homebrew/bin/rsync /usr/local/bin/rsync; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] &&
+      "$candidate" --version 2> /dev/null | grep -Eq '^rsync[[:space:]]+version 3'; then
+      RSYNC_LINE="rsync_path = $(toml_str "$candidate")"
+      break
+    fi
+  done
   # Pin the machine name so a hostname change never starts a new folder.
   # Keep the comments in step with TEMPLATE in bin/museum-sync; a test checks.
   cat > "$CONF" << EOF
@@ -69,6 +80,10 @@ if [ ! -f "$CONF" ] && [ ! -f "$CONF_DIR/config" ]; then
 # This machine's folder in the store: sessions go to <store path>/<machine>/.
 # Pinned at install, so a hostname change keeps using the same folder.
 machine = $(toml_str "$MACHINE")
+
+# The rsync 3 the sync runs, pinned at install: a timer, tmux and harness hooks
+# start the sync with a PATH of their own. Left out, the sync looks on PATH.
+$RSYNC_LINE
 
 [store]
 # The store is on another host, over ssh, when \`host\` is set, and in a folder
@@ -102,12 +117,19 @@ done
 
 # The skill and the extension, as a pi package loaded from this folder, so
 # repo edits are live. Running pi agents pick it up on restart or /reload.
-command -v pi > /dev/null || {
-  echo "museum: needs pi on PATH" >&2
-  exit 1
-}
-pi install "$ROOT"
+if command -v pi > /dev/null; then
+  pi install "$ROOT"
+else
+  echo "museum: no pi on PATH; skipping the pi package"
+fi
 
-# The first sync also converts an old KEY=value config to config.toml.
+# The first sync also converts an old KEY=value config to config.toml. It runs
+# before the timer exists: the timer's first tick would start a sync that
+# takes the lock, and this one would then exit 0 without showing an error.
 echo "running first sync..."
-"$SYNC" --now && echo "ok"
+status=0
+if "$SYNC" --now; then echo "ok"; else status=$?; fi
+
+# Syncs for claude and codex, and for a host whose agents have all exited.
+"$ROOT/bin/museum" timer install || echo "museum: could not install the timer" >&2
+exit "$status"

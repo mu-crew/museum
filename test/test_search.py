@@ -207,6 +207,21 @@ class Store(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("no store folder matches", r.stderr)
 
+    def test_find_skips_other_harness_folders(self) -> None:
+        """museum-sync's claude and codex copies sit beside pi's folders; until
+        museum-search reads them, find returns what it did before."""
+        before = self.run_search("find", "stalwart").stdout
+        for rel in (
+            "pc/claude/-home-u-hacking-hail/s1.jsonl",
+            "pc/claude/-home-u-hacking-hail/s1/subagents/agent-a.jsonl",
+            "pc/codex/-home-u-hacking-hail/rollout-2026-11-05T10-00-00-c0de.jsonl",
+        ):
+            write_session(self.dir, rel, [msg("user", "stalwart again")])
+        self.assertEqual(self.run_search("find", "stalwart").stdout, before)
+        r = self.run_search("find", "stalwart", "claude")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no store folder matches", r.stderr)
+
     def test_show_window(self) -> None:
         r = self.run_search("show", f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl", "rust it")
         lines = r.stdout.splitlines()
