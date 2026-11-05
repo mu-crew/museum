@@ -16,7 +16,7 @@ Every machine rsyncs `~/.pi/agent/sessions/`, and filtered copies of `~/.claude/
 <store>/<hostname>/<harness>/meta/<session id>.json                 (repo, branch, mu agent, workstream)
 ```
 
-`museum-search` reads only the pi folders so far, and skips these; search the `claude` and `codex` folders with `rg -l` on the store host. Their project folders spell the cwd with every non-alphanumeric character as `-`, so `/home/u/proj` is `-home-u-proj`. The filtered copies leave out API request records (and their system prompts), file snapshots, encrypted reasoning and repeated compaction histories, and cut tool output at 64 KB.
+`museum-search` reads all of these, and pi files at the top of a machine's folder, from before pi kept a folder per cwd. It skips `muse/`, whose format is not known yet: search it with `rg -l` on the store host. claude's and codex's project folders spell the cwd with every non-alphanumeric character as `-`, so `/home/u/proj` is `-home-u-proj`. The filtered copies leave out API request records (and their system prompts), file snapshots, encrypted reasoning and repeated compaction histories, and cut tool output at 64 KB.
 
 The path records the machine, the project, and the start time. Pi encodes the cwd folder by replacing `/` with `-`, so `/Users/x/hacking/hail` is stored as `--Users-x-hacking-hail--`. mu agents run in worktrees such as `--…-.local-state-mu-workspaces-hail-worker-1--`, and those folders still contain the project name. Newer sessions also carry a `museum` custom entry that records the git repo, branch, commit and mu workstream.
 
@@ -30,8 +30,8 @@ S=<this skill's folder>/scripts/museum-search
 
 It reads the config, reaches an ssh store in one ssh call, and needs no quoting from you: pass `TERM` as a plain argument.
 
-1. **Triage.** Run `"$S" find TERM [PROJECT]`. `TERM` is a case-insensitive literal. `PROJECT` narrows the search to store folders whose name contains it. Each session prints as one block: the start time, the host, the project, how many turns and tool entries mention `TERM`, the store path, the first user message, and the first mention in conversation text. Sessions where a user or assistant turn says `TERM` come before sessions where only tool output does. Matches only in the recorded system prompt (AGENTS.md, docs, skills) are dropped, and so is your own session. Within each group, project folders come before mu workspace folders, then the sessions that discuss `TERM` in the most turns, because the session that debated a topic holds the decision. `--newest` orders by date instead, for "what is the latest on X". `--limit N` shows more than 20 sessions. Pick sessions by their first user message, which says what the session was for.
-2. **Read.** Run `"$S" show FILE --users` for the session's arc: every user turn, one line each. A short or numbered reply ("1", "q6 1, q7 1") comes with the end of the assistant turn it answers, which usually holds the question and the recommendation. Then run `"$S" show FILE TERM` to print only the turns that mention `TERM`, each with the turn either side. A word from the arc, such as `DECISIONS` or a rejected option, makes a good `TERM`. `"$S" show FILE` prints the whole conversation, which can be long. Tool calls and outputs are left out.
+1. **Triage.** Run `"$S" find TERM [PROJECT]`. `TERM` is a case-insensitive literal. `PROJECT` narrows the search to store folders whose name contains it, pi's, claude's and codex's. Put `--` before a `TERM` or `PROJECT` that starts with `-`, such as a claude project folder: `"$S" find -- TERM -home-u-proj`. Each session prints as one block: the start time, the host (and the harness, for claude and codex), the project, how many turns and tool entries mention `TERM`, the store path, the first user message, and the first mention in conversation text. Sessions where a user or assistant turn says `TERM` come before sessions where only tool output does. Matches only in the recorded system prompt (AGENTS.md, docs, skills) are dropped, and so is your own session. Within each group, project folders come before mu workspace folders, then the sessions that discuss `TERM` in the most turns, because the session that debated a topic holds the decision. `--newest` orders by date instead, for "what is the latest on X". `--limit N` shows more than 20 sessions. Pick sessions by their first user message, which says what the session was for.
+2. **Read.** Run `"$S" show FILE --users` for the session's arc: every user turn, one line each. A short or numbered reply ("1", "q6 1, q7 1") comes with the end of the assistant turn it answers, which usually holds the question and the recommendation. Then run `"$S" show FILE TERM` to print only the turns that mention `TERM`, each with the turn either side. A word from the arc, such as `DECISIONS` or a rejected option, makes a good `TERM`. `"$S" show FILE` prints the whole conversation, which can be long. Tool calls and outputs are left out. A claude or codex session reads the same way as pi's: claude's reply split over several lines, and codex's split over several items, each print as one turn.
 3. **Find the decision.** Decisions show up as user turns that choose or reject something ("X is out", "go with Y", "lets do it"), and as the assistant turn just before them. Search again with a term from that exchange, and keep going until you can name the session file, date, and host behind the answer.
 
 The newest sessions from this machine may exist only in `~/.pi/agent/sessions/`. Search there with `rg -l -i -F TERM ~/.pi/agent/sessions`.
@@ -61,11 +61,18 @@ listed session with `show FILE TERM`. Both commands share filters:
 `--background`/`--foreground`, and role/agent/workstream globs. `--json`
 gives structured reports. Consult `--help` for argument details.
 
-Role comes from museum metadata, not prompt text; missing metadata is
-`other`, metadata without an agent is `main`. Model time includes harness
-gaps, not just provider inference. Model/tool wall spans split across UTC
-windows. `--since`/`--until` select session-start date cohorts by filename,
-not event-time slices; a selected session can contribute to later windows.
+Role comes from museum metadata, not prompt text: pi's `museum` entry, or
+the meta record `museum hook` wrote for a claude or codex session. Missing
+metadata is `other`, metadata without an agent is `main`. Model time includes
+harness gaps, not just provider inference. Model/tool wall spans split across
+UTC windows. `--since`/`--until` select session-start date cohorts (a pi
+file's name, else its first record), not event-time slices; a selected
+session can contribute to later windows.
+
+All three formats count alike: messages and calls are counted after merging
+claude's lines by `message.id` and codex's records by `call_id`. Tool names
+are lowercased, and every harness's shell tool is `bash`. codex records each
+command's wall time and exit code; claude's call durations are estimates.
 
 Call rows carry `duration_source`: `durationMs` is measured; `estimated` is
 a call-to-result gap, also marked in text. Several calls can share one

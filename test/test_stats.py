@@ -415,7 +415,8 @@ class Units(unittest.TestCase):
             "role",
         ]
         words = search.forward(search.parse(argv))
-        self.assertEqual(words[:6], ["calls", "lock", "--match", "a b", "--min-secs", "3.0"])
+        self.assertEqual(words[:5], ["calls", "--match", "a b", "--min-secs", "3.0"])
+        self.assertEqual(words[-2:], ["--", "lock"])
         self.assertIn("--background", words)
         self.assertEqual(search.forward(search.parse(words)), words)
         stats = search.forward(search.parse(["stats", "--by", "6h", "--error"]))

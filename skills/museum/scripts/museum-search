@@ -28,13 +28,21 @@ result, wait time every other gap (the user, a follow-up). A call's duration is
 its recorded durationMs, else an estimated call-to-result gap; duration_source
 labels which. Request timestamps do not establish execution intervals, so no
 concurrency is reported. Model/tool wall spans split across UTC windows;
---since/--until select session-start cohorts by filename, not event-time slices.
+--since/--until select session-start cohorts (a pi file's name, else its first
+record), not event-time slices.
 Shell heredoc and background detection are launch/matching heuristics, not a
 shell parser or proof of execution.
 
 TERM is a literal, matched case-insensitively. PROJECT narrows `find` to store
 folders whose name contains it. FILE is a path relative to the store, as `find`
-prints it.
+prints it. Put -- before a TERM, PROJECT or FILE that starts with -, as claude's
+and codex's project folders do: find -- TERM -home-u-proj.
+
+Every command reads pi, Claude Code and Codex sessions alike: each format has a
+normaliser to one stream of user and assistant messages, tool calls and tool
+results. Messages and calls are counted after merging, so claude's one line per
+content block counts as one message, and codex's records of one call as one
+call. Tool names are lowercased, and every harness's shell tool is `bash`.
 
 `find` ranks sessions by where TERM appears. Sessions that mention it in a user
 or assistant turn come before those where only tool output does; sessions where
@@ -54,6 +62,7 @@ museum. rg makes `find` faster where it is installed, and is optional.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -62,16 +71,13 @@ import shutil
 import statistics
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, NamedTuple
 
 MU_WORKSPACE = "-mu-workspaces-"
-# The other harnesses' folders, <host>/<harness>/<project>/...: not read yet,
-# so kept out of every search.
-HARNESS_FOLDERS = frozenset({"claude", "codex", "muse"})
 SNIPPET = 100  # characters of context either side of a match
 # A user turn that answers the assistant turn before it: short ("yes", "mule"),
 # or picking options by number ("1, also consider...", "q6 1, q7 1 q8. lets
@@ -98,35 +104,97 @@ def tier(line: str) -> int:
     return SYSTEM if role == "system" else TOOL
 
 
+# Where museum-sync puts each harness's sessions, told apart by depth:
+#
+#   <host>/<pi folder>/<time>_<id>.jsonl                   pi
+#   <host>/<time>_<id>.jsonl                               pi, from before its
+#                                                          per-cwd folders
+#   <host>/claude/<project>/<id>.jsonl                     claude
+#   <host>/claude/<project>/<id>/subagents/agent-<x>.jsonl claude's subagents,
+#   <host>/claude/<project>/<id>/subagents/workflows/<run>/agent-<x>.jsonl
+#                                                          and its workflows'
+#   <host>/codex/<project>/rollout-<time>-<id>.jsonl       codex
+#   <host>/<harness>/meta/<id>.json                        `museum hook`'s record
+#
+# muse's session format is not known yet: its folder stays out of every
+# command, and rg on the store still finds it.
+HARNESS_FOLDERS = frozenset({"claude", "codex", "muse"})
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
 class Session(NamedTuple):
-    path: str  # relative to the store: host/folder/file.jsonl
+    path: str  # relative to the store, as discover() found it
     host: str
-    folder: str
+    folder: str  # the project folder; "" for a pi file from before pi's folders
     name: str
+    harness: str = "pi"
 
     @classmethod
-    def of(cls, path: str) -> Session:
-        host, folder, name = path.split("/", 2)
-        return cls(path, host, folder, name)
+    def parse(cls, path: str) -> Session | None:
+        """A store path as a session, by its depth; None for anything else."""
+        parts = path.split("/")
+        if not parts[-1].endswith(".jsonl") or any(not p or p.startswith(".") for p in parts):
+            return None
+        n, top = len(parts), parts[1] if len(parts) > 2 else ""
+        if n == 2:
+            return cls(path, parts[0], "", parts[1])
+        if n == 3 and top not in HARNESS_FOLDERS:
+            return cls(path, parts[0], parts[1], parts[2])
+        # A subagent's transcript is agent-<id>.jsonl, under subagents/ or a
+        # workflow run's folder below it, beside the run's journal.jsonl.
+        subagent = (
+            n >= 6
+            and top == "claude"
+            and parts[4] == "subagents"
+            and parts[-1].startswith("agent-")
+        )
+        if top in ("claude", "codex") and parts[2] != "meta" and (n == 4 or subagent):
+            return cls(path, parts[0], parts[2], parts[-1], top)
+        return None
+
+    def dir(self) -> str:
+        """The project folder, as a store path: what PROJECT selects."""
+        return "/".join(self.path.split("/")[: 2 if self.harness == "pi" else 3])
 
     def id(self) -> str:
-        return self.name.removesuffix(".jsonl").rpartition("_")[2]
+        stem = self.name.removesuffix(".jsonl")
+        if self.harness == "pi":
+            return stem.rpartition("_")[2]
+        ids = UUID.findall(stem)
+        return ids[-1] if ids else stem
+
+    def session_ids(self) -> list[str]:
+        """The ids `museum hook` may have filed this session's record under:
+        a claude subagent's is its parent's, a codex rollout's is in its
+        session_meta record and its name."""
+        parts = self.path.split("/")
+        if self.harness == "claude":
+            return [parts[3].removesuffix(".jsonl")]
+        if self.harness != "codex":
+            return []
+        ids = []
+        try:
+            with Path(self.path).open(encoding="utf-8", errors="replace") as f:
+                first = json.loads(f.readline())
+            payload = first.get("payload") if isinstance(first, dict) else None
+            if isinstance(payload, dict):
+                ids = [v for k in ("session_id", "id") if isinstance(v := payload.get(k), str)]
+        except (OSError, ValueError):
+            pass
+        return ids + UUID.findall(self.name)[::-1]
 
     def project(self) -> bool:
         """In a project folder, not a mu workspace: where decisions are made."""
         return MU_WORKSPACE not in self.folder
 
-    def started(self) -> str:
-        m = re.match(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})", self.name)
-        return f"{m[1]} {m[2]}:{m[3]}" if m else self.name
-
 
 def label(folder: str) -> str:
     """A store folder as a short project label: the home prefix goes, and mu
-    workspaces become mu:<workstream>-<agent>."""
-    s = re.sub(r"^--|--$", "", folder)
+    workspaces become mu:<workstream>-<agent>. pi's folders are wrapped in --,
+    claude's and codex's start with one -, and spell a . as -."""
+    s = re.sub(r"^-+|-+$", "", folder)
     s = re.sub(r"^(Users|home|var-home)-[^-]+-", "", s)
-    return re.sub(r"^\.local-state-mu-workspaces-", "mu:", s)
+    return re.sub(r"^[.-]local-state-mu-workspaces-", "mu:", s)
 
 
 def needle(term: str) -> str:
@@ -165,6 +233,529 @@ def text(entry: dict[str, Any]) -> str | None:
     )
 
 
+# --- the formats: discovery, start dates, and one normaliser per harness ---
+#
+# The normalisers turn claude's and codex's records into pi's shape, which the
+# rest of this script reads: a "session" entry with the cwd, a "museum" custom
+# entry with the meta record, and "message" entries whose role is user,
+# assistant, toolResult or system, with text, thinking and toolCall blocks.
+# Merging happens after: claude writes each content block of one reply as its
+# own line under one message.id, and codex writes one reply as several items
+# (reasoning, text, calls) and a call's outcome as records sharing its call_id.
+
+INDEX = ".museum-index.json"  # at the store's root: start dates read so far
+# A session file's name, when it starts with its start time: pi's do.
+NAMED = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})")
+SHELLS = frozenset({"bash", "shell", "shell_command", "exec_command", "local_shell"})
+
+
+def discover() -> list[Session]:
+    """Every session in the store, in path order. Dot folders (the index)
+    and muse's folder are skipped; links are not followed."""
+    out = []
+    for root, dirs, files in os.walk("."):
+        rel = root.removeprefix(".").removeprefix("/")
+        depth = rel.count("/") + 1 if rel else 0
+        dirs[:] = [
+            d
+            for d in dirs
+            if not d.startswith(".")
+            and not (depth == 1 and d == "muse")
+            and not (depth == 2 and d == "meta")
+        ]
+        for f in files:
+            s = Session.parse(f"{rel}/{f}" if rel else f)
+            if s is not None:
+                out.append(s)
+    return sorted(out, key=lambda s: s.path.split("/"))
+
+
+def first_stamp(path: Path) -> str:
+    """The time of a session's first record that has one, as Dates keeps it."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f):
+                if n >= 200 or not line.endswith("\n"):
+                    break
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                t = stamp(entry) if isinstance(entry, dict) else None
+                if t is not None:
+                    return iso(t)
+    except OSError:
+        pass
+    return ""
+
+
+class Dates:
+    """Each session's start, YYYY-MM-DDTHH:MM:SS in UTC: from a pi file's name,
+    else from the file's first record. A first record never changes, so those
+    are kept in INDEX, which a search rewrites when it has read new ones; a
+    store it cannot write is only slower."""
+
+    def __init__(self) -> None:
+        try:
+            doc = json.loads(Path(INDEX).read_text())
+        except (OSError, ValueError):
+            doc = {}
+        known = doc.get("dates") if isinstance(doc, dict) else None
+        self.known: dict[str, str] = known if isinstance(known, dict) else {}
+        self.changed = False
+
+    def started(self, s: Session) -> str:
+        m = NAMED.match(s.name) if s.harness == "pi" else None
+        if m:
+            return f"{m[1]}T{m[2]}:{m[3]}:{m[4]}"
+        got = self.known.get(s.path)
+        if not isinstance(got, str):
+            got = first_stamp(Path(s.path))
+            if got:
+                self.known[s.path] = got
+                self.changed = True
+        return got
+
+    def save(self) -> None:
+        if not self.changed:
+            return
+        tmp = Path(f"{INDEX}.{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps({"dates": self.known}, sort_keys=True) + "\n")
+            tmp.replace(INDEX)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+
+DATES: list[Dates] = []  # the one Dates of this run, made on first use
+
+
+def dates() -> Dates:
+    if not DATES:
+        DATES.append(Dates())
+    return DATES[0]
+
+
+def started_label(s: Session) -> str:
+    when = dates().started(s)
+    return f"{when[:10]} {when[11:16]}" if when else s.name
+
+
+def message(ts: object, role: str, content: object, **extra: Any) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "timestamp": ts,
+        "message": {"role": role, "content": content, **extra},
+    }
+
+
+def texts(content: object) -> list[dict[str, Any]]:
+    """A string, or a list of blocks whatever they call their text (text,
+    input_text, output_text), as pi's text blocks."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    blocks = content if isinstance(content, list) else []
+    return [
+        {"type": "text", "text": b["text"]}
+        for b in blocks
+        if isinstance(b, dict) and isinstance(b.get("text"), str)
+    ]
+
+
+def tool_name(name: object) -> str:
+    n = str(name or "").lower()
+    return "bash" if n in SHELLS else n
+
+
+# User records claude writes itself for a local slash command.
+CLAUDE_INJECTED = (
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+)
+# Attachments whose text is instructions, not talk: like pi's system prompt.
+CLAUDE_SYSTEM = frozenset(
+    {
+        "instructions",
+        "skill_listing",
+        "prompt_snapshot",
+        "session_context",
+        "environment",
+        "hook_additional_context",
+    }
+)
+
+
+def claude_entries(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """One claude record in pi's shape. An assistant entry carries its
+    message.id as "id", for merging, and each tool call the time of its own
+    line."""
+    kind, ts, msg = entry.get("type"), entry.get("timestamp"), entry.get("message")
+    if kind not in ("user", "assistant") or not isinstance(msg, dict):
+        return []
+    content = msg.get("content")
+    if kind == "assistant":
+        blocks: list[dict[str, Any]] = []
+        for b in content if isinstance(content, list) else texts(content):
+            block = b.get("type") if isinstance(b, dict) else None
+            if block == "text" and isinstance(b.get("text"), str):
+                blocks.append({"type": "text", "text": b["text"]})
+            elif block == "thinking":
+                blocks.append({"type": "thinking", "thinking": str(b.get("thinking") or "")})
+            elif block == "tool_use":
+                name = tool_name(b.get("name"))
+                call = {"type": "toolCall", "id": b.get("id"), "name": name}
+                blocks.append({**call, "arguments": b.get("input"), "timestamp": ts})
+        model = {"model": msg["model"]} if isinstance(msg.get("model"), str) else {}
+        return [{**message(ts, "assistant", blocks, **model), "id": msg.get("id")}]
+    # A compaction's summary and a local slash command's lines are no message,
+    # as pi's compaction entry is not and pi records no slash command.
+    if (
+        entry.get("isCompactSummary")
+        or entry.get("isVisibleInTranscriptOnly")
+        or (isinstance(content, str) and content.startswith(CLAUDE_INJECTED))
+    ):
+        return []
+    # claude's own additions to a turn (command caveats, skill text) are
+    # isMeta, like pi's recorded system prompt.
+    if entry.get("isMeta"):
+        return [message(ts, "system", texts(content))]
+    said = texts(content) if isinstance(content, str) else []
+    results = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_result":
+            results.append(b)
+        elif isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+            said.append({"type": "text", "text": b["text"]})
+    out = [message(ts, "user", said)] if said else []
+    recorded = entry.get("toolUseResult")
+    ms = recorded.get("durationMs") if isinstance(recorded, dict) and len(results) == 1 else None
+    for b in results:
+        extra: dict[str, Any] = {
+            "toolCallId": b.get("tool_use_id"),
+            "isError": b.get("is_error") is True,
+        }
+        if isinstance(ms, (int, float)) and not isinstance(ms, bool):
+            extra["durationMs"] = ms
+        out.append(message(ts, "toolResult", texts(b.get("content")), **extra))
+    return out
+
+
+def merged_into(content: list[dict[str, Any]], block: dict[str, Any]) -> bool:
+    """Whether a reply's content holds a block already: a call by its id, as
+    a repeat of it carries its own line's time."""
+    if block.get("type") != "toolCall":
+        return block in content
+    return any(b.get("type") == "toolCall" and b.get("id") == block.get("id") for b in content)
+
+
+def claude_stream(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A claude session in pi's shape. The lines of one reply share a
+    message.id, and a parallel call's result can come between them. pi stamps
+    a reply when it ends, so a merged reply takes its last line's time, up to
+    the first tool result that lands among its lines."""
+    out: list[dict[str, Any]] = []
+    replies: dict[str, dict[str, Any]] = {}
+    live: set[str] = set()  # replies no tool result has followed yet
+    cwd = None
+    for record in records:
+        if cwd is None and isinstance(record.get("cwd"), str):
+            cwd = record["cwd"]
+            out.insert(0, {"type": "session", "cwd": cwd, "timestamp": record.get("timestamp")})
+        for entry in claude_entries(record):
+            key = entry.pop("id", None)
+            if entry["message"]["role"] == "toolResult":
+                live.clear()
+            reply = replies.get(key) if isinstance(key, str) else None
+            if reply is None:
+                if isinstance(key, str):
+                    replies[key] = entry
+                    live.add(key)
+                out.append(entry)
+                continue
+            content = reply["message"]["content"]
+            for block in entry["message"]["content"]:
+                if not merged_into(content, block):
+                    content.append(block)
+            if key in live and entry.get("timestamp") is not None:
+                reply["timestamp"] = entry["timestamp"]
+    return out
+
+
+# Records whose text is instructions, not talk: like pi's system prompt.
+CODEX_SYSTEM = frozenset({"session_meta", "turn_context", "world_state"})
+# User messages codex writes itself, ahead of or between turns.
+CODEX_INJECTED = (
+    "<environment_context>",
+    "<user_instructions>",
+    "<permissions instructions>",
+    "<INSTRUCTIONS>",
+    "<turn_aborted>",
+    "# AGENTS.md instructions for ",
+)
+CODEX_CALLS = frozenset(
+    {"function_call", "custom_tool_call", "local_shell_call", "web_search_call"}
+)
+CODEX_OUTPUTS = frozenset({"function_call_output", "custom_tool_call_output"})
+CODEX_ITEMS = CODEX_CALLS | CODEX_OUTPUTS | {"message", "reasoning"}
+WALL = re.compile(r"^Wall time:? ([\d.]+) seconds", re.MULTILINE)
+EXIT = re.compile(r"^(?:Process exited with code|Exit code:) (-?\d+)", re.MULTILINE)
+RUNNING = re.compile(r"^Process running with session ID", re.MULTILINE)
+
+
+def codex_item(entry: dict[str, Any]) -> dict[str, Any] | None:
+    if entry.get("type") == "response_item":
+        payload = entry.get("payload")
+        return payload if isinstance(payload, dict) else None
+    # The first rollouts wrote response items bare, one per line.
+    return entry if entry.get("type") in CODEX_ITEMS and "payload" not in entry else None
+
+
+def shell_words(argv: list[Any]) -> str:
+    words = [str(w) for w in argv]
+    if len(words) == 3 and words[1] in ("-c", "-lc"):
+        return words[2]
+    return shlex.join(words)
+
+
+def codex_call(item: dict[str, Any]) -> dict[str, Any]:
+    kind = item.get("type")
+    if kind == "local_shell_call":
+        action = item.get("action")
+        args: Any = {"command": action.get("command")} if isinstance(action, dict) else {}
+    elif isinstance(item.get("arguments"), str):
+        try:
+            args = json.loads(item["arguments"])
+        except ValueError:
+            args = {"input": item["arguments"]}
+    elif "arguments" in item:
+        args = item["arguments"]
+    else:
+        args = {"input": item["input"]} if "input" in item else {}
+    args = args if isinstance(args, dict) else {"input": args}
+    command = args.get("command", args.get("cmd"))
+    if isinstance(command, list):
+        command = shell_words(command)
+    if isinstance(command, str):
+        args = {**args, "command": command}
+    name = item.get("name") or {"local_shell_call": "shell", "web_search_call": "web_search"}.get(
+        str(kind), kind
+    )
+    cid = item.get("call_id") or item.get("id")
+    return {"type": "toolCall", "id": cid, "name": tool_name(name), "arguments": args}
+
+
+def codex_output(output: object) -> tuple[str, float | None, bool]:
+    """A codex tool output's text, measured milliseconds and error flag. The
+    output is a string or a list of text items, which start with lines like
+    "Wall time: 0.5 seconds" and "Process exited with code 1", or "Process
+    running with session ID 3" for a command left running; older rollouts
+    wrap it in JSON with metadata.duration_seconds and metadata.exit_code."""
+    body = output if isinstance(output, str) else "".join(b["text"] for b in texts(output))
+    secs: object = None
+    code: object = None
+    if body.startswith("{"):
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and isinstance(doc.get("metadata"), dict):
+            secs = doc["metadata"].get("duration_seconds")
+            code = doc["metadata"].get("exit_code")
+            body = str(doc.get("output", ""))
+    head = body.split("\nOutput:", 1)[0]
+    if code is None and (m := EXIT.search(head)):
+        code = int(m[1])
+    # A command still running when codex stopped waiting: its wall time is the
+    # wait, not the command's, so only exec_command_end can say how long it ran.
+    running = code is None and RUNNING.search(head) is not None
+    if secs is None and not running and (m := WALL.search(head)):
+        secs = float(m[1])
+    ms = None
+    if isinstance(secs, (int, float)) and not isinstance(secs, bool):
+        ms = float(secs) * 1000
+    return body, ms, isinstance(code, int) and code != 0
+
+
+def codex_entries(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """One codex record in pi's shape, plus two kinds codex_stream folds in:
+    "model" from turn_context and "end", a call's outcome from
+    exec_command_end. The other event_msg records repeat response items."""
+    ts, kind = entry.get("timestamp"), entry.get("type")
+    payload = entry.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    if kind == "session_meta":
+        cwd = payload.get("cwd")
+        return [{"type": "session", "cwd": cwd, "timestamp": ts}] if isinstance(cwd, str) else []
+    if kind == "turn_context":
+        model = payload.get("model")
+        return [{"type": "model", "model": model}] if isinstance(model, str) else []
+    if kind == "event_msg":
+        if payload.get("type") != "exec_command_end":
+            return []
+        took, code = payload.get("duration"), payload.get("exit_code")
+        if isinstance(took, dict):
+            took = (took.get("secs") or 0) + (took.get("nanos") or 0) / 1e9
+        ms = took * 1000 if isinstance(took, (int, float)) and not isinstance(took, bool) else None
+        error = isinstance(code, int) and code != 0
+        return [
+            {"type": "end", "call_id": payload.get("call_id"), "durationMs": ms, "isError": error}
+        ]
+    item = codex_item(entry)
+    if item is None:
+        return []
+    what = item.get("type")
+    if what == "message":
+        role, said = item.get("role"), texts(item.get("content"))
+        if role == "assistant":
+            return [message(ts, "assistant", said)]
+        injected = " ".join(b["text"] for b in said).lstrip().startswith(CODEX_INJECTED)
+        return [message(ts, "user" if role == "user" and not injected else "system", said)]
+    if what == "reasoning":
+        summary = [b["text"] for b in texts(item.get("summary"))]
+        return [message(ts, "assistant", [{"type": "thinking", "thinking": "\n".join(summary)}])]
+    if what in CODEX_CALLS:
+        return [message(ts, "assistant", [{**codex_call(item), "timestamp": ts}])]
+    if what in CODEX_OUTPUTS:
+        body, ms, error = codex_output(item.get("output"))
+        extra: dict[str, Any] = {"toolCallId": item.get("call_id"), "isError": error}
+        if ms is not None:
+            extra["durationMs"] = ms
+        return [message(ts, "toolResult", [{"type": "text", "text": body}], **extra)]
+    return []
+
+
+def codex_stream(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A codex session in pi's shape. The items between two user messages or
+    tool outputs are one assistant message, as pi records a reply, stamped
+    with its last item's time, as pi stamps a reply when it ends. A call or
+    output whose call_id was seen already is dropped, and exec_command_end
+    adds its duration and exit code to its call's output."""
+    out: list[dict[str, Any]] = []
+    reply: dict[str, Any] | None = None
+    calls: set[str] = set()
+    results: dict[str, dict[str, Any]] = {}
+    ends: dict[str, dict[str, Any]] = {}
+    model = None
+    for record in records:
+        for entry in codex_entries(record):
+            kind = entry["type"]
+            if kind == "model":
+                model = entry["model"]
+            elif kind == "end":
+                ends[str(entry["call_id"])] = entry
+            elif kind == "session":
+                if not out or out[0].get("type") != "session":
+                    out.insert(0, entry)
+            elif entry["message"]["role"] == "assistant":
+                fresh = []
+                for block in entry["message"]["content"]:
+                    cid = block.get("id") if block.get("type") == "toolCall" else None
+                    if cid is not None:
+                        if str(cid) in calls:
+                            continue
+                        calls.add(str(cid))
+                    fresh.append(block)
+                if not fresh:
+                    continue
+                if reply is not None:
+                    reply["message"]["content"].extend(fresh)
+                    if entry.get("timestamp") is not None:
+                        reply["timestamp"] = entry["timestamp"]
+                    continue
+                entry["message"]["content"] = fresh
+                if model:
+                    entry["message"]["model"] = model
+                reply = entry
+                out.append(entry)
+            else:
+                cid = str(entry["message"].get("toolCallId"))
+                if entry["message"]["role"] == "toolResult":
+                    if cid in results:
+                        continue
+                    results[cid] = entry["message"]
+                reply = None
+                out.append(entry)
+    for cid, end in ends.items():
+        result = results.get(cid)
+        if result is None:
+            continue
+        if "durationMs" not in result and end["durationMs"] is not None:
+            result["durationMs"] = end["durationMs"]
+        result["isError"] = result["isError"] or end["isError"]
+    return out
+
+
+def record(s: Session) -> dict[str, Any]:
+    """The meta record `museum hook` wrote when the session started, if any:
+    mu's agent and workstream, and the cwd's repo, as pi's museum entry."""
+    for sid in s.session_ids():
+        try:
+            doc = json.loads(Path(s.host, s.harness, "meta", f"{sid}.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict):
+            return doc
+    return {}
+
+
+def stream(s: Session) -> Iterator[dict[str, Any]]:
+    """A session's entries in pi's shape, merged. pi's are read as they are,
+    one at a time; the others are merged in memory."""
+    path = Path(s.path)
+    if s.harness == "pi":
+        yield from entries(path)
+        return
+    merged = (claude_stream if s.harness == "claude" else codex_stream)(entries(path))
+    meta = record(s)
+    if meta:
+        at = 1 if merged and merged[0].get("type") == "session" else 0
+        merged.insert(at, {"type": "custom", "customType": "museum", "data": meta})
+    yield from merged
+
+
+# Records that repeat another: codex's events repeat its response items,
+# claude's queue and last prompt repeat a user message.
+ECHOES = frozenset(
+    {("codex", "event_msg"), ("claude", "queue-operation"), ("claude", "last-prompt")}
+)
+
+
+def normalised(harness: str, entry: dict[str, Any]) -> list[dict[str, Any]]:
+    return (claude_entries if harness == "claude" else codex_entries)(entry)
+
+
+def classify(harness: str, entry: object, term: str) -> tuple[int, str | None] | None:
+    """tier() and said() for a claude or codex line that mentions TERM, on its
+    normalised text, with the turn it belongs to: the message.id when there is
+    one, "" for another turn, None when it is no turn. None for a line that
+    only repeats another (ECHOES). claude's instruction
+    attachments (CLAUDE_SYSTEM) are SYSTEM, as codex's CODEX_SYSTEM are."""
+    if not isinstance(entry, dict):
+        return TOOL, None  # a torn line
+    kind = entry.get("type")
+    if (harness, kind) in ECHOES:
+        return None
+    got = normalised(harness, entry)
+    talk = [
+        e
+        for e in got
+        if e.get("type") == "message" and e["message"]["role"] in ("user", "assistant")
+    ]
+    turn = str(talk[0].get("id") or "") if talk else None
+    if any(term.lower() in (text(e) or "").lower() for e in talk):
+        return CONVERSATION, turn
+    roles = {e["message"]["role"] if e.get("type") == "message" else "" for e in got}
+    attached = entry.get("attachment") if kind == "attachment" else None
+    instructions = harness == "claude" and isinstance(attached, dict)
+    instructions = instructions and attached.get("type") in CLAUDE_SYSTEM
+    if (harness == "codex" and kind in CODEX_SYSTEM) or instructions or roles == {"system"}:
+        return SYSTEM, None
+    return TOOL, turn
+
+
 def squash(s: str) -> str:
     return " ".join(s.split())
 
@@ -176,13 +767,13 @@ def snippet(s: str, term: str) -> str | None:
     return s[max(0, i - SNIPPET) : i + len(term) + SNIPPET]
 
 
-def rg(args: list[str], dirs: list[str]) -> list[str]:
-    """rg's output lines over the store's pi session files: <host>/<folder>/
-    <file> from the store, <file> from a PROJECT dir. The depth keeps out the
-    other harnesses' deeper folders."""
-    depth = "3" if dirs == ["."] else "1"
+def rg(args: list[str], dirs: list[str], deep: bool = False) -> list[str]:
+    """rg's output lines over the store's session files: <host>/... from the
+    store, <dir>/<file> from a PROJECT dir. Unless deep, only pi's: the depth
+    keeps out the other harnesses' deeper folders."""
+    depth = [] if deep else ["--max-depth", "3" if dirs == ["."] else "1"]
     out = subprocess.run(
-        ["rg", "-i", "-g", "*.jsonl", "--max-depth", depth, *args, "--", *dirs],
+        ["rg", "-i", "-g", "*.jsonl", *depth, *args, "--", *dirs],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -217,56 +808,90 @@ def counts(lines: list[str]) -> dict[str, int]:
     return out
 
 
-def matching_files(dirs: list[str], term: str) -> dict[str, Match]:
+def matching_files(sessions: dict[str, Session], dirs: list[str], term: str) -> dict[str, Match]:
     """Store-relative paths of the sessions that mention TERM outside the
     system prompt, each with its best tier and weight."""
     if not shutil.which("rg"):
         found = {}
-        for d in dirs:
-            # The store is <host>/<folder>/<session>.jsonl; a PROJECT dir is <host>/<folder>.
-            for path in Path(d).glob("*/*/*.jsonl" if d == "." else "*.jsonl"):
-                m = scan(path, term)
-                if m is not None:
-                    found[str(path)] = m
+        for path, s in sessions.items():
+            m = scan(Path(path), term, s.harness)
+            if m is not None:
+                found[path] = m
         return found
-    # Three rg passes, about 0.5s each on a 1.3GB store, and no file read in
+    # Three rg passes, about 0.5s each on a 1.3GB store, and no pi file read in
     # Python: reading every mention takes about 6s. rg's regex syntax rejects
     # some of re.escape's escapes (a space), so escape only what both treat as
     # special.
     raw = needle(term)
     lit = re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", raw)
+    mentions = {
+        p: n for p, n in counts(rg(["-c", "-F", raw], dirs, deep=True)).items() if p in sessions
+    }
+    # The other harnesses' serialisations differ from pi's, and from each
+    # other's: their candidate files are classified in Python, on normalised
+    # text.
+    found = {}
+    for path in mentions:
+        s = sessions[path]
+        if s.harness != "pi" and (m := scan(Path(path), term, s.harness)) is not None:
+            found[path] = m
+    pi_dirs = ["."] if dirs == ["."] else [d for d in dirs if sessions_in(sessions, d) == "pi"]
+    if not pi_dirs:
+        return found
     # A session whose every mention sits in the recorded system prompt is not
     # a mention: comparing the two counts says so.
-    mentions = counts(rg(["-c", "-F", raw], dirs))
-    system = counts(rg(["-c", "-e", rf'"message":\{{"role":"system".*{lit}'], dirs))
-    found = {p: Match(TOOL, 0) for p, n in mentions.items() if system.get(p, 0) < n}
+    system = counts(rg(["-c", "-e", rf'"message":\{{"role":"system".*{lit}'], pi_dirs))
+    for p, n in mentions.items():
+        if sessions[p].harness == "pi" and system.get(p, 0) < n:
+            found[p] = Match(TOOL, 0)
     # Lines that may be a turn saying TERM. The regex cannot tell a turn's text
     # from its thinking or tool calls, so Python confirms until one passes.
     turn = rf'"message":\{{"role":"(user|assistant)".*{lit}'
-    for hit in rg(["--with-filename", "-e", turn], dirs):
+    for hit in rg(["--with-filename", "-e", turn], pi_dirs):
         path, _, line = hit.partition(":")
-        m = found.get(path.removeprefix("./"))
-        if m is None:
+        path = path.removeprefix("./")
+        m = found.get(path)
+        if m is None or sessions[path].harness != "pi":
             continue
         said_it = m.tier == CONVERSATION or said(line, term)
-        found[path.removeprefix("./")] = Match(CONVERSATION if said_it else TOOL, m.turns + 1)
+        found[path] = Match(CONVERSATION if said_it else TOOL, m.turns + 1)
     return found
 
 
-def scan(path: Path, term: str) -> Match | None:
+def sessions_in(sessions: dict[str, Session], folder: str) -> str:
+    """The harness whose sessions a PROJECT dir holds."""
+    return next((s.harness for s in sessions.values() if s.dir() == folder), "")
+
+
+def scan(path: Path, term: str, harness: str = "pi") -> Match | None:
     """matching_files for one session, without rg."""
-    raw, best, turns = needle(term), SYSTEM + 1, 0
+    raw, best, turns, keys = needle(term), SYSTEM + 1, 0, set()
     with path.open(encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for n, line in enumerate(f):
             if raw not in line.lower():
                 continue
-            t = tier(line)
-            if t == CONVERSATION:
-                turns += 1
-                if best != CONVERSATION and not said(line, term):
-                    t = TOOL
+            if harness != "pi":
+                got = classify(harness, loads(line), term)
+                if got is None:
+                    continue
+                t, key = got
+                if key is not None:
+                    keys.add(key or f"#{n}")
+            else:
+                t = tier(line)
+                if t == CONVERSATION:
+                    turns += 1
+                    if best != CONVERSATION and not said(line, term):
+                        t = TOOL
             best = min(best, t)
-    return Match(best, turns) if best < SYSTEM else None
+    return Match(best, turns + len(keys)) if best < SYSTEM else None
+
+
+def loads(line: str) -> object:
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
 
 
 class Summary(NamedTuple):
@@ -277,7 +902,10 @@ class Summary(NamedTuple):
     match: str  # the first mention in conversation text, else in any entry
 
 
-def summarize(path: Path, term: str) -> Summary:
+def summarize(s: Session, term: str) -> Summary:
+    path = Path(s.path)
+    if s.harness != "pi":
+        return summarize_normalised(s, path, term)
     raw = needle(term)
     hits, tool, meta, first, match, fallback = 0, 0, {}, "", "", ""
     with path.open(encoding="utf-8", errors="replace") as f:
@@ -319,6 +947,47 @@ def summarize(path: Path, term: str) -> Summary:
     return Summary(hits, tool, meta, first, match or fallback)
 
 
+def summarize_normalised(s: Session, path: Path, term: str) -> Summary:
+    """summarize for claude and codex: the same counts, on normalised text,
+    with a turn's lines counted once, and the meta record for metadata. A line
+    of a claude reply that mentions TERM outside its text (its thinking, a
+    call) is a tool entry only if no line of that reply says TERM, as pi's
+    reply is one line."""
+    raw = needle(term)
+    hits: set[str] = set()
+    others: set[str] = set()  # replies that mention TERM outside their text
+    tool, first, match, fallback = 0, "", "", ""
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for n, line in enumerate(f):
+            mentions = raw in line.lower()
+            if not (mentions or (not first and '"user"' in line)):
+                continue
+            entry = loads(line)
+            got = classify(s.harness, entry, term) if mentions else None
+            if not isinstance(entry, dict):
+                tool += 0 if got is None else 1
+                continue
+            turns = [e for e in normalised(s.harness, entry) if text(e) is not None]
+            if not first:
+                first = next(
+                    (squash(text(e) or "")[:160] for e in turns if e["message"]["role"] == "user"),
+                    "",
+                )
+            if got is None or got[0] == SYSTEM:
+                continue
+            if got[0] == CONVERSATION:
+                hits.add(got[1] or f"#{n}")
+                bodies = (squash(text(e) or "") for e in turns)
+                match = match or next((m for b in bodies if (m := snippet(b, term))), "")
+            else:
+                if got[1]:
+                    others.add(got[1])
+                else:
+                    tool += 1
+                fallback = fallback or snippet(squash(" ".join(strings(entry))), term) or ""
+    return Summary(len(hits), tool + len(others - hits), record(s), first, match or fallback)
+
+
 def strings(value: object) -> Iterator[str]:
     """Every string inside a JSON value, unescaped: tool output as text."""
     if isinstance(value, str):
@@ -332,21 +1001,21 @@ def strings(value: object) -> Iterator[str]:
 
 
 def find(term: str, project: str | None, limit: int, skip: str, newest: bool) -> int:
+    sessions = {s.path: s for s in discover()}
     if project:
-        dirs = sorted(
-            str(p)
-            for p in Path().glob(f"*/*{project}*")
-            if p.is_dir() and p.name not in HARNESS_FOLDERS
-        )
+        sessions = {
+            p: s for p, s in sessions.items() if s.folder and fnmatch(s.folder, f"*{project}*")
+        }
+        dirs = sorted({s.dir() for s in sessions.values()})
         if not dirs:
             return fail(f"no store folder matches *{project}*")
     else:
         dirs = ["."]
-    found = matching_files(dirs, term)
-    matches = {s: m for p, m in found.items() if (s := Session.of(p)).id() != skip}
+    found = matching_files(sessions, dirs, term)
+    matches = {s: m for p, m in found.items() if (s := sessions[p]).id() != skip}
 
-    def key(s: Session) -> tuple[bool, int, str]:
-        return (s.project(), 0 if newest else matches[s].turns, s.name)
+    def key(s: Session) -> tuple[bool, int, str, str]:
+        return (s.project(), 0 if newest else matches[s].turns, dates().started(s), s.name)
 
     talk = [s for s, m in matches.items() if m.tier == CONVERSATION]
     tools = [s for s, m in matches.items() if m.tier == TOOL]
@@ -362,10 +1031,12 @@ def find(term: str, project: str | None, limit: int, skip: str, newest: bool) ->
         f"{order} first."
     )
     for s in shown:
-        sm = summarize(Path(s.path), term)
+        sm = summarize(s, term)
         where = "@".join(str(sm.meta[k]) for k in ("project", "branch") if sm.meta.get(k))
+        where = where or label(s.folder)
         tally = f"{sm.hits} turns, {sm.tool} tool entries"
-        print(f"\n{s.started()}  {s.host}  {where or label(s.folder)}  ({tally})")
+        host = s.host if s.harness == "pi" else f"{s.host}  {s.harness}"
+        print(f"\n{started_label(s)}  {host}  {where}  ({tally})")
         print(f"  file:  {s.path}\n  first: {sm.first}\n  match: {sm.match}")
     return 0
 
@@ -384,8 +1055,10 @@ def show(file: str, term: str | None, users: bool) -> int:
     path = Path(file)
     if not path.is_file():
         return fail(f"no such session in the store: {file}")
+    # A path that is no session by its depth is read as pi's, as before.
+    s = Session.parse(file.removeprefix("./")) or Session(file, "", "", path.name)
     turns = []
-    for entry in entries(path):
+    for entry in stream(s):
         if entry.get("type") == "session":
             print(f"cwd: {entry.get('cwd', '')}")
         elif entry.get("customType") == "museum":
@@ -535,6 +1208,7 @@ class Timeline(NamedTuple):
     # or "wait" (ends at anything else: the user, a follow-up, a nudge).
     spans: list[tuple[str, str, float]]
     calls: int  # every tool call, filtered or not
+    messages: int  # user and assistant messages, merged
 
 
 class Filters(NamedTuple):
@@ -612,7 +1286,8 @@ def iso(t: datetime) -> str:
 
 def command_of(name: str, args: object) -> str:
     if isinstance(args, dict):
-        for key in ("command", "code", "path"):
+        # pi's keys first; then claude's file tools' and codex's custom tools'.
+        for key in ("command", "code", "path", "file_path", "input"):
             if isinstance(args.get(key), str):
                 return args[key]
     return json.dumps(args, ensure_ascii=False)
@@ -634,27 +1309,27 @@ def head_meta(path: Path) -> dict[str, Any]:
     return {}
 
 
-def session_files(project: str | None, since: str | None, until: str | None) -> list[Path]:
-    """The sessions to scan: started in [since, until] (by file name), in a
-    folder matching PROJECT or with a museum entry whose project or
-    workstream does."""
+def session_files(project: str | None, since: str | None, until: str | None) -> list[Session]:
+    """The sessions to scan: started in [since, until] (by a pi file's name,
+    else its first record), in a folder matching PROJECT or with a museum
+    entry or meta record whose project or workstream does."""
     out = []
-    for path in sorted(Path().glob("*/*/*.jsonl")):
-        started = Session.of(str(path)).name[:19]  # 2026-10-21T12-14-38
-        day_time = started[:10] + started[10:].replace("-", ":")
-        if since and day_time < since:
-            continue
-        if until and day_time[: len(until)] > until:
-            continue
-        if project and project not in path.parent.name:
-            meta = head_meta(path)
+    for s in discover():
+        if since or until:
+            day_time = dates().started(s)  # 2026-10-21T12:14:38
+            if since and day_time < since:
+                continue
+            if until and day_time[: len(until)] > until:
+                continue
+        if project and project not in s.folder:
+            meta = head_meta(Path(s.path)) if s.harness == "pi" else record(s)
             if not any(project in str(meta.get(k) or "") for k in ("project", "workstream")):
                 continue
-        out.append(path)
+        out.append(s)
     return out
 
 
-def timeline(path: Path, index: int, flt: Filters) -> tuple[Timeline, list[Call]] | None:
+def timeline(s: Session, index: int, flt: Filters) -> tuple[Timeline, list[Call]] | None:
     """One session's time split and its tool calls that pass the filters;
     None when the session's role, agent or workstream does not."""
     meta: dict[str, Any] = {}
@@ -663,8 +1338,8 @@ def timeline(path: Path, index: int, flt: Filters) -> tuple[Timeline, list[Call]
     spans: list[tuple[str, str, float]] = []
     asked: dict[str, tuple[datetime, str, str]] = {}
     calls: list[Call] = []
-    ncalls = 0
-    for entry in entries(path):
+    ncalls = nmessages = 0
+    for entry in stream(s):
         if entry.get("customType") == "museum" and not meta:
             meta = entry.get("data") or {}
             if not flt.session(
@@ -679,6 +1354,7 @@ def timeline(path: Path, index: int, flt: Filters) -> tuple[Timeline, list[Call]
             continue
         started = started or t
         role = message.get("role")
+        nmessages += role in ("user", "assistant")
         if prev is not None and role != "system":
             kind = {"assistant": "model", "toolResult": "tool"}.get(role, "wait")
             spans.append((iso(prev), kind, max(0.0, (t - prev).total_seconds())))
@@ -693,7 +1369,8 @@ def timeline(path: Path, index: int, flt: Filters) -> tuple[Timeline, list[Call]
                     name = str(c.get("name") or "")
                     cmd = command_of(name, c.get("arguments"))
                     if flt.command(name, cmd):
-                        asked[str(c.get("id"))] = (t, name, cmd)
+                        # A merged reply's call carries its own line's time.
+                        asked[str(c.get("id"))] = (stamp(c) or t, name, cmd)
         elif role == "toolResult":
             call = asked.pop(str(message.get("toolCallId")), None)
             if call is None:
@@ -712,7 +1389,7 @@ def timeline(path: Path, index: int, flt: Filters) -> tuple[Timeline, list[Call]
     if not meta and not flt.session("other", "", ""):
         return None
     agent, ws = str(meta.get("agent") or ""), str(meta.get("workstream") or "")
-    tl = Timeline(str(path), iso(started), role_of(meta), agent, ws, first, spans, ncalls)
+    tl = Timeline(s.path, iso(started), role_of(meta), agent, ws, first, spans, ncalls, nmessages)
     return tl, calls
 
 
@@ -735,8 +1412,8 @@ def scan_all(ns: argparse.Namespace) -> tuple[list[Timeline], list[Call]]:
     )
     sessions: list[Timeline] = []
     calls: list[Call] = []
-    for path in session_files(ns.project, ns.since, ns.until):
-        got = timeline(path, len(sessions), flt)
+    for s in session_files(ns.project, ns.since, ns.until):
+        got = timeline(s, len(sessions), flt)
         if got:
             sessions.append(got[0])
             calls.extend(got[1])
@@ -833,10 +1510,21 @@ def stats(ns: argparse.Namespace) -> int:
         r = by_role.setdefault(
             s.role,
             dict.fromkeys(
-                ("sessions", "calls", "model", "tool", "wait", "matched", "matched_secs"), 0.0
+                (
+                    "sessions",
+                    "messages",
+                    "calls",
+                    "model",
+                    "tool",
+                    "wait",
+                    "matched",
+                    "matched_secs",
+                ),
+                0.0,
             ),
         )
         r["sessions"] += 1
+        r["messages"] += s.messages
         r["calls"] += s.calls
         for _, kind, secs in s.spans:
             r[kind] += secs
@@ -905,6 +1593,7 @@ def stats(ns: argparse.Namespace) -> int:
         [
             "role",
             "sessions",
+            "messages",
             "calls",
             "model h",
             "tool h",
@@ -917,6 +1606,7 @@ def stats(ns: argparse.Namespace) -> int:
             [
                 k,
                 int(v["sessions"]),
+                int(v["messages"]),
                 int(v["calls"]),
                 v["model"] / hours,
                 v["tool"] / hours,
@@ -1252,13 +1942,14 @@ def scope(p: argparse.ArgumentParser) -> None:
 def forward(ns: argparse.Namespace) -> list[str]:
     """The subcommand again, as words for the store host. The limit goes as a
     flag, like the session to skip, because environment variables do not cross
-    ssh."""
+    ssh. The positionals go last, after --: a claude or codex project folder
+    starts with -, which argparse would read as options (-home is -h)."""
     if ns.cmd == "find":
-        words = ["find", ns.term, *([ns.project] if ns.project else [])]
-        words += ["--limit", str(ns.limit), "--skip", ns.skip]
-        return [*words, "--newest"] if ns.newest else words
+        words = ["find", "--limit", str(ns.limit), "--skip", ns.skip]
+        words += ["--newest"] if ns.newest else []
+        return [*words, "--", ns.term, *([ns.project] if ns.project else [])]
     if ns.cmd in ("stats", "calls"):
-        words = [ns.cmd, *([ns.project] if ns.project else [])]
+        words = [ns.cmd]
         for k in VALUE_OPTS:
             if getattr(ns, k) is not None:
                 words += ["--" + k.replace("_", "-"), str(getattr(ns, k))]
@@ -1266,11 +1957,13 @@ def forward(ns: argparse.Namespace) -> list[str]:
         words += {True: ["--background"], False: ["--foreground"], None: []}[ns.background]
         words += ["--json"] if ns.json else []
         if ns.cmd == "stats":
-            return [*words, "--by", ns.by, "--slow", str(ns.slow)]
-        words += ["--group-by", ns.group_by] if ns.group_by else []
-        return [*words, "--sort", ns.sort, "--limit", str(ns.limit)]
-    words = ["show", ns.file, *([ns.term] if ns.term else [])]
-    return [*words, "--users"] if ns.users else words
+            words += ["--by", ns.by, "--slow", str(ns.slow)]
+        else:
+            words += ["--group-by", ns.group_by] if ns.group_by else []
+            words += ["--sort", ns.sort, "--limit", str(ns.limit)]
+        return [*words, "--", *([ns.project] if ns.project else [])]
+    words = ["show", *(["--users"] if ns.users else [])]
+    return [*words, "--", ns.file, *([ns.term] if ns.term else [])]
 
 
 def main(argv: list[str]) -> int:
@@ -1291,12 +1984,16 @@ def main(argv: list[str]) -> int:
     except OSError:
         return fail(f"cannot enter store {store} (is store.host missing?)")
     if ns.cmd == "find":
-        return find(ns.term, ns.project, ns.limit, ns.skip, ns.newest)
-    if ns.cmd == "stats":
-        return stats(ns)
-    if ns.cmd == "calls":
-        return calls_cmd(ns)
-    return show(ns.file, ns.term, ns.users)
+        code = find(ns.term, ns.project, ns.limit, ns.skip, ns.newest)
+    elif ns.cmd == "stats":
+        code = stats(ns)
+    elif ns.cmd == "calls":
+        code = calls_cmd(ns)
+    else:
+        code = show(ns.file, ns.term, ns.users)
+    if DATES:
+        DATES[0].save()
+    return code
 
 
 if __name__ == "__main__":

@@ -207,21 +207,6 @@ class Store(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("no store folder matches", r.stderr)
 
-    def test_find_skips_other_harness_folders(self) -> None:
-        """museum-sync's claude and codex copies sit beside pi's folders; until
-        museum-search reads them, find returns what it did before."""
-        before = self.run_search("find", "stalwart").stdout
-        for rel in (
-            "pc/claude/-home-u-hacking-hail/s1.jsonl",
-            "pc/claude/-home-u-hacking-hail/s1/subagents/agent-a.jsonl",
-            "pc/codex/-home-u-hacking-hail/rollout-2026-11-05T10-00-00-c0de.jsonl",
-        ):
-            write_session(self.dir, rel, [msg("user", "stalwart again")])
-        self.assertEqual(self.run_search("find", "stalwart").stdout, before)
-        r = self.run_search("find", "stalwart", "claude")
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("no store folder matches", r.stderr)
-
     def test_show_window(self) -> None:
         r = self.run_search("show", f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl", "rust it")
         lines = r.stdout.splitlines()
@@ -333,11 +318,25 @@ class Units(unittest.TestCase):
 
     def test_forward_carries_the_limit(self) -> None:
         ns = search.parse(["find", "t", "--limit", "3", "--skip", "me"])
-        self.assertEqual(search.forward(ns), ["find", "t", "--limit", "3", "--skip", "me"])
-        self.assertEqual(search.forward(search.parse(["show", "f", "t"])), ["show", "f", "t"])
+        self.assertEqual(search.forward(ns), ["find", "--limit", "3", "--skip", "me", "--", "t"])
+        self.assertEqual(search.forward(search.parse(["show", "f", "t"])), ["show", "--", "f", "t"])
         ns = search.parse(["find", "t", "--newest", "--skip", ""])
-        self.assertEqual(search.forward(ns)[-1], "--newest")
-        self.assertEqual(search.forward(search.parse(["show", "f", "--users"]))[-1], "--users")
+        self.assertIn("--newest", search.forward(ns))
+        words = search.forward(search.parse(["show", "f", "--users"]))
+        self.assertEqual(words, ["show", "--users", "--", "f"])
+
+    def test_forward_puts_dashed_positionals_after_double_dash(self) -> None:
+        """claude's and codex's project folders start with -: -home reads as -h."""
+        for argv in (
+            ["find", "--", "-t", "-home-u-proj"],
+            ["stats", "--json", "--", "-home-u-proj"],
+            ["calls", "--group-by", "role", "--", "-home-u-proj"],
+            ["show", "--", "-f.jsonl", "-t"],
+        ):
+            with self.subTest(argv=argv):
+                ns = search.parse(argv)
+                again = search.parse(search.forward(ns))
+                self.assertEqual(vars(again), vars(ns))
 
     def test_remote_command_is_one_shell_command(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".toml") as conf:
@@ -356,14 +355,21 @@ class Units(unittest.TestCase):
                 env={**os.environ, "MUSEUM_CONFIG": conf.name},
                 check=True,
             )
-        # A POSIX shell parses it back to python3 -c SRC --store ... find it's.
+        # A POSIX shell parses it back to python3 -c SRC --store ... find ... -- it's.
         words = subprocess.run(
-            ["sh", "-c", 'eval "set -- $1"; printf "%s\\n" "$1" "$4" "$6" "$7"', "sh", r.stdout],
+            [
+                "sh",
+                "-c",
+                'eval "set -- $1"; a=$1; shift 3; printf "%s\\n" "$a" "$@"',
+                "sh",
+                r.stdout,
+            ],
             capture_output=True,
             text=True,
             check=True,
         ).stdout.splitlines()
-        self.assertEqual(words, ["python3", "--store", "find", "it's"])
+        self.assertEqual([words[0], words[1], words[3]], ["python3", "--store", "find"])
+        self.assertEqual(words[-2:], ["--", "it's"])
 
 
 if __name__ == "__main__":

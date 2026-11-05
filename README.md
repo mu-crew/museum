@@ -20,7 +20,7 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 - **Append-only:** the sync never passes `--delete`, so sessions you delete locally stay in the store.
 - **No collisions:** each machine writes only its own `<hostname>/` folder, so nothing in the store needs locking or merging.
 - **Compression is left to the filesystem:** session files are plain JSONL, and they compress to about a third of their size. Put the store on a filesystem that compresses, such as btrfs mounted with `compress-force=zstd:3`.
-- **No daemon, no index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly with `skills/museum/scripts/museum-search`, as the `museum` skill describes.
+- **No daemon, no search index:** sessions only change while pi runs, so pi triggers the sync, in the pane's own environment (ssh agent, PATH). Agents search the files directly with `skills/museum/scripts/museum-search`, as the `museum` skill describes. The one file a search writes is `.museum-index.json` at the store's root: the start dates it has read from sessions' first records, which never change.
 - **Repo metadata:** at session start the extension adds a `museum` custom entry to the session (not sent to the model) with the git repo, remote, branch, commit and mu workstream, so a session in a throwaway mu worktree still names its project.
 - **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock(2)`) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
 - **Failures show up in pi:** the footer says `museum: backup failing: <error>`, and says nothing while backups work. `museum-sync` writes the label into one `state.json` per node and every pi re-reads it every 5 seconds, so when one agent's sync fails or recovers, every agent's footer follows.
@@ -31,12 +31,12 @@ The same sync also backs up Claude Code's `~/.claude/projects/` (each session an
 
 ```
 <store>/<machine>/claude/<project folder>/<session id>.jsonl
-<store>/<machine>/claude/<project folder>/<session id>/subagents/<agent>.jsonl
+<store>/<machine>/claude/<project folder>/<session id>/subagents/[workflows/<run>/]agent-<id>.jsonl
 <store>/<machine>/codex/<project folder>/rollout-<timestamp>-<id>.jsonl
 <store>/<machine>/<harness>/meta/<session id>.json
 ```
 
-claude's project folder is its own (`-home-u-proj`). A codex rollout's date folders say nothing about the project, so its folder is the cwd from its first record, `session_meta`, spelled the same way. pi's layout does not move. `museum-search` does not read these folders yet, and skips them; `rg` on the store does. cursor-agent is not backed up: its chats are live SQLite databases, unsafe to copy and not greppable. Muse Code's session store is not known yet, so only its meta records are kept.
+claude's project folder is its own (`-home-u-proj`). A codex rollout's date folders say nothing about the project, so its folder is the cwd from its first record, `session_meta`, spelled the same way. pi's layout does not move. `museum-search` reads these folders too (see [Search](#search)). cursor-agent is not backed up: its chats are live SQLite databases, unsafe to copy and not greppable. Muse Code's session store is not known yet, so only its meta records are kept.
 
 - **A filtered copy.** claude transcripts carry `api-request`, `api-request-blob` and `api-request-shape` records (the last holds the whole system prompt), `file-history-snapshot` records and full tool output; codex carries `encrypted_content` and a full `replacement_history` and `guardian_history` at every compaction, enough for one session to reach hundreds of MB. museum keeps a filtered copy of each session under `~/.local/state/museum/stage/`, extended from a byte cursor (`stage.json`), and syncs that. The filter drops those records (every claude record type starting `api-request`) and fields, and cuts any tool result to 64 KB. A line still being written waits for the next sync. A file the filter fails on is skipped and named on stderr; the other files, and pi's sessions, still sync. A source that shrank is filtered again from scratch. Every source file is stat'ed on each sync, because a codex rollout can grow long after its date folder.
 - **Append-only here too:** claude deletes old transcripts after `cleanupPeriodDays`; the store keeps them.
@@ -116,8 +116,10 @@ as search. See `stats --help` and `calls --help` for shared filters.
 Model time is the gap before an assistant message, not provider latency
 alone. Tool wall time counts each gap before a tool result once. Model/tool
 wall spans are split across UTC window boundaries. `--since`/`--until` select
-session-start date cohorts by filename, not event-time slices; selected
-sessions can contribute to later windows.
+session-start date cohorts, not event-time slices; selected sessions can
+contribute to later windows. A session starts at the time in a pi file's name,
+else at its first record's timestamp (a codex rollout's name is in local time).
+`stats` also counts each role's user and assistant messages.
 
 Call rows include `duration_source`: `durationMs` for recorded measurements,
 `estimated` for call-to-result gaps (also marked in text output). Calls in one
@@ -145,6 +147,15 @@ $S show FILE stalwart     # that session's turns about TERM, with neighbours
 ```
 
 For an ssh store it runs on the store host in one ssh call. The `museum` skill tells agents how to use it.
+
+`find`, `show`, `stats` and `calls` read pi, Claude Code and Codex sessions alike. The script walks the whole store and tells the formats apart by depth: `<machine>/<folder>/<file>` is pi's, and so is `<machine>/<file>`, from before pi kept a folder per cwd; `<machine>/claude/...` and `<machine>/codex/...` are the others'. A `PROJECT` matches their project folders too. Muse Code's folder is skipped until its format is known; `rg` on the store still sees it.
+
+One normaliser per format maps each session to one stream of user and assistant messages, tool calls and results, timestamps and the model, and every command reads that stream:
+
+- **Counted after merging.** claude writes each content block of a reply as its own line, under one `message.id`, and a parallel call's result can land between them: those lines are one message. codex writes a reply as several items (reasoning, text, calls) and a call's outcome as records sharing its `call_id`: the items between two user messages or tool outputs are one message, and each `call_id` is one call. So the same conversation gives the same message and call counts in all three formats.
+- **Tool names** are lowercased (`Bash` is `bash`), and codex's shell tools (`exec_command`, `shell`) are `bash`, so `--tool bash --match` works across harnesses. codex records how long a command took (`Wall time`) and its exit code, which give `durationMs` and the error flag; claude's calls are estimated from the gap.
+- **`find` matches normalised text.** A user or assistant turn's text is conversation; claude's `isMeta` additions, codex's developer messages, the instructions codex adds as user messages (`<environment_context>`, `# AGENTS.md instructions`) and its `session_meta`, `turn_context` and `world_state` records count as the system prompt; codex's `event_msg` records and claude's queued prompts only repeat other lines, so they are skipped.
+- **Metadata** for claude and codex comes from the meta record `museum hook` wrote (`<machine>/<harness>/meta/<session id>.json`; a claude subagent uses its parent's), so `--role`, `--agent` and `--workstream` and the project shown by `find` work as for pi.
 
 ## Configuration
 
