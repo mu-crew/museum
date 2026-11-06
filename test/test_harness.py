@@ -462,6 +462,26 @@ class Hook(Harness):
         m = self.meta()
         self.assertEqual((m["agent"], m["workstream"], m["role"]), ("lead", "ws2", "orchestrator"))
 
+    def test_anchor_role_wins_over_its_orchestrator_flag(self) -> None:
+        self.anchor(agent_name="w1", cli="claude", role="worker", orchestrator=True)
+        self.start()
+        m = self.meta()
+        self.assertEqual((m["agent"], m["role"]), ("w1", "worker"))
+
+    def test_env_role(self) -> None:
+        cases = (
+            ({"MU_MANAGED_AGENT": "1"}, "worker"),
+            ({"MU_MANAGED_AGENT": "1", "MU_ORCHESTRATOR": "1"}, "orchestrator"),
+            ({"MU_MANAGED_AGENT": "1", "MU_ORCHESTRATOR": "0"}, "worker"),
+            ({}, None),
+            ({"MU_ORCHESTRATOR": "1"}, "orchestrator"),
+        )
+        for env, want in cases:
+            with self.subTest(env=env):
+                (self.state / "meta" / "claude" / f"{SID}.json").unlink(missing_ok=True)
+                self.start(MU_AGENT_NAME="a", **env)
+                self.assertEqual(self.meta().get("role"), want)
+
     def test_anchor_from_a_reused_pid_is_ignored(self) -> None:
         self.anchor(agent="lead", cli="claude", start_time=12345)
         self.start(MU_AGENT_NAME="worker-1")

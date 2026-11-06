@@ -741,19 +741,29 @@ def read_anchor(path: Path, pid: int) -> dict[str, Any] | None:
 
 
 def identity(harness: str, env: Mapping[str, str]) -> dict[str, str]:
-    """Agent, role and workstream exist only in mu's anchor or the agent's env."""
+    """Agent, role and workstream exist only in mu's anchor or the agent's env.
+    The anchor's role wins, then its orchestrator flag. In the env, as in mu,
+    a managed agent is a worker unless MU_ORCHESTRATOR is "1"."""
     anchor = find_anchor(harness)
     if anchor is not None:
         agent = pick(anchor, "agent", "agent_name", "name")
         workstream = pick(anchor, "workstream")
-        orchestrator = anchor.get("orchestrator") in (True, 1, "1", "true")
+        role = pick(anchor, "role")
+        if not isinstance(role, str):
+            orchestrator = anchor.get("orchestrator") in (True, 1, "1", "true")
+            role = "orchestrator" if orchestrator else ""
     else:
         agent, workstream = env.get("MU_AGENT_NAME"), env.get("MU_WORKSTREAM")
-        orchestrator = env.get("MU_ORCHESTRATOR") == "1"
+        if env.get("MU_ORCHESTRATOR") == "1":
+            role = "orchestrator"
+        elif env.get("MU_MANAGED_AGENT") == "1":
+            role = "worker"
+        else:
+            role = ""
     return {
         "agent": agent if isinstance(agent, str) else "",
         "workstream": workstream if isinstance(workstream, str) else "",
-        "role": "orchestrator" if orchestrator else "",
+        "role": role,
     }
 
 
