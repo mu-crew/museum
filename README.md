@@ -191,7 +191,7 @@ These environment variables are for tests and unusual layouts:
 | `MUSEUM_TIMER_KIND` | `launchd` on macOS, else `systemd` | Which timer `museum timer` installs |
 | `MUSEUM_SYNC` | `bin/museum-sync` beside the extension | Script the extension runs |
 
-The extension and the script read the environment of the pi process, so set these where pi starts. The timer and `#(museum tick)` read the environment of launchd, systemd or the tmux server; `museum timer install` copies `XDG_STATE_HOME` and `MUSEUM_STATE_DIR` into the timer when they are set, so its syncs share pi's state folder.
+The extension and the script read the environment of the pi process, so set these where pi starts. The timer and `#(museum tick)` read the environment of launchd, systemd or the tmux server; `museum timer install` copies `XDG_STATE_HOME` and `MUSEUM_STATE_DIR` into the timer when they are set, so its syncs share pi's state folder, and `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when they are set and not empty, so they back up the sessions claude and codex write. A status line's `#(museum tick)` gets none of these unless they are in tmux's global environment: if you move claude's or codex's folder, also run `tmux set-environment -g CLAUDE_CONFIG_DIR "$CLAUDE_CONFIG_DIR"` (likewise `CODEX_HOME`), or set them before the tmux server starts.
 
 ## Requirements
 

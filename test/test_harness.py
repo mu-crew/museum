@@ -652,7 +652,7 @@ FAKE_CTL = '#!/bin/sh\necho "$(basename "$0") $*" >> "$FAKE_LOG"\n[ "$1" != prin
 
 
 class Timer(Harness):
-    def run_timer(self, kind: str, action: str) -> list[str]:
+    def run_timer(self, kind: str, action: str, **extra: str) -> list[str]:
         bin_dir = self.dir / "ctl"
         bin_dir.mkdir(exist_ok=True)
         for name in ("launchctl", "systemctl"):
@@ -661,7 +661,7 @@ class Timer(Harness):
         log = self.dir / "ctl.log"
         log.unlink(missing_ok=True)
         path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
-        env = self.env(MUSEUM_TIMER_KIND=kind, FAKE_LOG=str(log), PATH=path)
+        env = self.env(MUSEUM_TIMER_KIND=kind, FAKE_LOG=str(log), PATH=path, **extra)
         env.pop("XDG_CONFIG_HOME", None)
         r = subprocess.run(
             ["sh", str(BIN / "museum"), "timer", action],
@@ -684,6 +684,10 @@ class Timer(Harness):
         self.assertTrue(job["AbandonProcessGroup"])
         self.assertIn("PATH", job["EnvironmentVariables"])
         self.assertEqual(job["EnvironmentVariables"]["MUSEUM_STATE_DIR"], str(self.state))
+        # The timer's syncs back up the claude and codex sessions this shell's
+        # harnesses write, not those under the default folders.
+        self.assertEqual(job["EnvironmentVariables"]["CLAUDE_CONFIG_DIR"], str(self.dir / "claude"))
+        self.assertEqual(job["EnvironmentVariables"]["CODEX_HOME"], str(self.dir / "codex"))
         self.assertEqual(calls[-1], f"launchctl bootstrap gui/{os.getuid()} {plist}")
         self.run_timer("launchd", "remove")
         self.assertFalse(plist.exists())
@@ -695,6 +699,8 @@ class Timer(Harness):
         self.assertIn(f'ExecStart="{(BIN / "museum").resolve()}" tick', service)
         self.assertIn("KillMode=process", service)
         self.assertIn(f'Environment="MUSEUM_STATE_DIR={self.state}"', service)
+        self.assertIn(f'Environment="CLAUDE_CONFIG_DIR={self.dir / "claude"}"', service)
+        self.assertIn(f'Environment="CODEX_HOME={self.dir / "codex"}"', service)
         self.assertIn("OnUnitActiveSec=300", (units / "museum-tick.timer").read_text())
         self.assertEqual(
             calls,
@@ -702,6 +708,20 @@ class Timer(Harness):
         )
         self.run_timer("systemd", "remove")
         self.assertFalse((units / "museum-tick.timer").exists())
+
+    def test_empty_harness_homes_are_not_forwarded(self) -> None:
+        """An empty CLAUDE_CONFIG_DIR or CODEX_HOME means the default folder to
+        museum-sync; the timer must not pin it as an empty value."""
+        self.run_timer("launchd", "install", CLAUDE_CONFIG_DIR="", CODEX_HOME="")
+        plist = self.home / "Library/LaunchAgents/museum.tick.plist"
+        with plist.open("rb") as f:
+            job_env = plistlib.load(f)["EnvironmentVariables"]
+        self.assertNotIn("CLAUDE_CONFIG_DIR", job_env)
+        self.assertNotIn("CODEX_HOME", job_env)
+        self.run_timer("systemd", "install", CLAUDE_CONFIG_DIR="", CODEX_HOME="")
+        service = (self.home / ".config/systemd/user/museum-tick.service").read_text()
+        self.assertNotIn("CLAUDE_CONFIG_DIR", service)
+        self.assertNotIn("CODEX_HOME", service)
 
 
 @unittest.skipUnless(RSYNC, "rsync 3 not installed")
