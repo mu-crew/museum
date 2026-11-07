@@ -2,7 +2,7 @@
 # museum: the one command that tmux, timers and harness hooks call.
 #
 #   museum tick            start a sync, detached, if one is due; prints nothing
-#   museum hook HARNESS    a harness hook (claude, codex, muse); payload on stdin
+#   museum hook HARNESS    a harness hook (claude, codex, cursor-agent, muse); payload on stdin
 #   museum sync [ARGS]     museum-sync, in the foreground (--now, --if-due)
 #   museum timer install   run `museum tick` every 5 minutes (launchd or systemd)
 #   museum timer remove    stop and remove that timer
@@ -111,9 +111,9 @@ systemd_dir() { printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"; 
 # The timer gets this shell's PATH: launchd's and systemd's own leave out the
 # Homebrew or user folders that hold python3 3.11+. It also gets this shell's
 # XDG_STATE_HOME and MUSEUM_STATE_DIR, when set, so its syncs share pi's state
-# folder: the lock, the cursors and state.json; and CLAUDE_CONFIG_DIR and
-# CODEX_HOME, when set and not empty, so they back up the sessions claude and
-# codex write.
+# folder: the lock, the cursors and state.json; and CLAUDE_CONFIG_DIR,
+# CODEX_HOME and CURSOR_HOME, when set and not empty, so they back up the
+# sessions those harnesses write.
 timer_env() {
   plist_env="$plist_env<key>$1</key><string>$(xml "$2")</string>"
   unit_env="$unit_env
@@ -127,6 +127,7 @@ timer_install() {
   [ -z "${MUSEUM_STATE_DIR+x}" ] || timer_env MUSEUM_STATE_DIR "$MUSEUM_STATE_DIR"
   [ -z "${CLAUDE_CONFIG_DIR:-}" ] || timer_env CLAUDE_CONFIG_DIR "$CLAUDE_CONFIG_DIR"
   [ -z "${CODEX_HOME:-}" ] || timer_env CODEX_HOME "$CODEX_HOME"
+  [ -z "${CURSOR_HOME:-}" ] || timer_env CURSOR_HOME "$CURSOR_HOME"
   case $(timer_kind) in
     launchd)
       plist=$(launchd_plist)

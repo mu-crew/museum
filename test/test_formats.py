@@ -585,6 +585,91 @@ class Units(unittest.TestCase):
             search.label("-home-u--local-state-mu-workspaces-hail-worker-1"), "mu:hail-worker-1"
         )
         self.assertEqual(search.label("-Users-u-hacking-hail"), "hacking-hail")
+        self.assertEqual(search.label("var-home-u-dotfiles"), "dotfiles")
+
+
+class CursorAgent(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.sid = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
+        self.path = f"pc/cursor-agent/var-home-u-proj/{self.sid}.jsonl"
+        write_session(
+            self.dir,
+            self.path,
+            [
+                {
+                    "role": "user",
+                    "message": {"content": [{"type": "text", "text": "Find the quokka decision"}]},
+                },
+                {
+                    "role": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Looking for quokka."},
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Shell",
+                                "input": {"command": "rg quokka"},
+                            },
+                        ]
+                    },
+                },
+                {"type": "turn_ended", "status": "success"},
+            ],
+        )
+        meta_path = self.dir / "pc" / "cursor-agent" / "meta" / f"{self.sid}.json"
+        meta_path.parent.mkdir(parents=True)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "harness": "cursor-agent",
+                    "session_id": self.sid,
+                    "project": "proj",
+                    "agent": "cursor-1",
+                    "workstream": "proj-ws",
+                }
+            )
+            + "\n"
+        )
+
+    def run_search(self, *args: str) -> str:
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "museum-search"), "--store", str(self.dir), *args],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, PI_SESSION_ID=""),
+            check=False,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_parse_and_session_ids(self) -> None:
+        s = search.Session.parse(self.path)
+        assert s is not None
+        self.assertEqual(s.harness, "cursor-agent")
+        self.assertEqual(s.session_ids(), [self.sid])
+        self.assertIsNone(search.Session.parse("pc/cursor-agent/meta/x.jsonl"))
+
+    def test_shell_tool_is_bash_and_find_reads_turns(self) -> None:
+        entry = {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Shell", "input": {"command": "ls"}}
+                ]
+            },
+        }
+        call = search.cursor_entries(entry)[0]["message"]["content"][0]
+        self.assertEqual(call["name"], "bash")
+        self.assertEqual(search.cursor_entries({"type": "turn_ended", "status": "success"}), [])
+        out = self.run_search("find", "quokka")
+        self.assertIn(self.path, out)
+        self.assertIn("pc  cursor-agent", out)
+        self.assertIn("first: Find the quokka decision", out)
+        rows = json.loads(self.run_search("calls", "--tool", "bash", "--json"))
+        self.assertEqual([(r["agent"], r["command"]) for r in rows], [("cursor-1", "rg quokka")])
 
 
 if __name__ == "__main__":

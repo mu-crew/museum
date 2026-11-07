@@ -38,11 +38,11 @@ folders whose name contains it. FILE is a path relative to the store, as `find`
 prints it. Put -- before a TERM, PROJECT or FILE that starts with -, as claude's
 and codex's project folders do: find -- TERM -home-u-proj.
 
-Every command reads pi, Claude Code and Codex sessions alike: each format has a
-normaliser to one stream of user and assistant messages, tool calls and tool
-results. Messages and calls are counted after merging, so claude's one line per
-content block counts as one message, and codex's records of one call as one
-call. Tool names are lowercased, and every harness's shell tool is `bash`.
+Every command reads pi, Claude Code, Codex and cursor-agent sessions alike: each
+format has a normaliser to one stream of user and assistant messages, tool calls
+and tool results. Messages and calls are counted after merging, so claude's one
+line per content block counts as one message, and codex's records of one call as
+one call. Tool names are lowercased, and every harness's shell tool is `bash`.
 
 `find` ranks sessions by where TERM appears. Sessions that mention it in a user
 or assistant turn come before those where only tool output does; sessions where
@@ -114,11 +114,12 @@ def tier(line: str) -> int:
 #   <host>/claude/<project>/<id>/subagents/workflows/<run>/agent-<x>.jsonl
 #                                                          and its workflows'
 #   <host>/codex/<project>/rollout-<time>-<id>.jsonl       codex
+#   <host>/cursor-agent/<project>/<id>.jsonl               cursor-agent
 #   <host>/<harness>/meta/<id>.json                        `museum hook`'s record
 #
 # muse's session format is not known yet: its folder stays out of every
 # command, and rg on the store still finds it.
-HARNESS_FOLDERS = frozenset({"claude", "codex", "muse"})
+HARNESS_FOLDERS = frozenset({"claude", "codex", "cursor-agent", "muse"})
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -148,7 +149,11 @@ class Session(NamedTuple):
             and parts[4] == "subagents"
             and parts[-1].startswith("agent-")
         )
-        if top in ("claude", "codex") and parts[2] != "meta" and (n == 4 or subagent):
+        if (
+            top in ("claude", "codex", "cursor-agent")
+            and parts[2] != "meta"
+            and (n == 4 or subagent)
+        ):
             return cls(path, parts[0], parts[2], parts[-1], top)
         return None
 
@@ -165,10 +170,10 @@ class Session(NamedTuple):
 
     def session_ids(self) -> list[str]:
         """The ids `museum hook` may have filed this session's record under:
-        a claude subagent's is its parent's, a codex rollout's is in its
-        session_meta record and its name."""
+        a claude subagent's is its parent's, a cursor-agent file's is its name,
+        a codex rollout's is in its session_meta record and its name."""
         parts = self.path.split("/")
-        if self.harness == "claude":
+        if self.harness in ("claude", "cursor-agent"):
             return [parts[3].removesuffix(".jsonl")]
         if self.harness != "codex":
             return []
@@ -271,7 +276,8 @@ def discover() -> list[Session]:
 
 
 def first_stamp(path: Path) -> str:
-    """The time of a session's first record that has one, as Dates keeps it."""
+    """The time of a session's first record that has one, as Dates keeps it.
+    cursor-agent transcripts often have no timestamps: fall back to mtime."""
     try:
         with path.open(encoding="utf-8", errors="replace") as f:
             for n, line in enumerate(f):
@@ -284,6 +290,10 @@ def first_stamp(path: Path) -> str:
                 t = stamp(entry) if isinstance(entry, dict) else None
                 if t is not None:
                     return iso(t)
+        if "cursor-agent" in path.parts:
+            return iso(
+                datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)  # noqa: UP017
+            )
     except OSError:
         pass
     return ""
@@ -627,6 +637,72 @@ def codex_entries(entry: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def cursor_entries(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """One cursor-agent transcript line in pi's shape. Role is top-level; tool
+    calls are tool_use blocks (Shell → bash via tool_name)."""
+    role, ts, msg = entry.get("role"), entry.get("timestamp"), entry.get("message")
+    if role not in ("user", "assistant") or not isinstance(msg, dict):
+        return []
+    content = msg.get("content")
+    if role == "assistant":
+        blocks: list[dict[str, Any]] = []
+        for b in content if isinstance(content, list) else texts(content):
+            block = b.get("type") if isinstance(b, dict) else None
+            if block == "text" and isinstance(b.get("text"), str):
+                blocks.append({"type": "text", "text": b["text"]})
+            elif block == "thinking":
+                blocks.append({"type": "thinking", "thinking": str(b.get("thinking") or "")})
+            elif block == "tool_use":
+                blocks.append(
+                    {
+                        "type": "toolCall",
+                        "id": b.get("id"),
+                        "name": tool_name(b.get("name")),
+                        "arguments": b.get("input"),
+                        "timestamp": ts,
+                    }
+                )
+        return [message(ts, "assistant", blocks)]
+    said = texts(content) if isinstance(content, str) else []
+    results = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, dict) and b.get("type") == "tool_result":
+            results.append(b)
+        elif isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+            said.append({"type": "text", "text": b["text"]})
+    out = [message(ts, "user", said)] if said else []
+    for b in results:
+        out.append(
+            message(
+                ts,
+                "toolResult",
+                texts(b.get("content")),
+                toolCallId=b.get("tool_use_id"),
+                isError=b.get("is_error") is True,
+            )
+        )
+    return out
+
+
+def cursor_stream(
+    records: Iterable[dict[str, Any]], base: datetime | None = None
+) -> list[dict[str, Any]]:
+    """A cursor-agent session in pi's shape. Each transcript line is already one
+    turn; turn_ended lines are ignored by cursor_entries. Transcripts usually
+    omit timestamps: invent one-second steps from `base` (file mtime) so
+    timeline/stats/calls and Dates.started/--since agree."""
+    out: list[dict[str, Any]] = []
+    n = 0
+    start = base or datetime(1970, 1, 1, tzinfo=timezone.utc)  # noqa: UP017
+    for record in records:
+        for entry in cursor_entries(record):
+            if entry.get("timestamp") is None:
+                entry = {**entry, "timestamp": iso(start + timedelta(seconds=n))}
+                n += 1
+            out.append(entry)
+    return out
+
+
 def codex_stream(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """A codex session in pi's shape. The items between two user messages or
     tool outputs are one assistant message, as pi records a reply, stamped
@@ -708,7 +784,15 @@ def stream(s: Session) -> Iterator[dict[str, Any]]:
     if s.harness == "pi":
         yield from entries(path)
         return
-    merged = (claude_stream if s.harness == "claude" else codex_stream)(entries(path))
+    if s.harness == "cursor-agent":
+        try:
+            base = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)  # noqa: UP017
+        except OSError:
+            base = None
+        merged = cursor_stream(entries(path), base=base)
+    else:
+        streams = {"claude": claude_stream, "codex": codex_stream}
+        merged = streams[s.harness](entries(path))
     meta = record(s)
     if meta:
         at = 1 if merged and merged[0].get("type") == "session" else 0
@@ -724,7 +808,12 @@ ECHOES = frozenset(
 
 
 def normalised(harness: str, entry: dict[str, Any]) -> list[dict[str, Any]]:
-    return (claude_entries if harness == "claude" else codex_entries)(entry)
+    entries_fn = {
+        "claude": claude_entries,
+        "codex": codex_entries,
+        "cursor-agent": cursor_entries,
+    }
+    return entries_fn[harness](entry)
 
 
 def classify(harness: str, entry: object, term: str) -> tuple[int, str | None] | None:
@@ -1384,6 +1473,12 @@ def timeline(s: Session, index: int, flt: Filters) -> tuple[Timeline, list[Call]
             if flt.outcome(secs, error, bg, result):
                 source = "durationMs" if isinstance(ms, (int, float)) else "estimated"
                 calls.append(Call(iso(at), secs, source, name, cmd[:COMMAND], error, bg, index))
+    # cursor-agent transcripts often omit tool results; unfinished calls in any
+    # harness still count, with a zero estimated duration.
+    for at, name, cmd in asked.values():
+        bg = name == "bash" and background_launch(cmd)
+        if flt.outcome(0.0, False, bg, ""):
+            calls.append(Call(iso(at), 0.0, "estimated", name, cmd[:COMMAND], False, bg, index))
     if started is None:
         return None
     if not meta and not flt.session("other", "", ""):

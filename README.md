@@ -6,7 +6,7 @@ That's easy to answer when one machine holds all your sessions. Across a fleet
 of laptops, devservers and throwaway worktrees, the session you need is on a
 host you've forgotten, or on one that no longer exists.
 
-museum is a central, append-only backup of agent sessions (pi, Claude Code and Codex) from every machine, searchable by agents with the `museum` skill and its `museum-search` script.
+museum is a central, append-only backup of agent sessions (pi, Claude Code, Codex and cursor-agent) from every machine, searchable by agents with the `museum` skill and its `museum-search` script.
 
 ## How it works
 
@@ -25,22 +25,23 @@ A pi extension runs `bin/museum-sync` from inside pi: when a session starts, at 
 - **One sync per node:** ten agents finishing at once start one rsync. A kernel lock (`flock(2)`) serialises them; a session that ends mid-sync makes the running sync go round once more; the lock dies with its holder.
 - **Failures show up in pi:** the footer says `museum: backup failing: <error>`, and says nothing while backups work. `museum-sync` writes the label into one `state.json` per node and every pi re-reads it every 5 seconds, so when one agent's sync fails or recovers, every agent's footer follows.
 
-## Claude Code and Codex
+## Claude Code, Codex and cursor-agent
 
-The same sync also backs up Claude Code's `~/.claude/projects/` (each session and its `<uuid>/subagents/`) and Codex's `~/.codex/sessions/`, walked recursively. They land beside pi's folders:
+The same sync also backs up Claude Code's `~/.claude/projects/` (each session and its `<uuid>/subagents/`), Codex's `~/.codex/sessions/`, and cursor-agent's greppable transcripts under `~/.cursor/projects/*/agent-transcripts/` (not the live SQLite chats in `~/.cursor/chats/`). They land beside pi's folders:
 
 ```
 <store>/<machine>/claude/<project folder>/<session id>.jsonl
 <store>/<machine>/claude/<project folder>/<session id>/subagents/[workflows/<run>/]agent-<id>.jsonl
 <store>/<machine>/codex/<project folder>/rollout-<timestamp>-<id>.jsonl
+<store>/<machine>/cursor-agent/<project folder>/<session id>.jsonl
 <store>/<machine>/<harness>/meta/<session id>.json
 ```
 
-claude's project folder is its own (`-home-u-proj`). A codex rollout's date folders say nothing about the project, so its folder is the cwd from its first record, `session_meta`, spelled the same way. pi's layout does not move. `museum-search` reads these folders too (see [Search](#search)). cursor-agent is not backed up: its chats are live SQLite databases, unsafe to copy and not greppable. Muse Code's session store is not known yet, so only its meta records are kept.
+claude's project folder is its own (`-home-u-proj`). A codex rollout's date folders say nothing about the project, so its folder is the cwd from its first record, `session_meta`, spelled the same way. cursor-agent keeps Cursor's project folder name under `~/.cursor/projects/` as-is (`var-home-u-proj`). pi's layout does not move. `museum-search` reads these folders too (see [Search](#search)). Muse Code's session store is not known yet, so only its meta records are kept.
 
-- **A filtered copy.** claude transcripts carry `api-request`, `api-request-blob` and `api-request-shape` records (the last holds the whole system prompt), `file-history-snapshot` records and full tool output; codex carries `encrypted_content` and a full `replacement_history` and `guardian_history` at every compaction, enough for one session to reach hundreds of MB. museum keeps a filtered copy of each session under `~/.local/state/museum/stage/`, extended from a byte cursor (`stage.json`), and syncs that. The filter drops those records (every claude record type starting `api-request`) and fields, and cuts any tool result to 64 KB. A line still being written waits for the next sync. A file the filter fails on is skipped and named on stderr; the other files, and pi's sessions, still sync. A source that shrank is filtered again from scratch. Every source file is stat'ed on each sync, because a codex rollout can grow long after its date folder.
+- **A filtered copy.** claude transcripts carry `api-request`, `api-request-blob` and `api-request-shape` records (the last holds the whole system prompt), `file-history-snapshot` records and full tool output; codex carries `encrypted_content` and a full `replacement_history` and `guardian_history` at every compaction, enough for one session to reach hundreds of MB; cursor-agent transcripts drop `turn_ended` lines and can still carry large tool inputs. museum keeps a filtered copy of each session under `~/.local/state/museum/stage/`, extended from a byte cursor (`stage.json`), and syncs that. The filter drops those records (every claude record type starting `api-request`) and fields, and cuts any tool result (or cursor-agent tool input) to 64 KB. A line still being written waits for the next sync. A file the filter fails on is skipped and named on stderr; the other files, and pi's sessions, still sync. A source that shrank is filtered again from scratch. Every source file is stat'ed on each sync, because a codex rollout can grow long after its date folder.
 - **Append-only here too:** claude deletes old transcripts after `cleanupPeriodDays`; the store keeps them.
-- **The meta record.** claude and codex record the cwd and branch in their transcripts, but the mu agent, role and workstream exist only in mu's anchor file or the agent's environment. `museum hook <harness>` on `SessionStart` writes them, with the session id and the cwd's git repo, remote, branch and commit, to `~/.local/state/museum/meta/<harness>/<session id>.json`, once per session. That path, and the flush stamp beside it, ignore `XDG_STATE_HOME`, because hooks and timers run with different environments. It reads the anchor (`~/.local/state/mu-next/anchors/<pid>.json`) of the nearest ancestor process whose start time matches, taking the role from its `role`, else its `orchestrator` flag. Without an anchor it falls back to `MU_AGENT_NAME` and `MU_WORKSTREAM`; the role is orchestrator for `MU_ORCHESTRATOR=1`, else worker for `MU_MANAGED_AGENT=1`. An anchor reached only past the session's own harness process, such as a lead's for a `claude -p` it started, is not the session's: that session gets no identity. museum never writes into another harness's transcript.
+- **The meta record.** claude and codex record the cwd and branch in their transcripts, but the mu agent, role and workstream exist only in mu's anchor file or the agent's environment. `museum hook <harness>` on `SessionStart` writes them, with the session id and the cwd's git repo, remote, branch and commit, to `~/.local/state/museum/meta/<harness>/<session id>.json`, once per session. That path, and the flush stamp beside it, ignore `XDG_STATE_HOME`, because hooks and timers run with different environments. It reads the anchor (`~/.local/state/mu-next/anchors/<pid>.json`) of the nearest ancestor process whose start time matches, taking the role from its `role`, else its `orchestrator` flag. Without an anchor it falls back to `MU_AGENT_NAME` and `MU_WORKSTREAM`; the role is orchestrator for `MU_ORCHESTRATOR=1`, else worker for `MU_MANAGED_AGENT=1`. An anchor reached only past the session's own harness process, such as a lead's for a `claude -p` it started, is not the session's: that session gets no identity. museum never writes into another harness's transcript. Cursor's hook payload has `workspace_roots` instead of `cwd`; the meta record uses the first root when `cwd` is missing.
 - **Triggered from outside every sandbox.** Harness hooks may run in a sandbox that refuses rsync and ssh, so they only leave stamps:
   - `museum tick` is a shell script that does nothing unless a sync is due: the last one started over 10 minutes ago, or a session ended. Then it starts `museum-sync`, detached. It is cheap enough for a tmux status line, `#(museum tick)`, which the tmux server runs outside any agent's sandbox.
   - `museum hook <harness>` on `SessionEnd` only leaves a flush stamp, so the next tick syncs the final turn without waiting out the 10 minutes.
@@ -65,7 +66,7 @@ and add `museum hook <harness>` to each harness's `SessionStart` and `SessionEnd
 }
 ```
 
-Codex takes the same entries in `~/.codex/hooks.json`, as `museum hook codex`, and asks you to trust them once; its hidden title-generation session is ignored. Muse Code takes `museum hook muse`. Muse clears its hooks' environment, so they see neither `MU_*` nor `MUSEUM_STATE_DIR`, and the anchor is the only source of mu identity there. A hook never fails a turn: problems go to stderr, and it prints nothing on stdout. On a Linux host that should sync while you are logged out, run `loginctl enable-linger` so the user timer keeps running.
+Codex takes the same entries in `~/.codex/hooks.json`, as `museum hook codex`, and asks you to trust them once; its hidden title-generation session is ignored. cursor-agent takes `museum hook cursor-agent` in `~/.cursor/hooks.json` on `sessionStart` and `sessionEnd` (camelCase event names). Muse Code takes `museum hook muse`. Muse clears its hooks' environment, so they see neither `MU_*` nor `MUSEUM_STATE_DIR`, and the anchor is the only source of mu identity there. A hook never fails a turn: problems go to stderr, and it prints nothing on stdout. On a Linux host that should sync while you are logged out, run `loginctl enable-linger` so the user timer keeps running.
 
 ## Install (per machine)
 
@@ -148,14 +149,14 @@ $S show FILE stalwart     # that session's turns about TERM, with neighbours
 
 For an ssh store it runs on the store host in one ssh call. The `museum` skill tells agents how to use it.
 
-`find`, `show`, `stats` and `calls` read pi, Claude Code and Codex sessions alike. The script walks the whole store and tells the formats apart by depth: `<machine>/<folder>/<file>` is pi's, and so is `<machine>/<file>`, from before pi kept a folder per cwd; `<machine>/claude/...` and `<machine>/codex/...` are the others'. A `PROJECT` matches their project folders too. Muse Code's folder is skipped until its format is known; `rg` on the store still sees it.
+`find`, `show`, `stats` and `calls` read pi, Claude Code, Codex and cursor-agent sessions alike. The script walks the whole store and tells the formats apart by depth: `<machine>/<folder>/<file>` is pi's, and so is `<machine>/<file>`, from before pi kept a folder per cwd; `<machine>/claude/...`, `<machine>/codex/...` and `<machine>/cursor-agent/...` are the others'. A `PROJECT` matches their project folders too. Muse Code's folder is skipped until its format is known; `rg` on the store still sees it.
 
 One normaliser per format maps each session to one stream of user and assistant messages, tool calls and results, timestamps and the model, and every command reads that stream:
 
-- **Counted after merging.** claude writes each content block of a reply as its own line, under one `message.id`, and a parallel call's result can land between them: those lines are one message. codex writes a reply as several items (reasoning, text, calls) and a call's outcome as records sharing its `call_id`: the items between two user messages or tool outputs are one message, and each `call_id` is one call. So the same conversation gives the same message and call counts in all three formats.
-- **Tool names** are lowercased (`Bash` is `bash`), and codex's shell tools (`exec_command`, `shell`) are `bash`, so `--tool bash --match` works across harnesses. codex records how long a command took (`Wall time`) and its exit code, which give `durationMs` and the error flag; claude's calls are estimated from the gap.
+- **Counted after merging.** claude writes each content block of a reply as its own line, under one `message.id`, and a parallel call's result can land between them: those lines are one message. codex writes a reply as several items (reasoning, text, calls) and a call's outcome as records sharing its `call_id`: the items between two user messages or tool outputs are one message, and each `call_id` is one call. cursor-agent's transcript lines are already one turn each. So the same conversation gives the same message and call counts across formats.
+- **Tool names** are lowercased (`Bash` is `bash`), and every harness's shell tool is `bash` (codex's `exec_command`/`shell`, cursor-agent's `Shell`), so `--tool bash --match` works across harnesses. codex records how long a command took (`Wall time`) and its exit code, which give `durationMs` and the error flag; claude's and cursor-agent's calls are estimated from the gap.
 - **`find` matches normalised text.** A user or assistant turn's text is conversation; claude's `isMeta` additions, codex's developer messages, the instructions codex adds as user messages (`<environment_context>`, `# AGENTS.md instructions`) and its `session_meta`, `turn_context` and `world_state` records count as the system prompt; codex's `event_msg` records and claude's queued prompts only repeat other lines, so they are skipped.
-- **Metadata** for claude and codex comes from the meta record `museum hook` wrote (`<machine>/<harness>/meta/<session id>.json`; a claude subagent uses its parent's), so `--role`, `--agent` and `--workstream` and the project shown by `find` work as for pi.
+- **Metadata** for claude, codex and cursor-agent comes from the meta record `museum hook` wrote (`<machine>/<harness>/meta/<session id>.json`; a claude subagent uses its parent's), so `--role`, `--agent` and `--workstream` and the project shown by `find` work as for pi.
 
 ## Configuration
 
@@ -188,10 +189,11 @@ These environment variables are for tests and unusual layouts:
 | `PI_SESSIONS_DIR` | `~/.pi/agent/sessions` | pi's sessions |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | claude's sessions, in `projects/` |
 | `CODEX_HOME` | `~/.codex` | codex's sessions, in `sessions/` |
+| `CURSOR_HOME` | `~/.cursor` | cursor-agent transcripts, in `projects/*/agent-transcripts/` |
 | `MUSEUM_TIMER_KIND` | `launchd` on macOS, else `systemd` | Which timer `museum timer` installs |
 | `MUSEUM_SYNC` | `bin/museum-sync` beside the extension | Script the extension runs |
 
-The extension and the script read the environment of the pi process, so set these where pi starts. The timer and `#(museum tick)` read the environment of launchd, systemd or the tmux server; `museum timer install` copies `XDG_STATE_HOME` and `MUSEUM_STATE_DIR` into the timer when they are set, so its syncs share pi's state folder, and `CLAUDE_CONFIG_DIR` and `CODEX_HOME` when they are set and not empty, so they back up the sessions claude and codex write. A status line's `#(museum tick)` gets none of these unless they are in tmux's global environment: if you move claude's or codex's folder, also run `tmux set-environment -g CLAUDE_CONFIG_DIR "$CLAUDE_CONFIG_DIR"` (likewise `CODEX_HOME`), or set them before the tmux server starts.
+The extension and the script read the environment of the pi process, so set these where pi starts. The timer and `#(museum tick)` read the environment of launchd, systemd or the tmux server; `museum timer install` copies `XDG_STATE_HOME` and `MUSEUM_STATE_DIR` into the timer when they are set, so its syncs share pi's state folder, and `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `CURSOR_HOME` when they are set and not empty, so they back up the sessions those harnesses write. A status line's `#(museum tick)` gets none of these unless they are in tmux's global environment: if you move claude's, codex's or cursor's folder, also run `tmux set-environment -g CLAUDE_CONFIG_DIR "$CLAUDE_CONFIG_DIR"` (likewise `CODEX_HOME`, `CURSOR_HOME`), or set them before the tmux server starts.
 
 ## Requirements
 

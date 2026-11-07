@@ -83,8 +83,30 @@ CODEX_SESSION = [
 ROLLOUT = "rollout-2026-11-05T10-00-00-c0de.jsonl"
 
 
+CURSOR_SESSION = [
+    {
+        "role": "user",
+        "message": {"content": [{"type": "text", "text": "hi from cursor"}]},
+    },
+    {
+        "role": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "running"},
+                {
+                    "type": "tool_use",
+                    "name": "Shell",
+                    "input": {"command": "x" * (2 * CAP)},
+                },
+            ]
+        },
+    },
+    {"type": "turn_ended", "status": "success"},
+]
+
+
 class Harness(Sandbox):
-    """A sandbox with a claude and a codex session beside the pi one."""
+    """A sandbox with a claude, codex and cursor-agent session beside the pi one."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -94,13 +116,26 @@ class Harness(Sandbox):
         self.claude_file = self.projects / f"{SID}.jsonl"
         self.subagent = self.projects / SID / "subagents" / "agent-a1.jsonl"
         self.codex_file = self.dir / "codex" / "sessions" / "2026" / "11" / "05" / ROLLOUT
+        self.cursor_file = (
+            self.dir
+            / "cursor"
+            / "projects"
+            / "tmp-work-proj"
+            / "agent-transcripts"
+            / SID
+            / f"{SID}.jsonl"
+        )
         for path, body in (
             (self.claude_file, jsonl(*CLAUDE_SESSION)),
             (self.subagent, jsonl({"type": "user", "message": {"role": "user", "content": "sub"}})),
             (self.codex_file, jsonl(*CODEX_SESSION)),
+            (self.cursor_file, jsonl(*CURSOR_SESSION)),
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body)
+        # Noise under projects/ that must not be staged.
+        noise = self.dir / "cursor" / "projects" / "tmp-work-proj" / "other.jsonl"
+        noise.write_text('{"role":"user","message":{"content":"skip me"}}\n')
         self.box = self.store / "box"
 
     def env(self, **extra: str) -> dict[str, str]:
@@ -139,10 +174,13 @@ class Store(Harness):
         self.assertEqual(r.returncode, 0, r.stderr)
         claude = self.box / "claude" / "-work-proj" / f"{SID}.jsonl"
         codex = self.box / "codex" / "-work-proj" / ROLLOUT
+        cursor = self.box / "cursor-agent" / "tmp-work-proj" / f"{SID}.jsonl"
         self.assertTrue(
             (self.box / "claude" / "-work-proj" / SID / "subagents" / "agent-a1.jsonl").exists()
         )
         self.assertTrue((self.box / "--proj--" / "s1.jsonl").exists())
+        self.assertTrue(cursor.exists())
+        self.assertFalse((self.box / "cursor-agent" / "tmp-work-proj" / "other.jsonl").exists())
 
         kept = self.records(claude)
         self.assertEqual([r["type"] for r in kept], ["user", "user", "assistant"])
@@ -164,6 +202,14 @@ class Store(Harness):
         self.assertEqual(payloads[1]["summary"], ["thinking"])
         self.assertEqual(payloads[2]["message"], "summary")
         self.assertLess(len(payloads[3]["output"].encode()), CAP + 100)
+
+        cursor_kept = self.records(cursor)
+        self.assertEqual([r["role"] for r in cursor_kept], ["user", "assistant"])
+        self.assertNotIn("turn_ended", cursor.read_text())
+        cut = cursor_kept[1]["message"]["content"][1]["input"]
+        self.assertIsInstance(cut, str)
+        self.assertIn(f"[museum: cut at {CAP} of", cut)
+        self.assertLess(len(cut.encode()), CAP + 100)
 
     def test_a_growing_session_is_appended_and_a_partial_line_waits(self) -> None:
         self.run_sync()
@@ -190,7 +236,9 @@ class Store(Harness):
         r = self.run_sync(PI_SESSIONS_DIR=str(self.dir / "no-pi"))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.state_field("status"), "ok")
-        self.assertEqual(sorted(p.name for p in self.box.iterdir()), ["claude", "codex"])
+        self.assertEqual(
+            sorted(p.name for p in self.box.iterdir()), ["claude", "codex", "cursor-agent"]
+        )
 
     def test_meta_record_reaches_the_store(self) -> None:
         start = {"hook_event_name": "SessionStart", "session_id": SID, "cwd": str(self.dir)}
@@ -320,6 +368,32 @@ class Filter(unittest.TestCase):
         nested = b'{"payload":{"content":[{"type":"reasoning","encrypted_content":"e"}]}}\n'
         self.assertEqual(
             sync.filter_line("codex", nested), b'{"payload":{"content":[{"type":"reasoning"}]}}\n'
+        )
+        self.assertIsNone(sync.filter_line("cursor-agent", b'{"role":"turn_ended"}\n'))
+        self.assertIsNone(
+            sync.filter_line("cursor-agent", b'{"type":"turn_ended","status":"success"}\n')
+        )
+        fat = {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Shell", "input": {"command": "z" * (CAP + 1)}}
+                ]
+            },
+        }
+        cut_c = json.loads(
+            sync.filter_line("cursor-agent", json.dumps(fat).encode() + b"\n") or b""
+        )
+        self.assertIn("[museum: cut at", cut_c["message"]["content"][0]["input"])
+
+    def test_cursor_agent_destination(self) -> None:
+        root = self.dir / "cursor" / "projects"
+        source = sync.Source("cursor-agent", root)
+        good = root / "proj" / "agent-transcripts" / SID / f"{SID}.jsonl"
+        self.assertEqual(sync.destination(source, good), f"cursor-agent/proj/{SID}.jsonl")
+        self.assertIsNone(sync.destination(source, root / "proj" / "other.jsonl"))
+        self.assertIsNone(
+            sync.destination(source, root / "proj" / "agent-transcripts" / SID / "other.jsonl")
         )
 
     def test_every_api_request_record_type_is_dropped(self) -> None:
@@ -553,7 +627,7 @@ class Hook(Harness):
         cases = {
             "not json": ("claude", "{"),
             "unsafe id": ("claude", {"hook_event_name": "SessionStart", "session_id": "../x"}),
-            "no backup": ("cursor-agent", {"hook_event_name": "sessionEnd"}),
+            "no backup": ("not-a-harness", {"hook_event_name": "sessionEnd"}),
         }
         for name, (harness, payload) in cases.items():
             with self.subTest(name):
@@ -561,6 +635,22 @@ class Hook(Harness):
                 self.assertEqual((r.returncode, r.stdout), (0, ""))
         self.assertFalse((self.state / "meta").exists())
         self.assertFalse((self.state / "flush").exists())
+
+    def test_cursor_agent_meta_uses_workspace_roots(self) -> None:
+        root = str(self.repo)
+        payload = {
+            "hook_event_name": "sessionStart",
+            "session_id": SID,
+            "workspace_roots": [root],
+        }
+        r = self.hook("cursor-agent", payload, MU_AGENT_NAME="c1")
+        self.assertEqual((r.returncode, r.stdout), (0, "{}\n"))
+        record = json.loads((self.state / "meta" / "cursor-agent" / f"{SID}.json").read_text())
+        self.assertEqual(record["cwd"], root)
+        self.assertEqual(record["agent"], "c1")
+        end = self.hook("cursor-agent", {"hook_event_name": "sessionEnd"})
+        self.assertEqual((end.returncode, end.stdout), (0, "{}\n"))
+        self.assertTrue((self.state / "flush").exists())
 
 
 # Stands in for museum-sync, so tick's gating is checked without a sync.
@@ -688,6 +778,7 @@ class Timer(Harness):
         # harnesses write, not those under the default folders.
         self.assertEqual(job["EnvironmentVariables"]["CLAUDE_CONFIG_DIR"], str(self.dir / "claude"))
         self.assertEqual(job["EnvironmentVariables"]["CODEX_HOME"], str(self.dir / "codex"))
+        self.assertEqual(job["EnvironmentVariables"]["CURSOR_HOME"], str(self.dir / "cursor"))
         self.assertEqual(calls[-1], f"launchctl bootstrap gui/{os.getuid()} {plist}")
         self.run_timer("launchd", "remove")
         self.assertFalse(plist.exists())
@@ -701,6 +792,7 @@ class Timer(Harness):
         self.assertIn(f'Environment="MUSEUM_STATE_DIR={self.state}"', service)
         self.assertIn(f'Environment="CLAUDE_CONFIG_DIR={self.dir / "claude"}"', service)
         self.assertIn(f'Environment="CODEX_HOME={self.dir / "codex"}"', service)
+        self.assertIn(f'Environment="CURSOR_HOME={self.dir / "cursor"}"', service)
         self.assertIn("OnUnitActiveSec=300", (units / "museum-tick.timer").read_text())
         self.assertEqual(
             calls,
@@ -710,18 +802,20 @@ class Timer(Harness):
         self.assertFalse((units / "museum-tick.timer").exists())
 
     def test_empty_harness_homes_are_not_forwarded(self) -> None:
-        """An empty CLAUDE_CONFIG_DIR or CODEX_HOME means the default folder to
-        museum-sync; the timer must not pin it as an empty value."""
-        self.run_timer("launchd", "install", CLAUDE_CONFIG_DIR="", CODEX_HOME="")
+        """An empty CLAUDE_CONFIG_DIR, CODEX_HOME or CURSOR_HOME means the
+        default folder to museum-sync; the timer must not pin it as empty."""
+        self.run_timer("launchd", "install", CLAUDE_CONFIG_DIR="", CODEX_HOME="", CURSOR_HOME="")
         plist = self.home / "Library/LaunchAgents/museum.tick.plist"
         with plist.open("rb") as f:
             job_env = plistlib.load(f)["EnvironmentVariables"]
         self.assertNotIn("CLAUDE_CONFIG_DIR", job_env)
         self.assertNotIn("CODEX_HOME", job_env)
-        self.run_timer("systemd", "install", CLAUDE_CONFIG_DIR="", CODEX_HOME="")
+        self.assertNotIn("CURSOR_HOME", job_env)
+        self.run_timer("systemd", "install", CLAUDE_CONFIG_DIR="", CODEX_HOME="", CURSOR_HOME="")
         service = (self.home / ".config/systemd/user/museum-tick.service").read_text()
         self.assertNotIn("CLAUDE_CONFIG_DIR", service)
         self.assertNotIn("CODEX_HOME", service)
+        self.assertNotIn("CURSOR_HOME", service)
 
 
 @unittest.skipUnless(RSYNC, "rsync 3 not installed")

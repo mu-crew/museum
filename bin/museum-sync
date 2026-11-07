@@ -283,12 +283,18 @@ def settings() -> Settings:
 
 
 def harness_sources(env: Mapping[str, str]) -> tuple[Source, ...]:
-    """Where claude and codex keep sessions, honouring their own home variables.
-    cursor-agent's chats are live SQLite databases, unsafe to copy and not
-    greppable, so it has none; Muse Code's store is not known yet."""
+    """Where claude, codex and cursor-agent keep sessions, honouring their own
+    home variables. cursor-agent's live SQLite chats are not copied; its
+    greppable agent-transcripts under projects/ are. Muse Code's store is not
+    known yet."""
     claude = Path(env.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
     codex = Path(env.get("CODEX_HOME") or HOME / ".codex")
-    return (Source("claude", claude / "projects"), Source("codex", codex / "sessions"))
+    cursor = Path(env.get("CURSOR_HOME") or HOME / ".cursor")
+    return (
+        Source("claude", claude / "projects"),
+        Source("codex", codex / "sessions"),
+        Source("cursor-agent", cursor / "projects"),
+    )
 
 
 def find_rsync(configured: str | None = None) -> str | None:
@@ -378,11 +384,11 @@ def copy(s: Settings, rsync: str) -> Result:
     return Result(0, r.output) if r.code == RSYNC_VANISHED else r
 
 
-# --- the filter: claude and codex sessions, staged for the copy ---
+# --- the filter: claude, codex and cursor-agent sessions, staged for the copy ---
 #
-# museum keeps a filtered copy of each claude and codex session under
+# museum keeps a filtered copy of each non-pi session under
 # <state>/stage/<harness>/<project folder>/, extended from a byte cursor, and
-# syncs that. Both harnesses only append, so the copy only grows and keeps
+# syncs that. Sources only append, so the copy only grows and keeps
 # --append-verify. A source that shrank is filtered again from scratch.
 
 STAGE = "stage"
@@ -401,6 +407,8 @@ CODEX_OUTPUT = ("output", "aggregated_output", "formatted_output", "stdout", "st
 MARKERS = {
     "claude": (b'"api-request', b'"file-history-snapshot"'),
     "codex": tuple(f'"{key}"'.encode() for key in sorted(CODEX_DROP)),
+    # Real transcripts use `"type":"turn_ended"`; tests also cover role=.
+    "cursor-agent": (b'"turn_ended"',),
 }
 
 
@@ -461,6 +469,19 @@ def filter_entry(harness: str, entry: object) -> tuple[bool, bool]:
         changed = strip(entry, CODEX_DROP)
         for key in CODEX_OUTPUT:
             capped(entry.get("payload"), key)
+    elif harness == "cursor-agent":
+        # Observed Cursor JSONL uses type=turn_ended; role= was only a guess.
+        if entry.get("type") == "turn_ended" or entry.get("role") == "turn_ended":
+            return False, False
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                capped(block, "input")
+            elif block.get("type") == "tool_result":
+                capped(block, "content")
     return True, changed
 
 
@@ -512,6 +533,15 @@ def destination(source: Source, src: Path) -> str | None:
     if source.harness == "codex":
         project = codex_project(src)
         return None if project is None else f"codex/{project}/{src.name}"
+    if source.harness == "cursor-agent":
+        # <project>/agent-transcripts/<id>/<id>.jsonl → cursor-agent/<project>/<id>.jsonl
+        try:
+            parts = src.relative_to(source.root).parts
+        except ValueError:
+            return None
+        if len(parts) != 4 or parts[1] != "agent-transcripts" or parts[3] != f"{parts[2]}.jsonl":
+            return None
+        return f"cursor-agent/{parts[0]}/{parts[3]}"
     # claude's own folders are already per project; subagents stay beside
     # their session, in <uuid>/subagents/.
     return f"{source.harness}/{src.relative_to(source.root).as_posix()}"
@@ -588,7 +618,7 @@ def stage(state: Path, sources: tuple[Source, ...], hooks: Path) -> None:
 
 # --- `museum hook HARNESS`: the meta record and the flush stamp ---
 
-HOOKED = ("claude", "codex", "muse")
+HOOKED = ("claude", "codex", "cursor-agent", "muse")
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -777,7 +807,10 @@ def write_meta(harness: str, payload: dict[str, Any], env: Mapping[str, str]) ->
     if path.exists():
         return
     cwd = payload.get("cwd")
-    cwd = cwd if isinstance(cwd, str) and cwd else str(Path.cwd())
+    if not (isinstance(cwd, str) and cwd):
+        roots = payload.get("workspace_roots")
+        root = roots[0] if isinstance(roots, list) and roots else None
+        cwd = root if isinstance(root, str) and root else str(Path.cwd())
     doc = {
         "harness": harness,
         "session_id": sid,
@@ -817,6 +850,10 @@ def hook(harness: str, stdin: TextIO) -> int:
             (state / "flush").touch()
     except Exception as e:  # noqa: BLE001 (a hook never breaks a turn)
         print(f"museum: hook {harness}: {type(e).__name__}: {e}", file=sys.stderr)
+    # cursor-agent treats empty stdout as a failed hook (`empty_stdout`);
+    # murmur and muzzle reply `{}` for the same reason.
+    if harness == "cursor-agent":
+        print("{}")
     return 0
 
 
