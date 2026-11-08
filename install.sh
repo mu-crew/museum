@@ -1,6 +1,7 @@
 #!/bin/sh
-# Install museum on this machine: config, the pi package (skill and extension)
-# when pi is here, and the timer that runs `museum tick` every 5 minutes.
+# Install museum on this machine: config, the skill into each harness's skills
+# folder, the pi package (skill and extension) when pi is here, and the timer
+# that runs `museum tick` every 5 minutes.
 # Usage: ./install.sh [STORE [MACHINE]]     e.g. ./install.sh devbox:/data/museum
 # STORE is host:/path for an ssh store, or /path for a local one. MACHINE is this
 # machine's folder in the store; it defaults to `hostname -s`, pinned in config.
@@ -105,9 +106,10 @@ EOF
   echo "wrote $CONF"
 fi
 
-# Older installs symlinked the skill and the extension; with the package
-# installed too, pi would load both twice. Only symlinks are removed: a real
-# file or folder there is not ours.
+# Older installs symlinked the skill and the extension into pi's discovery
+# paths; with the package installed too, pi would load both twice. Only
+# symlinks are removed: a real file or folder there is not ours. Never put
+# the skill back in ~/.agents/skills: pi and other tools also read that tree.
 for link in "$HOME/.agents/skills/museum" "$HOME/.pi/agent/extensions/museum.ts"; do
   if [ -L "$link" ]; then
     rm "$link"
@@ -115,7 +117,48 @@ for link in "$HOME/.agents/skills/museum" "$HOME/.pi/agent/extensions/museum.ts"
   fi
 done
 
-# The skill and the extension, as a pi package loaded from this folder, so
+# Skill for claude, codex and cursor-agent: symlink into each harness's own
+# skills folder when that harness is set up here, so repo edits stay live.
+# Muse Code installs skills through `muse skills`; pi loads the skill from
+# the package below. A real directory already at the destination is left alone.
+SKILL="$ROOT/skills/museum"
+link_skill() {
+  dest=$1
+  mkdir -p "$(dirname "$dest")"
+  if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+    echo "museum: left $dest (not a symlink)" >&2
+    return 0
+  fi
+  ln -sfn "$SKILL" "$dest"
+  echo "linked skill -> $dest"
+}
+
+CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+CODEX_DIR=${CODEX_HOME:-$HOME/.codex}
+if [ -d "$CLAUDE_DIR" ]; then
+  link_skill "$CLAUDE_DIR/skills/museum"
+fi
+if [ -d "$CODEX_DIR" ]; then
+  link_skill "$CODEX_DIR/skills/museum"
+fi
+# cursor-agent also reads ~/.claude/skills and ~/.codex/skills (literal home
+# paths; it ignores CLAUDE_CONFIG_DIR and CODEX_HOME), so give it its own
+# copy only when neither already holds the skill.
+CURSOR_SKILL=$HOME/.cursor/skills/museum
+if [ -d "$HOME/.cursor" ]; then
+  if [ -f "$HOME/.claude/skills/museum/SKILL.md" ] ||
+    [ -f "$HOME/.codex/skills/museum/SKILL.md" ]; then
+    if [ -L "$CURSOR_SKILL" ]; then
+      rm "$CURSOR_SKILL"
+      echo "removed covered cursor skill link $CURSOR_SKILL"
+    fi
+  else
+    link_skill "$CURSOR_SKILL"
+  fi
+fi
+echo "museum: Muse Code: add $SKILL with \`muse skills\` (not linked automatically)"
+
+# The skill and the extension for pi, as a package loaded from this folder, so
 # repo edits are live. Running pi agents pick it up on restart or /reload.
 if command -v pi > /dev/null; then
   pi install "$ROOT"

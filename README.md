@@ -82,12 +82,13 @@ The store uses rsync's syntax: `host:/path` goes over ssh, anything else is a lo
 
 The install script:
 1. writes `~/.config/museum/config.toml` (see [Configuration](#configuration)). The machine name defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<machine>` already exists, the install stops unless you pass the name explicitly
-2. removes the symlinks older installs made, `~/.agents/skills/museum` and `~/.pi/agent/extensions/museum.ts`, so pi does not load museum twice
-3. runs `pi install <this folder>` when pi is on `PATH`, which adds the repo to `packages` in `~/.pi/agent/settings.json`. pi loads the extension (`pi/museum.ts`) and the skill (`skills/museum`) from the repo, so edits are live. Running pi agents pick it up on restart or `/reload`
-4. runs the first sync, and shows its error if it fails
-5. installs the timer that runs `museum tick` every 5 minutes (`museum timer install`), afterwards, so the timer's first sync cannot hide the first sync's result
+2. removes the symlinks older installs made, `~/.agents/skills/museum` and `~/.pi/agent/extensions/museum.ts`, so pi does not load museum twice. It never writes the skill back into `~/.agents/skills`: that tree is also pi's
+3. links `skills/museum` into each harness that is set up here: `$CLAUDE_CONFIG_DIR/skills/museum` (else `~/.claude/skills/museum`), `$CODEX_HOME/skills/museum` (else `~/.codex/skills/museum`), and `~/.cursor/skills/museum` only when neither literal `~/.claude/skills/museum` nor `~/.codex/skills/museum` already holds the skill (cursor-agent reads those too). A real directory already at the destination is left alone. Muse Code is not linked: add the same folder with `muse skills`
+4. runs `pi install <this folder>` when pi is on `PATH`, which adds the repo to `packages` in `~/.pi/agent/settings.json`. pi loads the extension (`pi/museum.ts`) and the skill (`skills/museum`) from the repo, so edits are live. Running pi agents pick it up on restart or `/reload`
+5. runs the first sync, and shows its error if it fails
+6. installs the timer that runs `museum tick` every 5 minutes (`museum timer install`), afterwards, so the timer's first sync cannot hide the first sync's result
 
-`pi list` shows the package, and `pi remove <this folder>` takes it out. The repo must stay where it was installed from: the package entry is its path. To use the skill with another agent CLI, link or copy `skills/museum` into that CLI's skills folder; the extension, and so the backup, runs only in pi.
+`pi list` shows the package, and `pi remove <this folder>` takes it out. The repo must stay where it was installed from: the package entry is its path. The extension, and so the backup from inside pi, runs only in pi; the other harnesses use `museum hook` and the timer.
 
 ## Check and sync by hand
 

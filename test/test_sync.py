@@ -448,6 +448,78 @@ class Units(unittest.TestCase):
                 self.assertEqual(c.machine, machine)
                 self.assertEqual(written, sync.toml(c))
 
+    def test_install_links_skill_into_harness_dirs(self) -> None:
+        """install.sh links skills/museum into each set-up harness, never into
+        ~/.agents/skills, and skips cursor when claude or codex already covers it."""
+        src = (ROOT / "install.sh").read_text()
+        start = src.index("# Older installs symlinked")
+        end = src.index("# The first sync also converts")
+        skill_block = src[start:end]
+        skill = ROOT / "skills" / "museum"
+
+        def run_skill_install(home: Path) -> subprocess.CompletedProcess[str]:
+            script = home / "install-skills.sh"
+            script.write_text(f"#!/bin/sh\nset -eu\nROOT={ROOT}\n" + skill_block)
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CURSOR_HOME")
+            }
+            env["HOME"] = str(home)
+            env["PATH"] = "/usr/bin:/bin"  # no pi: skip the package step
+            return subprocess.run(
+                ["sh", str(script)], env=env, capture_output=True, text=True, check=True
+            )
+
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".codex").mkdir()
+            (home / ".cursor").mkdir()
+            agents = home / ".agents" / "skills"
+            agents.mkdir(parents=True)
+            (agents / "museum").symlink_to(skill)
+
+            out = run_skill_install(home)
+            self.assertTrue((home / ".codex" / "skills" / "museum").is_symlink())
+            self.assertEqual((home / ".codex" / "skills" / "museum").resolve(), skill.resolve())
+            # Codex already holds the skill: cursor-agent reads that copy too.
+            self.assertFalse((home / ".cursor" / "skills" / "museum").exists())
+            self.assertFalse((agents / "museum").exists())
+            self.assertIn("muse skills", out.stdout)
+
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".cursor").mkdir()
+            out = run_skill_install(home)
+            self.assertTrue((home / ".cursor" / "skills" / "museum").is_symlink())
+            self.assertEqual((home / ".cursor" / "skills" / "museum").resolve(), skill.resolve())
+            self.assertIn("muse skills", out.stdout)
+
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".codex").mkdir()
+            (home / ".cursor" / "skills").mkdir(parents=True)
+            (home / ".codex" / "skills" / "museum").mkdir(parents=True)
+            (home / ".codex" / "skills" / "museum" / "SKILL.md").write_text("kept\n")
+            covered = home / ".cursor" / "skills" / "museum"
+            covered.symlink_to(skill)
+            run_skill_install(home)
+            self.assertFalse(covered.exists())
+            self.assertEqual(
+                (home / ".codex" / "skills" / "museum" / "SKILL.md").read_text(), "kept\n"
+            )
+            self.assertFalse((home / ".agents" / "skills" / "museum").exists())
+
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".claude").mkdir()
+            dest = home / ".claude" / "skills" / "museum"
+            dest.mkdir(parents=True)
+            (dest / "SKILL.md").write_text("hand-edited\n")
+            run_skill_install(home)
+            self.assertFalse(dest.is_symlink())
+            self.assertEqual((dest / "SKILL.md").read_text(), "hand-edited\n")
+
     def test_legacy_config_converts_once(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             old = Path(d, "config")
