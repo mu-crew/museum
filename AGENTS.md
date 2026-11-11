@@ -1,8 +1,9 @@
 # Agent notes
 
-[README.md](README.md) covers what museum does, its configuration and, under
-Develop, the `make check` gate. [docs/design.md](docs/design.md) has the
-decisions behind it. Releases: [RELEASING.md](RELEASING.md); add a
+[README.md](README.md) covers installing and using museum and, under Develop,
+the `make check` gate; [docs/reference.md](docs/reference.md) the details,
+configuration and environment variables; [docs/design.md](docs/design.md) the
+decisions behind them. Keep the README short: details go in the reference. Releases: [RELEASING.md](RELEASING.md); add a
 [CHANGELOG.md](CHANGELOG.md) entry for user-visible changes, in the top
 section when it has no date yet, else in a new `## [Unreleased]` one.
 
