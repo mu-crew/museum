@@ -3,7 +3,7 @@
 All notable changes to museum. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0.0 a minor release may change on-disk state or setup.
 
-## [0.4.0]
+## [0.4.0] — 2026-11-11
 
 museum is released to npm as `@mu-crew/museum`, so every machine installs and
 updates it like mu and the other tools: `pi install npm:@mu-crew/museum`, then
