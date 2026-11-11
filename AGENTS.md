@@ -2,7 +2,9 @@
 
 [README.md](README.md) covers what museum does, its configuration and, under
 Develop, the `make check` gate. [docs/design.md](docs/design.md) has the
-decisions behind it.
+decisions behind it. Releases: [RELEASING.md](RELEASING.md); add a
+[CHANGELOG.md](CHANGELOG.md) entry for user-visible changes, in the top
+section when it has no date yet, else in a new `## [Unreleased]` one.
 
 ## State directories
 

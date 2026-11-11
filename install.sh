@@ -1,7 +1,9 @@
 #!/bin/sh
 # Install museum on this machine: config, the skill into each harness's skills
-# folder, the pi package (skill and extension) when pi is here, and the timer
-# that runs `museum tick` every 5 minutes.
+# folder, `museum` on PATH, the pi package (skill and extension) when pi is
+# here, and the timer that runs `museum tick` every 5 minutes. Run it from pi's
+# copy of the npm package (~/.pi/agent/npm/node_modules/@mu-crew/museum), or
+# from a checkout, which pi then loads as a package, so edits are live.
 # Usage: ./install.sh [STORE [MACHINE]]     e.g. ./install.sh devbox:/data/museum
 # STORE is host:/path for an ssh store, or /path for a local one. MACHINE is this
 # machine's folder in the store; it defaults to `hostname -s`, pinned in config.
@@ -158,12 +160,43 @@ if [ -d "$HOME/.cursor" ]; then
 fi
 echo "museum: Muse Code: add $SKILL with \`muse skills\` (not linked automatically)"
 
-# The skill and the extension for pi, as a package loaded from this folder, so
-# repo edits are live. Running pi agents pick it up on restart or /reload.
-if command -v pi > /dev/null; then
-  pi install "$ROOT"
+# `museum` for tmux, harness hooks and you, through a link, so an update to
+# this folder is live. A real file there is not ours, and is left alone.
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+if [ -e "$BIN_DIR/museum" ] && [ ! -L "$BIN_DIR/museum" ]; then
+  echo "museum: left $BIN_DIR/museum (not a symlink)" >&2
 else
+  ln -sfn "$ROOT/bin/museum" "$BIN_DIR/museum"
+  echo "linked $BIN_DIR/museum -> $ROOT/bin/museum"
+fi
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) echo "museum: $BIN_DIR is not on PATH; add it for \`museum\`" >&2 ;;
+esac
+
+# The skill and the extension for pi. From the npm package, pi installed this
+# folder already. From a checkout, pi loads it as a package, so repo edits are
+# live. Running pi agents pick it up on restart or /reload.
+case "$ROOT" in
+  */node_modules/*) NPM=1 ;;
+  *) NPM= ;;
+esac
+if ! command -v pi > /dev/null; then
   echo "museum: no pi on PATH; skipping the pi package"
+else
+  [ -n "$NPM" ] || pi install "$ROOT"
+  # Two museum packages (a checkout and the npm package) would load the
+  # extension twice and sync from two copies.
+  pi list 2> /dev/null | awk '
+    /^  [^ ]/ { source = substr($0, 3) }
+    /^    [^ ]/ { print source "\t" substr($0, 5) }' |
+    while IFS="$(printf '\t')" read -r source dir; do
+      [ "$dir" != "$ROOT" ] || continue
+      if grep -Eq '"name": *"(@mu-crew/)?museum"' "$dir/package.json" 2> /dev/null; then
+        echo "museum: pi also loads museum from $dir; keep one: pi remove $source" >&2
+      fi
+    done
 fi
 
 # The first sync also converts an old KEY=value config to config.toml. It runs

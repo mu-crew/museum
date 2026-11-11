@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # id-token: npm trusted publishing. No npm token is stored anywhere;
+    # npmjs.com trusts this repo's release.yml for @mu-crew/museum.
+    permissions:
+      contents: write # the GitHub release
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Check release version
+        run: python3 scripts/check-release-version.py "${{ github.ref_name }}"
+      - run: make check
+      - run: make test PYTHON="uv run --no-project --python 3.11 python"
+      # Trusted publishing (OIDC) needs npm 11.5.1+; older npm fails with a
+      # misleading 404.
+      - run: npm install -g npm@^11.5.1
+      # Everything that can fail runs before the irreversible publish: the
+      # notes (a missing section fails here), then the GitHub release. A
+      # re-run after a failed publish edits the release instead of failing.
+      - name: Release notes
+        run: python3 scripts/changelog-section.py CHANGELOG.md "${GITHUB_REF_NAME#v}" > notes.md
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "museum $version" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "museum $version" --notes-file notes.md --verify-tag
+          fi
+      - name: Publish
+        run: npm publish --access public

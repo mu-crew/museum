@@ -279,6 +279,39 @@ class Store(unittest.TestCase):
         self.addCleanup(notes.chmod, 0o644)
         self.assertIn(tally, self.run_search("find", "stalwart").stdout)
 
+    def test_find_leaves_a_newer_museums_index_alone(self) -> None:
+        db = self.dir / search.TURNS
+        con = sqlite3.connect(db)
+        con.execute(f"PRAGMA user_version={search.TURNS_VERSION + 1}")
+        con.close()
+        out = self.run_search("find", "stalwart").stdout
+        self.assertIn('"stalwart": 3 sessions in conversation, 1 only in tool output.', out)
+        con = sqlite3.connect(db)
+        self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], search.TURNS_VERSION + 1)
+        con.close()
+
+    def test_fleet_lists_each_machines_version(self) -> None:
+        def mark(machine: str, name: str, doc: dict[str, str], mtime: int) -> None:
+            path = self.dir / machine / ".museum" / f"{name}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(doc))
+            os.utime(path, (mtime, mtime))
+
+        mark("pc", "0.9.0", {"version": "0.9.0", "source": "npm"}, 1_000)
+        mark("pc", "0.10.0", {"version": "0.10.0", "source": "npm"}, 2_000)
+        mark("mac", "0.9.1+abc", {"version": "0.9.1", "commit": "abc", "source": "checkout"}, 9)
+        write_session(self.dir, "old/--x--/2026-01-01T00-00-00-000Z_o.jsonl", [msg("user", "hi")])
+        out = self.run_search("fleet")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rows = {line.split()[0]: line for line in out.stdout.splitlines()[1:] if line.strip()}
+        # The newest marker counts, and versions order as numbers.
+        self.assertIn("0.10.0 (npm)", rows["pc"])
+        self.assertNotIn("behind", rows["pc"])
+        self.assertIn("0.9.1+abc (checkout)", rows["mac"])
+        self.assertTrue(rows["mac"].rstrip().endswith("behind"))
+        self.assertIn("no version reported", rows["old"])
+        self.assertIn("pi update npm:@mu-crew/museum", out.stdout)
+
     def indexed_turns(self, term: str) -> int:
         db = sqlite3.connect(self.dir / search.TURNS)
         try:

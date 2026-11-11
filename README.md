@@ -48,7 +48,7 @@ claude's project folder is its own (`-home-u-proj`). A codex rollout's date fold
   - A launchd agent (macOS) or systemd user timer (Linux) runs `museum tick` every 5 minutes, for a host with no tmux client attached. So a final turn reaches the store within 5 minutes of `SessionEnd`.
   - The sync runs the `rsync_path` pinned in the config, not whatever rsync the caller's `PATH` finds.
 
-To set it up, put `bin/museum` on your `PATH` (`ln -s "$PWD/bin/museum" ~/.local/bin/`), then:
+`install.sh` links `museum` into `~/.local/bin` (see [Install](#install-per-machine)). Then:
 
 ```sh
 museum timer install                          # install.sh does this too
@@ -70,13 +70,21 @@ Codex takes the same entries in `~/.codex/hooks.json`, as `museum hook codex`, a
 
 ## Install (per machine)
 
+museum is released to npm as `@mu-crew/museum`, a pi package. pi installs it, and `install.sh` inside it sets up the rest:
+
 ```sh
-./install.sh devbox:/data/museum          # first time, ssh store: writes ~/.config/museum/config.toml
-./install.sh /data/museum                 # first time, local store (this machine is the store host)
-./install.sh /Volumes/backup/museum       # local path on a mounted disk or network share
-./install.sh devbox:/data/museum work-mbp # first time, with an explicit machine folder name
-./install.sh                              # later runs: re-register the pi package, the timer, sync
+pi install npm:@mu-crew/museum
+M=~/.pi/agent/npm/node_modules/@mu-crew/museum
+$M/install.sh devbox:/data/museum          # first time, ssh store: writes ~/.config/museum/config.toml
+$M/install.sh /data/museum                 # first time, local store (this machine is the store host)
+$M/install.sh /Volumes/backup/museum       # local path on a mounted disk or network share
+$M/install.sh devbox:/data/museum work-mbp # first time, with an explicit machine folder name
+museum setup                               # later runs (install.sh again): links, the timer, sync
 ```
+
+Update with `pi update --extensions`, with mu and the other packages, or `pi update npm:@mu-crew/museum` alone. The package keeps its folder across updates, so the timer, the skill links and `~/.local/bin/museum` keep pointing at the new version; run `museum setup` again only when the [CHANGELOG](CHANGELOG.md) says a release needs it. `museum fleet` shows which machines run what (see [Versions](#versions)).
+
+To work on museum, install from a checkout instead: `./install.sh STORE` there makes pi load the checkout as a package, so edits are live. Keep one of the two: `install.sh` warns when pi loads museum from both, with the `pi remove` that drops one.
 
 The store uses rsync's syntax: `host:/path` goes over ssh, anything else is a local path. On the store host itself, use the local path rather than `localhost:`, which would need sshd and a key for your own account.
 
@@ -84,18 +92,20 @@ The install script:
 1. writes `~/.config/museum/config.toml` (see [Configuration](#configuration)). The machine name defaults to `hostname -s` and is fixed at install time, so a later hostname change keeps using the same folder. If `<store>/<machine>` already exists, the install stops unless you pass the name explicitly
 2. removes the symlinks older installs made, `~/.agents/skills/museum` and `~/.pi/agent/extensions/museum.ts`, so pi does not load museum twice. It never writes the skill back into `~/.agents/skills`: that tree is also pi's
 3. links `skills/museum` into each harness that is set up here: `$CLAUDE_CONFIG_DIR/skills/museum` (else `~/.claude/skills/museum`), `$CODEX_HOME/skills/museum` (else `~/.codex/skills/museum`), and `~/.cursor/skills/museum` only when neither literal `~/.claude/skills/museum` nor `~/.codex/skills/museum` already holds the skill (cursor-agent reads those too). A real directory already at the destination is left alone. Muse Code is not linked: add the same folder with `muse skills`
-4. runs `pi install <this folder>` when pi is on `PATH`, which adds the repo to `packages` in `~/.pi/agent/settings.json`. pi loads the extension (`pi/museum.ts`) and the skill (`skills/museum`) from the repo, so edits are live. Running pi agents pick it up on restart or `/reload`
-5. runs the first sync, and shows its error if it fails
-6. installs the timer that runs `museum tick` every 5 minutes (`museum timer install`), afterwards, so the timer's first sync cannot hide the first sync's result
+4. links `~/.local/bin/museum` to its `bin/museum`, for tmux, harness hooks and you, and says so when `~/.local/bin` is not on `PATH`. A real file there is left alone
+5. from a checkout, runs `pi install <this folder>` when pi is on `PATH`, which adds the repo to `packages` in `~/.pi/agent/settings.json`, so pi loads the extension (`pi/museum.ts`) and the skill (`skills/museum`) from the repo. From the npm package, pi has it already. Either way it warns when `pi list` shows a second museum package. Running pi agents pick it up on restart or `/reload`
+6. runs the first sync, and shows its error if it fails
+7. installs the timer that runs `museum tick` every 5 minutes (`museum timer install`), afterwards, so the timer's first sync cannot hide the first sync's result
 
-`pi list` shows the package, and `pi remove <this folder>` takes it out. The repo must stay where it was installed from: the package entry is its path. The extension, and so the backup from inside pi, runs only in pi; the other harnesses use `museum hook` and the timer.
+`pi list` shows the package, and `pi remove npm:@mu-crew/museum` (or `pi remove <checkout>`) takes it out. A checkout must stay where it was installed from: the package entry is its path. The extension, and so the backup from inside pi, runs only in pi; the other harnesses use `museum hook` and the timer.
 
 ## Check and sync by hand
 
 ```sh
 cat ~/.local/state/museum/state.json  # status ok|error, time (epoch), message (last error), warning (footer label)
-bin/museum-sync                  # sync now, and print rsync or ssh errors
-bin/museum sync                  # the same
+museum sync                      # sync now, and print rsync or ssh errors (bin/museum-sync)
+museum version                   # this machine's museum: version, commit for a checkout, and folder
+museum fleet                     # every machine's museum, from the store
 ```
 
 The pi footer shows the `warning` field of `state.json`, which the sync writes: nothing while backups work, `museum: backup failing: <error>` after a failed sync. pi adds `museum: no backup yet` before the first sync finishes, and `museum: cannot run museum-sync` when it cannot start the script.
@@ -211,14 +221,23 @@ The extension and the script read the environment of the pi process, so set thes
 
 The store holds the only complete copy of every machine's sessions. Snapshot it separately, for example with restic or filesystem snapshots on the store host.
 
+## Versions
+
+Each sync leaves a marker in the store, `<store>/<machine>/.museum/<version>.json` (`<version>+<commit>` from a checkout), with the version, commit, machine and the folder museum runs from. A marker is written once per version and never changes, because the copy appends; rsync keeps its mtime, so it says when the machine first synced with that version. `museum fleet` (`museum-search fleet`, which reaches an ssh store like a search) lists each machine folder's newest marker and newest session, and marks a machine `behind` when it reports an older release than the newest any machine reports. A machine that never reported runs museum before 0.4.0. A newest session that has stopped moving means the machine's syncs have stopped.
+
+Releases: [RELEASING.md](RELEASING.md). A `v*` tag publishes the package from CI.
+
 ## Layout
 
 ```
 bin/museum           tick, hook, sync and timer: what tmux, timers and harness hooks call
 bin/museum-sync      the rsync backup, one at a time per node; the filter; the hook
 pi/museum.ts          pi extension: triggers the sync, shows its warning in the footer
-install.sh            per-machine setup: config, pi package, timer, first sync
-package.json          pi package manifest (the extension and the skill)
+install.sh            per-machine setup: config, skill links, PATH, pi package, timer, first sync
+package.json          npm and pi package manifest (`files` is what npm publishes)
+CHANGELOG.md          release notes; a release's section is its GitHub release body
+RELEASING.md          how a tag becomes an npm release
+scripts/              release checks: the tag against package.json, a CHANGELOG section
 skills/museum/       agent skill: where the store is and how to search it
   scripts/museum-search  search the store: ranked triage, then one session's conversation
 docs/                 design notes

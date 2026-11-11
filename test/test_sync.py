@@ -131,6 +131,20 @@ class LocalStore(Sandbox):
         db = sqlite3.connect(self.store / ".museum-turns.sqlite")
         self.assertEqual(db.execute("SELECT body FROM turn").fetchall(), [("the quokka plan",)])
 
+    def test_reports_its_version_through_the_store(self) -> None:
+        self.assertEqual(self.run_sync().returncode, 0)
+        version = json.loads((ROOT / "package.json").read_text())["version"]
+        marks = list((self.store / "box" / ".museum").glob("*.json"))
+        self.assertEqual(len(marks), 1)
+        doc = json.loads(marks[0].read_text())
+        self.assertEqual((doc["version"], doc["machine"]), (version, "box"))
+        self.assertTrue(marks[0].name.startswith(version))
+        # The next sync with the same version adds nothing.
+        self.assertEqual(self.run_sync().returncode, 0)
+        self.assertEqual(list((self.store / "box" / ".museum").glob("*.json")), marks)
+        out = self.run_sync("--version").stdout
+        self.assertTrue(out.startswith(f"museum {version}"), out)
+
     def test_no_index_when_told_not_to(self) -> None:
         self.assertEqual(self.run_sync(MUSEUM_NO_INDEX="1").returncode, 0)
         self.assertFalse((self.store / ".museum-turns.sqlite").exists())
@@ -466,6 +480,73 @@ class Units(unittest.TestCase):
                 c = sync.load_config(home / ".config/museum/config.toml")
                 self.assertEqual(c.machine, machine)
                 self.assertEqual(written, sync.toml(c))
+
+    def test_install_registers_a_checkout_with_pi_but_not_the_npm_package(self) -> None:
+        """A checkout is installed as a pi package; pi's copy of the npm
+        package is installed already. Either way, a second museum package
+        that pi loads is named, with the command that removes it."""
+        src = (ROOT / "install.sh").read_text()
+        block = src[src.index("# `museum` for tmux") : src.index("# The first sync also converts")]
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            bin_dir = home / "fakebin"
+            bin_dir.mkdir()
+            npm = home / "npm/node_modules/@mu-crew/museum"
+            npm.mkdir(parents=True)
+            (npm / "package.json").write_text('{"name": "@mu-crew/museum"}\n')
+            log = home / "pi.log"
+            listing = (
+                f"User packages:\n  ../../src/museum\n    {ROOT}\n"
+                f"  npm:@mu-crew/museum\n    {npm}\n  npm:@mu-crew/mu\n    /nowhere\n"
+            )
+            pi = bin_dir / "pi"
+            pi.write_text(
+                f'#!/bin/sh\necho "$*" >> {log}\n'
+                f'[ "$1" = list ] && printf "%s" "{listing}"\nexit 0\n'
+            )
+            pi.chmod(0o755)
+            env = {**os.environ, "HOME": str(home), "PATH": f"{bin_dir}:/usr/bin:/bin"}
+
+            def install(root: Path) -> subprocess.CompletedProcess[str]:
+                script = home / "block.sh"
+                script.write_text(f"#!/bin/sh\nset -eu\nROOT={root}\n" + block)
+                return subprocess.run(
+                    ["sh", str(script)], env=env, capture_output=True, text=True, check=True
+                )
+
+            r = install(ROOT)
+            self.assertIn(f"install {ROOT}", log.read_text())
+            self.assertIn(f"pi also loads museum from {npm}; keep one: pi remove npm:", r.stderr)
+            self.assertNotIn(f"from {ROOT};", r.stderr)  # not itself
+            self.assertEqual((home / ".local/bin/museum").readlink(), ROOT / "bin/museum")
+            log.unlink()
+            r = install(npm)
+            self.assertNotIn("install", log.read_text())
+            self.assertIn(f"from {ROOT}; keep one: pi remove ../../src/museum", r.stderr)
+            self.assertNotIn(f"from {npm};", r.stderr)
+            self.assertEqual((home / ".local/bin/museum").readlink(), npm / "bin/museum")
+
+    def test_package_holds_what_museum_runs(self) -> None:
+        """npm publishes only package.json's `files`: each must exist, the
+        scripts must stay executable, and the version needs a CHANGELOG
+        section, which the release workflow publishes as its notes."""
+        package = json.loads((ROOT / "package.json").read_text())
+        for entry in package["files"]:
+            self.assertTrue((ROOT / entry).exists(), entry)
+        for script in ("bin/museum", "bin/museum-sync", "install.sh"):
+            self.assertIn(script, package["files"])
+            self.assertTrue(os.access(ROOT / script, os.X_OK), script)
+        search_script = "skills/museum/scripts/museum-search"
+        self.assertIn(search_script, package["files"])
+        self.assertEqual(sync.SEARCH, ROOT / search_script)
+        r = subprocess.run(
+            [sys.executable, "scripts/changelog-section.py", "CHANGELOG.md", package["version"]],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_install_links_skill_into_harness_dirs(self) -> None:
         """install.sh links skills/museum into each set-up harness, never into

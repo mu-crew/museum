@@ -105,4 +105,6 @@ Use this when the user asks whether museum is working, or pi's footer shows `mus
    Exit 0 means the sync succeeded, or another sync on this machine will cover it.
 3. Common causes: `python3` on PATH is older than 3.11 (`needs Python 3.11+`: on macOS, `brew install python`), a key in `config.toml` is misspelled or wrong (`unknown key`, `must be absolute`), ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), the store folder is not writable, or, with `ssh_mux_only = true` in the config, no ssh master is running (`no ssh master for <host>`: the user runs `ssh -MNf <host>`, which may need their key).
 
+To see which museum each machine runs, run `museum fleet` (or `"$S" fleet`): each machine's version, since when, and its newest session; `behind` marks one on an older release, updated with `pi update npm:@mu-crew/museum`. A machine whose newest session has stopped moving has stopped syncing.
+
 Report the error to the user. Do not change `~/.config/museum/config.toml` or the ssh setup without asking.

@@ -14,6 +14,9 @@
                                                   wait time by role, and a trend
   museum-search calls [PROJECT] [FILTERS] [--group-by session|agent|workstream|role]
                                                   the tool calls behind stats
+  museum-search fleet                             each machine's museum version, as
+                                                  its syncs report it, and its newest
+                                                  session
   museum-search index                             bring the turn index up to date;
                                                   museum-sync runs it after each
                                                   sync to a local store
@@ -996,6 +999,11 @@ class TurnIndex:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version > TURNS_VERSION:
+            # A newer museum's index: rebuilding it here would make that one
+            # rebuild it again. Read the files until this machine updates.
+            self.db.close()
+            raise sqlite3.DatabaseError(f"{TURNS} is from a newer museum: update this one")
         if version not in (0, TURNS_VERSION):
             self.db.executescript("DROP TABLE IF EXISTS fts; DROP TABLE IF EXISTS turn;")
             self.db.executescript("DROP TABLE IF EXISTS file;")
@@ -1186,6 +1194,54 @@ def index_cmd() -> int:
         TurnIndex().update(discover())
     except (DBError, OSError) as e:
         return fail(f"cannot update {TURNS}: {e}")
+    return 0
+
+
+VERSIONS = ".museum"  # <machine>/.museum/<version>[+<commit>].json, from museum-sync
+
+
+def release(version: str) -> tuple[int, ...]:
+    """A version's numbers, for ordering: 0.10.0 after 0.9.1."""
+    return tuple(int(n) for n in re.findall(r"\d+", version.split("+")[0]))
+
+
+def fleet() -> int:
+    """Each machine folder's museum version, from the newest marker its syncs
+    left, and its newest session. A machine on an older release than the
+    newest any machine reports is behind."""
+    rows = []
+    newest: dict[str, float] = {}
+    for s in discover():
+        with contextlib.suppress(OSError):
+            newest[s.host] = max(newest.get(s.host, 0.0), Path(s.path).stat().st_mtime)
+    for host in sorted(p.name for p in Path().iterdir() if p.is_dir() and p.name[0] != "."):
+        marks = []
+        for mark in Path(host, VERSIONS).glob("*.json"):
+            with contextlib.suppress(OSError, ValueError):
+                doc = json.loads(mark.read_text())
+                if isinstance(doc, dict):
+                    marks.append((mark.stat().st_mtime, doc))
+        when, doc = max(marks, key=lambda m: m[0]) if marks else (0.0, {})
+        rows.append((host, str(doc.get("version") or ""), doc, when))
+    if not rows:
+        return fail("no machine folders in the store")
+    latest = max((release(v) for _, v, _, _ in rows if v), default=())
+
+    def day(t: float) -> str:
+        return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M") if t else "-"  # noqa: DTZ006
+
+    table: list[list[object]] = []
+    for host, version, doc, when in rows:
+        if not version:
+            label, note = "-", "no version reported (museum before 0.4.0)"
+        else:
+            label = version + (f"+{doc['commit']}" if doc.get("commit") else "")
+            label += f" ({doc.get('source', '?')})"
+            note = "behind" if release(version) < latest else ""
+        table.append([host, label, day(when), day(newest.get(host, 0.0)), note])
+    print_table(["machine", "museum", "since", "newest session", ""], table)
+    if any(row[4] for row in table):
+        print("\nupdate a machine: pi update npm:@mu-crew/museum (a checkout: git pull)")
     return 0
 
 
@@ -2203,6 +2259,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
         help="leave this session out (default: $PI_SESSION_ID, the one searching)",
     )
     sub.add_parser("index", help="bring the turn index up to date")
+    sub.add_parser("fleet", help="each machine's museum version and newest session")
     s = sub.add_parser("show", help="one session's conversation")
     s.add_argument("file")
     s.add_argument("term", nargs="?")
@@ -2302,8 +2359,8 @@ def forward(ns: argparse.Namespace) -> list[str]:
             words += ["--group-by", ns.group_by] if ns.group_by else []
             words += ["--sort", ns.sort, "--limit", str(ns.limit)]
         return [*words, "--", *([ns.project] if ns.project else [])]
-    if ns.cmd == "index":
-        return ["index"]
+    if ns.cmd in ("index", "fleet"):
+        return [ns.cmd]
     words = ["show", *(["--users"] if ns.users else [])]
     return [*words, "--", ns.file, *([ns.term] if ns.term else [])]
 
@@ -2333,6 +2390,8 @@ def main(argv: list[str]) -> int:
         code = calls_cmd(ns)
     elif ns.cmd == "index":
         code = index_cmd()
+    elif ns.cmd == "fleet":
+        code = fleet()
     else:
         code = show(ns.file, ns.term, ns.users)
     if DATES:

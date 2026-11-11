@@ -1,10 +1,26 @@
 {
-  "name": "museum",
-  "version": "0.3.0",
-  "private": true,
+  "name": "@mu-crew/museum",
+  "version": "0.4.0",
   "description": "Central, append-only backup of agent sessions from every machine, searchable by agents.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mu-crew/museum.git"
+  },
   "keywords": ["pi-package"],
+  "files": [
+    "bin/museum",
+    "bin/museum-sync",
+    "install.sh",
+    "pi",
+    "skills/museum/SKILL.md",
+    "skills/museum/scripts/museum-search",
+    "docs/design.md",
+    "README.md",
+    "CHANGELOG.md",
+    "RELEASING.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": ["./pi/museum.ts"],
     "skills": ["./skills"]

@@ -6,6 +6,9 @@
 #   museum sync [ARGS]     museum-sync, in the foreground (--now, --if-due)
 #   museum timer install   run `museum tick` every 5 minutes (launchd or systemd)
 #   museum timer remove    stop and remove that timer
+#   museum setup [STORE [MACHINE]]  install.sh: config, skill links, PATH, timer
+#   museum fleet           every machine's museum version, from the store
+#   museum version         this museum's version and where it runs from
 #
 # Harness hooks may run in a sandbox that refuses rsync and ssh, so they only
 # leave stamps, and `tick` starts the sync from outside every sandbox: a tmux
@@ -217,8 +220,11 @@ timer_remove() {
   esac
 }
 
+# The museum folder: a checkout, or pi's copy of the npm package.
+root() { dirname "$(dirname "$(self)")"; }
+
 usage() {
-  sed -n '4,8s/^# \{0,1\}//p' "$(self)" >&2
+  sed -n '4,11s/^# \{0,1\}//p' "$(self)" >&2
   exit 2
 }
 
@@ -232,6 +238,12 @@ case ${1-} in
     shift
     exec "$(sync_path)" "$@"
     ;;
+  setup)
+    shift
+    exec "$(root)/install.sh" "$@"
+    ;;
+  fleet) exec python3 "$(root)/skills/museum/scripts/museum-search" fleet ;;
+  version) exec "$(sync_path)" --version ;;
   timer)
     case ${2-} in
       install) timer_install ;;

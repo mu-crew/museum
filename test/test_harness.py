@@ -237,7 +237,8 @@ class Store(Harness):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.state_field("status"), "ok")
         self.assertEqual(
-            sorted(p.name for p in self.box.iterdir()), ["claude", "codex", "cursor-agent"]
+            sorted(p.name for p in self.box.iterdir()),
+            [".museum", "claude", "codex", "cursor-agent"],
         )
 
     def test_meta_record_reaches_the_store(self) -> None:

@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, TextIO
 
 HOME = Path.home()
+ROOT = Path(__file__).resolve().parent.parent  # the museum folder: a checkout or the npm package
 # Exit status of copy() when ssh_mux_only is set and no master is running.
 NO_MASTER = 90
 # rsync's "some files vanished before they could be transferred": fine here.
@@ -363,7 +364,7 @@ def copy(s: Settings, rsync: str) -> Result:
     sources, meta = [f"{s.src}/"], []
     if stage.is_dir():
         sources = [*([f"{s.src}/"] if s.src.is_dir() else []), f"{stage}/"]
-        meta = ["--include=/*/meta/*.json"]
+        meta = ["--include=/*/meta/*.json", f"--include=/{VERSIONS}/*.json"]
     r = run(
         [
             rsync,
@@ -904,6 +905,10 @@ def sync_once(s: Settings, rsync: str | None) -> bool:
         stage(s.state, s.sources, hook_dir())
     except Exception as e:  # noqa: BLE001 (pi's backup comes first)
         print(f"museum: filter: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
+        mark_version(s.state, s.config.machine)
+    except OSError as e:
+        print(f"museum: version marker: {e}", file=sys.stderr)
     r = copy(s, rsync)
     # One retry, for a blip, only in mux-only mode with a live master: there it
     # costs no human step. A fresh connection may need a key touch, and a
@@ -920,7 +925,7 @@ def sync_once(s: Settings, rsync: str | None) -> bool:
     return False
 
 
-SEARCH = Path(__file__).resolve().parent.parent / "skills/museum/scripts/museum-search"
+SEARCH = ROOT / "skills/museum/scripts/museum-search"
 
 
 def index(s: Settings) -> None:
@@ -933,6 +938,50 @@ def index(s: Settings) -> None:
     r = run([sys.executable, str(SEARCH), "--store", s.config.path, "index"])
     if r.code != 0:
         print(f"museum: index: {r.output.strip()}", file=sys.stderr)
+
+
+# --- the version: what this machine runs, reported through the store ---
+#
+# Each sync leaves <store>/<machine>/.museum/<version>[+<commit>].json, so
+# `museum fleet` can list what every machine runs from the one place they all
+# write to. One file per version, never rewritten: the copy is --append-verify,
+# which would never update a file whose length stayed the same. rsync keeps the
+# file's mtime, the time this machine first synced with that version.
+
+VERSIONS = ".museum"
+
+
+def version_info() -> dict[str, str]:
+    """This museum's version (package.json), and its commit when it runs from
+    a git checkout. source: npm (pi's npm package), checkout, or copy."""
+    try:
+        version = str(json.loads((ROOT / "package.json").read_text())["version"])
+    except (OSError, ValueError, KeyError, TypeError):
+        version = "unknown"
+    info = {"version": version, "source": "copy", "commit": ""}
+    if "node_modules" in ROOT.parts:
+        info["source"] = "npm"
+    elif (ROOT / ".git").exists():
+        info["source"] = "checkout"
+        r = run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"])
+        if r.code == 0:
+            info["commit"] = r.output.strip()
+    return info
+
+
+def version_label(info: dict[str, str]) -> str:
+    return info["version"] + (f"+{info['commit']}" if info["commit"] else "")
+
+
+def mark_version(state: Path, machine: str) -> None:
+    """The version marker for the next copy, in the staged folder it rides."""
+    info = version_info()
+    out = state / STAGE / VERSIONS / f"{version_label(info)}.json"
+    if out.exists():
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc = {**info, "machine": machine, "root": str(ROOT)}
+    write(out, json.dumps(doc, sort_keys=True) + "\n")
 
 
 def due(s: Settings, if_due: bool) -> bool:
@@ -963,6 +1012,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="sync now; if a sync is running, it runs again after (the default)",
     )
+    mode.add_argument("--version", action="store_true", help="print the museum version")
     mode.add_argument(
         "--hook",
         metavar="HARNESS",
@@ -973,6 +1023,10 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     ns = parse(argv)
+    if ns.version:
+        info = version_info()
+        print(f"museum {version_label(info)} ({info['source']}: {ROOT})")
+        return 0
     if ns.hook:
         return hook(ns.hook, sys.stdin)
     if_due = ns.if_due
