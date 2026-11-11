@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ def write_session(root: Path, rel: str, entries: list[dict[str, Any]], torn: boo
 
 class Store(unittest.TestCase):
     rg: bool = True
+    index: bool = True
 
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
@@ -128,6 +130,9 @@ class Store(unittest.TestCase):
             # A PATH with python3 but no rg exercises the pure-Python scan.
             env["PATH"] = str(Path(sys.executable).parent)
         env["PI_SESSION_ID"] = SELF
+        env.pop("MUSEUM_NO_INDEX", None)
+        if not self.index:
+            env["MUSEUM_NO_INDEX"] = "1"
         return subprocess.run(
             [sys.executable, str(SCRIPTS / "museum-search"), "--store", str(self.dir), *args],
             capture_output=True,
@@ -206,6 +211,100 @@ class Store(unittest.TestCase):
         r = self.run_search("find", "x", "nosuchproject")
         self.assertEqual(r.returncode, 1)
         self.assertIn("no store folder matches", r.stderr)
+
+    def test_find_sees_turns_appended_since_the_last_search(self) -> None:
+        rel = f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl"
+        self.assertIn("no session mentions", self.run_search("find", "quokka").stdout)
+        with (self.dir / rel).open("a") as f:
+            f.write(json.dumps(msg("user", "and the quokka?")) + "\n")
+        self.assertEqual(self.files(self.run_search("find", "quokka").stdout), [rel])
+
+    def test_find_forgets_a_replaced_file(self) -> None:
+        rel = f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl"
+        path = self.dir / rel
+        self.assertIn(rel, self.run_search("find", "hey.com").stdout)
+        # The same size, so only the head hash tells it from the old file.
+        before = path.read_text()
+        path.write_text(before.replace("hey.com", "wombatx"))
+        self.assertEqual(len(path.read_text()), len(before))
+        self.assertIn("no session mentions", self.run_search("find", "hey.com").stdout)
+        # Larger, and different from the first line on.
+        write_session(self.dir, rel, [msg("user", "a different start, much longer " * 9)])
+        self.assertIn("no session mentions", self.run_search("find", "wombatx").stdout)
+
+    def test_find_rereads_a_changed_claude_session(self) -> None:
+        rel = "pc/claude/-home-u-proj/11111111-2222-3333-4444-555555555555.jsonl"
+
+        def turn(mid: str, words: str) -> dict[str, Any]:
+            content = [{"type": "text", "text": words}]
+            message = {"id": mid, "role": "assistant", "content": content}
+            return {"type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "message": message}
+
+        # A first line over HEAD bytes, so a grown file keeps its head hash.
+        first = turn("m1", "about the numbat " + "x" * search.HEAD)
+        write_session(self.dir, rel, [first])
+        self.assertIn(rel, self.run_search("find", "numbat").stdout)
+        # Grown, but read again whole: claude's lines are merged into turns.
+        write_session(self.dir, rel, [first, turn("m2", "the bilby")])
+        self.assertIn("1 sessions in conversation", self.run_search("find", "bilby").stdout)
+        if self.index:  # from the index, not from the scan of the tool tier
+            self.assertEqual(self.indexed_turns("bilby"), 1)
+            self.assertEqual(self.indexed_turns("numbat"), 1)  # not added twice
+        # claude's staged copy is filtered again from scratch: not an append.
+        write_session(self.dir, rel, [turn("m1", "about the quoll")])
+        self.assertIn("no session mentions", self.run_search("find", "numbat").stdout)
+
+    def test_index_prunes_deleted_files_but_not_outside_a_project(self) -> None:
+        if not self.index:
+            self.skipTest("no index")
+        self.run_search("find", "stalwart")
+        indexed = self.indexed()
+        self.run_search("find", "stalwart", "notes")  # narrowed: prunes nothing
+        self.assertEqual(self.indexed(), indexed)
+        (self.dir / f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl").unlink()
+        self.run_search("index")
+        self.assertEqual(self.indexed(), indexed - 1)
+
+    def test_find_reads_the_files_when_the_index_is_unusable(self) -> None:
+        tally = '"stalwart": 3 sessions in conversation, 1 only in tool output.'
+        db = self.dir / search.TURNS
+        db.write_text("not a database")
+        self.assertIn(tally, self.run_search("find", "stalwart").stdout)
+        db.unlink()
+        if not self.rg:
+            return  # the scan without rg stops at an unreadable file too
+        # A session the index cannot read fails its update, not the search.
+        notes = self.dir / "mac/--Users-u-notes--/2026-07-01T00-00-00-000Z_d.jsonl"
+        notes.chmod(0)
+        self.addCleanup(notes.chmod, 0o644)
+        self.assertIn(tally, self.run_search("find", "stalwart").stdout)
+
+    def indexed_turns(self, term: str) -> int:
+        db = sqlite3.connect(self.dir / search.TURNS)
+        try:
+            sql = "SELECT count(*) FROM fts WHERE fts MATCH ?"
+            return db.execute(sql, (f'"{term}"',)).fetchone()[0]
+        finally:
+            db.close()
+
+    def indexed(self) -> int:
+        db = sqlite3.connect(self.dir / search.TURNS)
+        try:
+            return db.execute("SELECT count(*) FROM file").fetchone()[0]
+        finally:
+            db.close()
+
+    def test_find_skips_the_tool_tier_when_conversation_fills_the_listing(self) -> None:
+        out = self.run_search("find", "stalwart", "--limit", "1").stdout
+        tally = "tool output not searched" if self.index else "1 only in tool output"
+        self.assertIn(f'"stalwart": 3 sessions in conversation, {tally}.', out)
+
+    def test_index_command_builds_what_find_reads(self) -> None:
+        r = self.run_search("index")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        self.assertEqual((self.dir / search.TURNS).exists(), self.index)
+        if self.index:
+            self.assertEqual(self.indexed_turns("stalwart"), 4)  # a, b, c and SELF
 
     def test_show_window(self) -> None:
         r = self.run_search("show", f"pc/{HAIL}/2026-05-22T16-32-24-344Z_a.jsonl", "rust it")
@@ -291,7 +390,12 @@ class StoreWithoutRg(Store):
     rg = False
 
 
-del Store  # only the two concrete variants run
+@unittest.skipUnless(shutil.which("rg"), "rg not installed")
+class StoreWithoutIndex(Store):
+    index = False
+
+
+del Store  # only the concrete variants run
 
 
 class Units(unittest.TestCase):
@@ -324,6 +428,7 @@ class Units(unittest.TestCase):
         self.assertIn("--newest", search.forward(ns))
         words = search.forward(search.parse(["show", "f", "--users"]))
         self.assertEqual(words, ["show", "--users", "--", "f"])
+        self.assertEqual(search.forward(search.parse(["index"])), ["index"])
 
     def test_forward_puts_dashed_positionals_after_double_dash(self) -> None:
         """claude's and codex's project folders start with -: -home reads as -h."""

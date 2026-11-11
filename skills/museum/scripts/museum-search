@@ -14,6 +14,9 @@
                                                   wait time by role, and a trend
   museum-search calls [PROJECT] [FILTERS] [--group-by session|agent|workstream|role]
                                                   the tool calls behind stats
+  museum-search index                             bring the turn index up to date;
+                                                  museum-sync runs it after each
+                                                  sync to a local store
   museum-search --remote-command ...              print the command that runs the
                                                   search on the store host, for a
                                                   transport like mule
@@ -53,6 +56,10 @@ the decisions and worker sessions carry them out. Then the sessions that discuss
 TERM in the most turns come first, because the session that debated a topic
 outranks a newer one that mentions it in passing; --newest orders by date.
 The session running the search ($PI_SESSION_ID, sent as --skip) is left out too.
+`find` reads user and assistant text from .museum-turns.sqlite, an FTS5 index
+at the store's root that each search brings up to date, and reads the files only
+for the tool tier, when conversation matches leave room in the listing.
+MUSEUM_NO_INDEX=1 reads the files for everything.
 
 For an ssh store the script runs on the store host: ssh starts `python3 -` there
 and this file arrives on stdin, so the store host needs python3 and nothing from
@@ -63,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -71,11 +79,20 @@ import shutil
 import statistics
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, NamedTuple
+
+try:
+    import sqlite3
+
+    DBError: type[Exception] = sqlite3.Error
+except ImportError:  # a Python built without it: find reads the files
+    sqlite3 = None
+    DBError = OSError
 
 MU_WORKSPACE = "-mu-workspaces-"
 SNIPPET = 100  # characters of context either side of a match
@@ -897,9 +914,12 @@ def counts(lines: list[str]) -> dict[str, int]:
     return out
 
 
-def matching_files(sessions: dict[str, Session], dirs: list[str], term: str) -> dict[str, Match]:
+def matching_files(
+    sessions: dict[str, Session], dirs: list[str], term: str, turns: bool = True
+) -> dict[str, Match]:
     """Store-relative paths of the sessions that mention TERM outside the
-    system prompt, each with its best tier and weight."""
+    system prompt, each with its best tier and weight. Without turns, the
+    pi sessions are not told apart further: all are TOOL."""
     if not shutil.which("rg"):
         found = {}
         for path, s in sessions.items():
@@ -933,6 +953,8 @@ def matching_files(sessions: dict[str, Session], dirs: list[str], term: str) -> 
     for p, n in mentions.items():
         if sessions[p].harness == "pi" and system.get(p, 0) < n:
             found[p] = Match(TOOL, 0)
+    if not turns:
+        return found
     # Lines that may be a turn saying TERM. The regex cannot tell a turn's text
     # from its thinking or tool calls, so Python confirms until one passes.
     turn = rf'"message":\{{"role":"(user|assistant)".*{lit}'
@@ -945,6 +967,226 @@ def matching_files(sessions: dict[str, Session], dirs: list[str], term: str) -> 
         said_it = m.tier == CONVERSATION or said(line, term)
         found[path] = Match(CONVERSATION if said_it else TOOL, m.turns + 1)
     return found
+
+
+# --- the turn index: conversation text, searchable without reading the store ---
+#
+# User and assistant text is under 2% of the store's bytes; tool output,
+# thinking and tool calls are the rest. TURNS holds that text, one row per
+# turn, in an SQLite FTS5 table with the trigram tokenizer, which matches any
+# substring of 3 or more characters: the same literal, lowercased match as the
+# scan. Session files only grow, so a pi file is read on from where the index
+# stopped; a claude, codex or cursor-agent file is merged as a whole, so it is
+# read again when it changes. The index sits beside INDEX at the store's root
+# and can be deleted at any time: the next search rebuilds it. Without FTS5's
+# trigram tokenizer (SQLite before 3.34), or a store the search cannot write,
+# find reads the files as before.
+
+TURNS = ".museum-turns.sqlite"
+TURNS_VERSION = 1
+MIN_TERM = 3  # the trigram tokenizer cannot match a shorter term
+HEAD = 4096  # bytes hashed to notice a file replaced rather than grown
+TURN_ROLES = ('"user"', '"assistant"')  # cheap test before parsing a line
+
+
+class TurnIndex:
+    def __init__(self, path: str = TURNS) -> None:
+        assert sqlite3 is not None
+        self.db = sqlite3.connect(path, timeout=30, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, TURNS_VERSION):
+            self.db.executescript("DROP TABLE IF EXISTS fts; DROP TABLE IF EXISTS turn;")
+            self.db.executescript("DROP TABLE IF EXISTS file;")
+        self.db.executescript(
+            f"""
+            CREATE TABLE IF NOT EXISTS file(
+                id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+                size INTEGER, mtime INTEGER, head TEXT, offset INTEGER);
+            CREATE TABLE IF NOT EXISTS turn(
+                id INTEGER PRIMARY KEY, file INTEGER NOT NULL, body TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS turn_file ON turn(file);
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
+                body, content='turn', content_rowid='id',
+                tokenize='trigram case_sensitive 1');
+            PRAGMA user_version={TURNS_VERSION};
+            """
+        )
+
+    @staticmethod
+    def open() -> TurnIndex | None:
+        """The store's index, or None where it cannot be used."""
+        if sqlite3 is None or os.environ.get("MUSEUM_NO_INDEX"):
+            return None
+        try:
+            return TurnIndex()
+        except DBError:  # no FTS5 trigram tokenizer, a read-only store
+            return None
+
+    def update(self, sessions: Iterable[Session], prune: bool = True) -> None:
+        """Bring every session's rows up to date with its file; with prune,
+        drop the rows of files no longer among SESSIONS. A search narrowed
+        to a PROJECT passes only its own sessions, so it must not prune.
+
+        Two updates can run at once (a find and museum-sync's index): each
+        write transaction is IMMEDIATE, and a file's row is read again inside
+        it before the file is read on from its offset, so no turn is added
+        twice."""
+        known = {
+            path: (fid, size, mtime, head, offset)
+            for fid, path, size, mtime, head, offset in self.db.execute(
+                "SELECT id, path, size, mtime, head, offset FROM file"
+            )
+        }
+        seen, started, dirty, told = set(), time.monotonic(), 0, False
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for s in sessions:
+                seen.add(s.path)
+                try:
+                    st = Path(s.path).stat()
+                except OSError:
+                    continue
+                if self.current(known.get(s.path), st):
+                    continue
+                row = self.row(s.path)  # another update may have written it
+                if self.current(row, st):
+                    continue
+                dirty += self.refresh(s, st, row)
+                if dirty > 64 << 20:  # keep a long first build's progress
+                    self.db.execute("COMMIT")
+                    self.db.execute("BEGIN IMMEDIATE")
+                    dirty = 0
+                    if not told and time.monotonic() - started > 2:
+                        told = True
+                        print(
+                            "museum-search: indexing the store, once (about a minute per 4 GB)...",
+                            file=sys.stderr,
+                        )
+            for path in known.keys() - seen if prune else ():
+                self.forget(known[path][0])
+                self.db.execute("DELETE FROM file WHERE id = ?", (known[path][0],))
+            self.db.execute("COMMIT")
+        except BaseException:
+            # A failed COMMIT may have rolled back already: a second
+            # rollback would raise and hide why (Ctrl-C, a full disk).
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def current(row: tuple | None, st: os.stat_result) -> bool:
+        return row is not None and row[1] == st.st_size and row[2] == st.st_mtime_ns
+
+    def row(self, path: str) -> tuple | None:
+        return self.db.execute(
+            "SELECT id, size, mtime, head, offset FROM file WHERE path = ?", (path,)
+        ).fetchone()
+
+    def forget(self, fid: int) -> None:
+        self.db.execute(
+            "INSERT INTO fts(fts, rowid, body) SELECT 'delete', id, body FROM turn WHERE file = ?",
+            (fid,),
+        )
+        self.db.execute("DELETE FROM turn WHERE file = ?", (fid,))
+
+    def refresh(self, s: Session, st: os.stat_result, row: tuple | None) -> int:
+        """Index what is new in one session file; the bytes read."""
+        with Path(s.path).open("rb") as f:
+            head = hashlib.sha1(f.read(HEAD)).hexdigest()
+            if row is None:
+                cur = self.db.execute("INSERT INTO file(path, offset) VALUES (?, 0)", (s.path,))
+                fid = int(cur.lastrowid or 0)
+                offset = 0
+            else:
+                fid, _, _, old_head, offset = row
+                grown = s.harness == "pi" and old_head == head and st.st_size >= offset
+                if not grown:
+                    self.forget(fid)
+                    offset = 0
+            if s.harness == "pi":
+                f.seek(offset)
+                bodies, end = [], offset
+                for raw in f:
+                    if not raw.endswith(b"\n"):
+                        break  # torn: read again once complete
+                    end += len(raw)
+                    line = raw.decode("utf-8", errors="replace")
+                    if not any(r in line for r in TURN_ROLES):
+                        continue
+                    entry = loads(line)
+                    body = text(entry) if isinstance(entry, dict) else None
+                    if body:
+                        bodies.append(body.lower())
+            else:
+                end = st.st_size
+                bodies = [b.lower() for e in stream(s) if (b := text(e))]
+        self.add(fid, bodies)
+        self.db.execute(
+            "UPDATE file SET size = ?, mtime = ?, head = ?, offset = ? WHERE id = ?",
+            (st.st_size, st.st_mtime_ns, head, end, fid),
+        )
+        return end - offset
+
+    def add(self, fid: int, bodies: list[str]) -> None:
+        for body in bodies:
+            tid = self.db.execute(
+                "INSERT INTO turn(file, body) VALUES (?, ?)", (fid, body)
+            ).lastrowid
+            self.db.execute("INSERT INTO fts(rowid, body) VALUES (?, ?)", (tid, body))
+
+    def turns(self, term: str) -> dict[str, int]:
+        """Each indexed session whose user or assistant text says TERM, with
+        how many turns do."""
+        phrase = '"' + term.lower().replace('"', '""') + '"'
+        rows = self.db.execute(
+            """SELECT file.path, count(*) FROM fts
+               JOIN turn ON turn.id = fts.rowid JOIN file ON file.id = turn.file
+               WHERE fts MATCH ? GROUP BY file.path""",
+            (phrase,),
+        )
+        return dict(rows)
+
+
+def indexed_files(
+    sessions: dict[str, Session], dirs: list[str], term: str, limit: int
+) -> tuple[dict[str, Match], bool] | None:
+    """matching_files through the turn index: the conversation tier from the
+    index, and the tool tier from the files only when the conversation tier
+    leaves room in the listing. The flag says whether
+    the tool tier was searched. None when the index cannot answer."""
+    if len(term) < MIN_TERM:
+        return None
+    idx = TurnIndex.open()
+    if idx is None:
+        return None
+    try:
+        idx.update(sessions.values(), prune=dirs == ["."])
+        talk = {p: Match(CONVERSATION, n) for p, n in idx.turns(term).items() if p in sessions}
+    except (DBError, OSError):  # locked, corrupt or full: read the files
+        return None
+    if len(talk) > limit:  # one more: the searching session may be skipped
+        return talk, False
+    rest = {p: s for p, s in sessions.items() if p not in talk}
+    # The index is up to date, so the files only tell the tool tier from the
+    # system prompt: no pi line needs reading as a turn.
+    found = matching_files(rest, dirs, term, turns=False)
+    return {**found, **talk}, True
+
+
+def index_cmd() -> int:
+    """`find`'s index update, on its own: museum-sync runs it after copying to
+    a local store, so a search finds the index current."""
+    if sqlite3 is None:
+        return fail("this Python has no sqlite3: find reads the files")
+    if os.environ.get("MUSEUM_NO_INDEX"):
+        return 0
+    try:
+        TurnIndex().update(discover())
+    except (DBError, OSError) as e:
+        return fail(f"cannot update {TURNS}: {e}")
+    return 0
 
 
 def sessions_in(sessions: dict[str, Session], folder: str) -> str:
@@ -1100,7 +1342,8 @@ def find(term: str, project: str | None, limit: int, skip: str, newest: bool) ->
             return fail(f"no store folder matches *{project}*")
     else:
         dirs = ["."]
-    found = matching_files(sessions, dirs, term)
+    got = indexed_files(sessions, dirs, term, limit)
+    found, searched = got if got is not None else (matching_files(sessions, dirs, term), True)
     matches = {s: m for p, m in found.items() if (s := sessions[p]).id() != skip}
 
     def key(s: Session) -> tuple[bool, int, str, str]:
@@ -1114,8 +1357,9 @@ def find(term: str, project: str | None, limit: int, skip: str, newest: bool) ->
         return 0
     shown = ranked[:limit]
     order = "newest" if newest else "most turns"
+    tally = f"{len(tools)} only in tool output" if searched else "tool output not searched"
     print(
-        f'"{term}": {len(talk)} sessions in conversation, {len(tools)} only in tool output. '
+        f'"{term}": {len(talk)} sessions in conversation, {tally}. '
         f"Showing {len(shown)}: conversation first, project folders before mu workspaces, "
         f"{order} first."
     )
@@ -1958,6 +2202,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
         default=os.environ.get("PI_SESSION_ID", ""),
         help="leave this session out (default: $PI_SESSION_ID, the one searching)",
     )
+    sub.add_parser("index", help="bring the turn index up to date")
     s = sub.add_parser("show", help="one session's conversation")
     s.add_argument("file")
     s.add_argument("term", nargs="?")
@@ -2057,6 +2302,8 @@ def forward(ns: argparse.Namespace) -> list[str]:
             words += ["--group-by", ns.group_by] if ns.group_by else []
             words += ["--sort", ns.sort, "--limit", str(ns.limit)]
         return [*words, "--", *([ns.project] if ns.project else [])]
+    if ns.cmd == "index":
+        return ["index"]
     words = ["show", *(["--users"] if ns.users else [])]
     return [*words, "--", ns.file, *([ns.term] if ns.term else [])]
 
@@ -2084,6 +2331,8 @@ def main(argv: list[str]) -> int:
         code = stats(ns)
     elif ns.cmd == "calls":
         code = calls_cmd(ns)
+    elif ns.cmd == "index":
+        code = index_cmd()
     else:
         code = show(ns.file, ns.term, ns.users)
     if DATES:

@@ -920,6 +920,21 @@ def sync_once(s: Settings, rsync: str | None) -> bool:
     return False
 
 
+SEARCH = Path(__file__).resolve().parent.parent / "skills/museum/scripts/museum-search"
+
+
+def index(s: Settings) -> None:
+    """Bring a local store's turn index up to date, so the next search finds
+    it current. An ssh store's index is updated by the store host's own sync,
+    or by the next search there. A failure costs only a slower search, so it
+    goes to stderr, not the footer."""
+    if s.config.host or not SEARCH.is_file():
+        return
+    r = run([sys.executable, str(SEARCH), "--store", s.config.path, "index"])
+    if r.code != 0:
+        print(f"museum: index: {r.output.strip()}", file=sys.stderr)
+
+
 def due(s: Settings, if_due: bool) -> bool:
     if (s.state / "pending").exists():
         return True
@@ -978,7 +993,7 @@ def main(argv: list[str]) -> int:
         (s.state / "pending").touch()
     rsync = find_rsync(s.config.rsync_path)
     fd = os.open(s.state / "lock", os.O_WRONLY | os.O_CREAT, 0o644)
-    ok = True
+    ok, synced = True, False
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -987,8 +1002,14 @@ def main(argv: list[str]) -> int:
         # The interval gates only the first round: a sync this caller just ran
         # is not a reason to run again, only a `pending` mark is.
         while due(s, if_due):
-            ok = sync_once(s, rsync) and ok
+            done = sync_once(s, rsync)
+            ok, synced = ok and done, synced or done
             if_due = False
+        # Under the lock, so one sync at a time writes the index. A flush
+        # that arrives meanwhile leaves `pending`, and the loop below syncs it.
+        if synced:
+            index(s)
+            synced = False
         fcntl.flock(fd, fcntl.LOCK_UN)
         # A --now caller may have set `pending` after our last check but before
         # the unlock, then found the lock taken and left. Take it back and sync

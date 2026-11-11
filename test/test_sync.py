@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -121,6 +122,24 @@ class LocalStore(Sandbox):
         copied = self.store / "box" / "--proj--"
         self.assertTrue((copied / "s2.jsonl").exists())
         self.assertEqual((copied / "s1.jsonl").read_text(), '{"a":1}\n{"b":2}\n')
+
+    def test_updates_a_local_store_turn_index(self) -> None:
+        turn = {"type": "message", "message": {"role": "user", "content": "the quokka plan"}}
+        (self.src / "--proj--" / "s1.jsonl").write_text(json.dumps(turn) + "\n")
+        r = self.run_sync()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        db = sqlite3.connect(self.store / ".museum-turns.sqlite")
+        self.assertEqual(db.execute("SELECT body FROM turn").fetchall(), [("the quokka plan",)])
+
+    def test_no_index_when_told_not_to(self) -> None:
+        self.assertEqual(self.run_sync(MUSEUM_NO_INDEX="1").returncode, 0)
+        self.assertFalse((self.store / ".museum-turns.sqlite").exists())
+
+    def test_no_index_after_a_failed_sync(self) -> None:
+        self.store.chmod(0o500)
+        self.addCleanup(self.store.chmod, 0o700)
+        self.assertEqual(self.run_sync().returncode, 1)
+        self.assertFalse((self.store / ".museum-turns.sqlite").exists())
 
     def test_if_due_skips_a_recent_sync(self) -> None:
         self.run_sync()
