@@ -18,60 +18,46 @@ ssh to the store host for an ssh store. The store host needs rsync and any
 `python3`; `rg` there makes search faster.
 
 ```sh
-pi install npm:@mu-crew/museum
-~/.pi/agent/npm/node_modules/@mu-crew/museum/install.sh devbox:/data/museum
+npm i -g @mu-crew/museum
+museum init devbox:/data/museum
 ```
 
 The argument is the store: `host:/path` over ssh, or `/path` for a local
 store (use that on the store host itself). A second argument names this
 machine's folder in the store; it defaults to `hostname -s`.
 
-`install.sh` writes `~/.config/museum/config.toml`, links `museum` into
-`~/.local/bin` and the skill into each harness's skills folder (claude, codex,
-cursor), runs the first sync, and installs a timer (launchd or systemd) that
-syncs every 5 minutes. pi itself loads the extension, which syncs as agents
-work and shows `museum: backup failing: …` in the footer when a sync fails.
-Run `museum setup` to redo these steps later.
+`museum init` writes `~/.config/museum/config.toml`, adds `museum hook
+<harness>` to the session start and end hooks of Claude Code, Codex,
+cursor-agent and Muse Code where each is set up (`--hooks LIST|all` for
+others, `--no-hooks` for none), links the skill into each harness, installs
+the pi package (`npm:@mu-crew/museum`: an extension that syncs as agents work
+and shows `museum: backup failing: …` in pi's footer), runs the first sync
+and installs a timer (launchd or systemd) that syncs every 5 minutes. It
+touches only museum's own entries, and removes what older museum installs
+left behind. Muse Code's skill goes in by hand: `muse skills`.
 
-For Claude Code, Codex, cursor-agent and Muse Code, add `museum hook
-<harness>` to their session start and end hooks, so each session gets its mu
-identity and its final turn is synced. In `~/.claude/settings.json`:
+Optionally, `tmux set -ag status-right '#(museum tick)'` syncs from the
+status line too. On Linux, `loginctl enable-linger` keeps the timer running
+while you are logged out.
 
-```json
-{
-  "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "museum hook claude" }] }],
-    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "museum hook claude" }] }]
-  }
-}
-```
+**Update** with `npm update -g @mu-crew/museum`, then `museum init` again;
+`pi update --extensions` updates pi's copy. `museum status` shows what every
+machine runs.
 
-Codex: the same in `~/.codex/hooks.json` with `museum hook codex`.
-cursor-agent: `museum hook cursor-agent` on `sessionStart` and `sessionEnd` in
-`~/.cursor/hooks.json`. Muse Code: `museum hook muse`, and add the skill
-with `muse skills`. Optionally, `tmux set -ag status-right '#(museum tick)'`
-syncs from the status line too. On Linux, `loginctl enable-linger` keeps the
-timer running while you are logged out.
-
-**Update** with `pi update --extensions` (or `pi update
-npm:@mu-crew/museum`). Paths stay the same across updates; the
-[CHANGELOG](CHANGELOG.md) says when a release needs `museum setup` again.
-`museum fleet` shows what every machine runs.
-
-**Remove** with `museum timer remove` and `pi remove npm:@mu-crew/museum`,
-then delete `~/.local/bin/museum` and the `museum` links in the harnesses'
-skills folders. The store is never touched.
+**Remove** with `museum timer remove`, `pi remove npm:@mu-crew/museum` and
+`npm rm -g @mu-crew/museum`, then delete the `museum` entries from the
+harnesses' hooks and their skills folders. The store is never touched.
 
 **From a checkout**, for working on museum: `./install.sh STORE` in the clone
-makes pi load the checkout, so edits are live. Keep only one of the two;
-`install.sh` warns when pi loads both.
+runs its `museum init`, which links `~/.local/bin/museum` and registers the
+checkout with pi, so edits are live, in place of the npm package.
 
 ## Use
 
 Agents search with the `museum` skill. By hand:
 
 ```sh
-S=~/.pi/agent/npm/node_modules/@mu-crew/museum/skills/museum/scripts/museum-search
+S=$(npm root -g)/@mu-crew/museum/skills/museum/scripts/museum-search
 $S find stalwart hail          # sessions mentioning a term, in folders matching *hail*
 $S show FILE --users           # one session's arc: its user turns
 $S show FILE stalwart          # its turns about the term, with neighbours
@@ -80,8 +66,7 @@ $S calls hail --tool bash --min-secs 30    # the tool calls behind it
 
 museum sync       # sync now, and show any error
 museum version    # this machine's museum
-museum fleet      # every machine's museum version and newest session
-cat ~/.local/state/museum/state.json   # the last sync's result
+museum status     # this machine's last sync, and every machine's museum
 ```
 
 For an ssh store, `museum-search` runs on the store host in one ssh call.
@@ -104,7 +89,7 @@ For an ssh store, `museum-search` runs on the store host in one ssh call.
   `.museum-turns.sqlite`, an FTS5 index at the store's root that each search
   and each local sync keeps current; it is safe to delete.
 - **Versions.** Each sync leaves `<machine>/.museum/<version>.json`, which
-  `museum fleet` reads.
+  `museum status` reads.
 - **Compression** is left to the filesystem: put the store on btrfs with
   `compress-force=zstd:3`, which takes it to about a third.
 

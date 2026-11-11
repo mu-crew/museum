@@ -14,7 +14,7 @@
                                                   wait time by role, and a trend
   museum-search calls [PROJECT] [FILTERS] [--group-by session|agent|workstream|role]
                                                   the tool calls behind stats
-  museum-search fleet                             each machine's museum version, as
+  museum-search machines                          each machine's museum version, as
                                                   its syncs report it, and its newest
                                                   session
   museum-search index                             bring the turn index up to date;
@@ -1205,7 +1205,7 @@ def release(version: str) -> tuple[int, ...]:
     return tuple(int(n) for n in re.findall(r"\d+", version.split("+")[0]))
 
 
-def fleet() -> int:
+def machines() -> int:
     """Each machine folder's museum version, from the newest marker its syncs
     left, and its newest session. A machine on an older release than the
     newest any machine reports is behind."""
@@ -1241,7 +1241,7 @@ def fleet() -> int:
         table.append([host, label, day(when), day(newest.get(host, 0.0)), note])
     print_table(["machine", "museum", "since", "newest session", ""], table)
     if any(row[4] for row in table):
-        print("\nupdate a machine: pi update npm:@mu-crew/museum (a checkout: git pull)")
+        print("\nupdate a machine: npm update -g @mu-crew/museum && museum init")
     return 0
 
 
@@ -2171,7 +2171,7 @@ def load_config(path: Path) -> Config:
     try:
         doc = tomllib.loads(path.read_text())
     except FileNotFoundError:
-        raise ConfigError(f"missing {path}; run install.sh") from None
+        raise ConfigError(f"missing {path}; run museum init") from None
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise ConfigError(f"{path}: {e}") from None
 
@@ -2259,7 +2259,7 @@ def parse(argv: list[str]) -> argparse.Namespace:
         help="leave this session out (default: $PI_SESSION_ID, the one searching)",
     )
     sub.add_parser("index", help="bring the turn index up to date")
-    sub.add_parser("fleet", help="each machine's museum version and newest session")
+    sub.add_parser("machines", help="each machine's museum version and newest session")
     s = sub.add_parser("show", help="one session's conversation")
     s.add_argument("file")
     s.add_argument("term", nargs="?")
@@ -2359,7 +2359,7 @@ def forward(ns: argparse.Namespace) -> list[str]:
             words += ["--group-by", ns.group_by] if ns.group_by else []
             words += ["--sort", ns.sort, "--limit", str(ns.limit)]
         return [*words, "--", *([ns.project] if ns.project else [])]
-    if ns.cmd in ("index", "fleet"):
+    if ns.cmd in ("index", "machines"):
         return [ns.cmd]
     words = ["show", *(["--users"] if ns.users else [])]
     return [*words, "--", ns.file, *([ns.term] if ns.term else [])]
@@ -2390,8 +2390,8 @@ def main(argv: list[str]) -> int:
         code = calls_cmd(ns)
     elif ns.cmd == "index":
         code = index_cmd()
-    elif ns.cmd == "fleet":
-        code = fleet()
+    elif ns.cmd == "machines":
+        code = machines()
     else:
         code = show(ns.file, ns.term, ns.users)
     if DATES:

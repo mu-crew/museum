@@ -25,13 +25,15 @@
  * agent's sync recovered. The only label decided here is the one the script
  * cannot write: it did not start at all.
  *
- * Loaded from the museum repo as a pi package, so museum-sync resolves at
- * ../bin beside it; override with $MUSEUM_SYNC.
+ * The sync is the museum-sync beside the `museum` on PATH, the one `museum
+ * init` pointed the timer and the hooks at, so one copy does every sync on the
+ * node even when pi's package copy is another version. Without one on PATH,
+ * it is ../bin/museum-sync beside this file. $MUSEUM_SYNC overrides both.
  */
-import { spawn } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Declared, not imported, so the extension needs nothing installed beside it.
@@ -72,10 +74,47 @@ const STATE_DIR =
 // 126/127: the shell or env could not run it (no python3 on PATH, say).
 const NOT_RUN = new Set([126, 127]);
 
+/** What `museum sync-path` prints: the museum-sync that `museum` runs. */
+function askMuseum(museum: string): string | undefined {
+  try {
+    const r = spawnSync(museum, ["sync-path"], { encoding: "utf8", timeout: 3000 });
+    const sync = r.status === 0 ? r.stdout.trim() : "";
+    return sync && existsSync(sync) ? sync : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The museum-sync of the first `museum` on PATH: beside it, through its
+ * symlinks, or, for a version manager's shim (asdf, volta), whatever the shim
+ * runs says. undefined without a `museum` on PATH.
+ */
+export function besidePathMuseum(
+  path: string | undefined = process.env.PATH,
+  ask: (museum: string) => string | undefined = askMuseum,
+): string | undefined {
+  for (const dir of (path ?? "").split(delimiter)) {
+    const museum = dir && join(dir, "museum");
+    if (!museum || !existsSync(museum)) continue;
+    try {
+      const sync = join(dirname(realpathSync(museum)), "museum-sync");
+      if (existsSync(sync)) return sync;
+    } catch {
+      // unreadable: ask it
+    }
+    return ask(museum);
+  }
+  return undefined;
+}
+
+let resolved: string | undefined;
+
 function syncPath(): string {
   if (process.env.MUSEUM_SYNC) return process.env.MUSEUM_SYNC;
-  const here = dirname(realpathSync(fileURLToPath(import.meta.url)));
-  return join(here, "..", "bin", "museum-sync");
+  resolved ??=
+    besidePathMuseum() ?? join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..", "bin", "museum-sync");
+  return resolved;
 }
 
 function read(name: string): string | undefined {

@@ -5,6 +5,10 @@
   museum-sync [--now]         sync now; if a sync is already running, it runs again after
   museum-sync --hook HARNESS  a harness hook: SessionStart writes the meta record,
                               SessionEnd leaves the flush stamp for `museum tick`
+  museum-sync init [STORE [MACHINE]] [--hooks LIST|all] [--no-hooks]
+                              set this machine up (`museum init`): config, harness
+                              hooks and skills, PATH, the first sync, the timer
+  museum-sync status          this machine's last sync, then every machine's museum
 
 pi's sessions are copied as they are, to <store>/<machine>/<pi cwd folder>/. claude's
 and codex's go through a filter first (see stage()), to
@@ -38,6 +42,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import io
 import json
 import os
 import re
@@ -113,7 +118,7 @@ def load_config(path: Path) -> Config:
     try:
         doc = tomllib.loads(path.read_text())
     except FileNotFoundError:
-        raise ConfigError(f"missing {path}; run install.sh") from None
+        raise ConfigError(f"missing {path}; run museum init") from None
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise ConfigError(f"{path}: {e}") from None
 
@@ -190,7 +195,7 @@ RSYNC_EXAMPLE = '# rsync_path = "/opt/homebrew/bin/rsync"'
 
 def toml(c: Config) -> str:
     """A Config as config.toml, commented. JSON strings are valid TOML basic
-    strings. install.sh writes the same file from its own copy of TEMPLATE."""
+    strings. `museum init` and convert_legacy write it."""
 
     def q(s: str) -> str:
         return json.dumps(s, ensure_ascii=False)
@@ -943,7 +948,7 @@ def index(s: Settings) -> None:
 # --- the version: what this machine runs, reported through the store ---
 #
 # Each sync leaves <store>/<machine>/.museum/<version>[+<commit>].json, so
-# `museum fleet` can list what every machine runs from the one place they all
+# `museum status` can list what every machine runs from the one place they all
 # write to. One file per version, never rewritten: the copy is --append-verify,
 # which would never update a file whose length stayed the same. rsync keeps the
 # file's mtime, the time this machine first synced with that version.
@@ -996,6 +1001,463 @@ def due(s: Settings, if_due: bool) -> bool:
     return time.time() - last >= s.interval
 
 
+# --- init: set this machine up, as `mu init`, `murmur init` and `muzzle init` do ---
+#
+# Run again after an upgrade, or any time: every step leaves what is already
+# right alone. The harness config files are shared with mu, murmur, muzzle and
+# the user, so museum owns exactly the hook handlers whose command's first word
+# is `museum`, as murmur owns `murmur`'s, and the skill links that point at a
+# museum skill folder. A file it cannot read as the shape it expects is named
+# and left alone.
+
+# Each harness's config folder (its variable, else under $HOME), the file in
+# it, its shape and the events museum hooks. grouped: claude's
+# hooks.<Event>[].hooks[] (codex and Muse too); flat: cursor's hooks.<event>[]
+# beside a top-level version. As murmur's HOOK_TARGETS.
+HOOK_TARGETS: dict[str, tuple[str | None, str, str, str, tuple[str, ...]]] = {
+    "claude": (
+        "CLAUDE_CONFIG_DIR",
+        ".claude",
+        "settings.json",
+        "grouped",
+        ("SessionStart", "SessionEnd"),
+    ),
+    "codex": ("CODEX_HOME", ".codex", "hooks.json", "grouped", ("SessionStart", "SessionEnd")),
+    "cursor-agent": (None, ".cursor", "hooks.json", "flat", ("sessionStart", "sessionEnd")),
+    "muse": (None, ".config/muse", "settings.json", "grouped", ("SessionStart", "SessionEnd")),
+}
+# museum's handlers: `museum ...`, and a path to museum or museum-sync, which
+# older setups wrote by hand. Those are replaced by the one `museum hook`.
+OWNED = re.compile(r"""^(python3?\s+)?["']?(\S*/)?museum(-sync)?["']?(\s|$)""")
+
+
+class Unworkable(Exception):
+    pass
+
+
+def harness_dir(harness: str, env: Mapping[str, str]) -> Path:
+    var, home_dir, *_ = HOOK_TARGETS[harness]
+    moved = env.get(var) if var else None
+    return Path(moved).expanduser() if moved else Path.home() / home_dir
+
+
+def plan_hooks(harness: str, root: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    """Bring one parsed config in line with museum's entries, in place: per
+    hooked event, keep the first handler that is exactly `museum hook
+    <harness>` (with any field the user added; a missing `type` is set),
+    remove every other museum handler, and add one where none is left. The
+    events added, the handlers fixed, and the handlers removed."""
+    *_, shape, events = HOOK_TARGETS[harness]
+    hooks = root.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise Unworkable("its `hooks` is not an object")
+    command = f"museum hook {harness}"
+    kept: set[str] = set()
+    added: list[str] = []
+    fixed: list[str] = []
+    removed: list[str] = []
+    for event in list(hooks):
+        entries = hooks[event]
+        if not isinstance(entries, list):
+            if event in events:
+                raise Unworkable(f"its `hooks.{event}` is not a list")
+            continue
+        groups: list[tuple[dict[str, Any] | None, list[Any]]]
+        if shape == "flat":
+            groups = [(None, entries)]
+        else:
+            groups = [
+                (g, g["hooks"])
+                for g in entries
+                if isinstance(g, dict) and isinstance(g.get("hooks"), list)
+            ]
+        before_removed = len(removed)
+        for group, handlers in groups:
+            before = len(handlers)
+            for handler in list(handlers):
+                if not isinstance(handler, dict) or not OWNED.match(
+                    str(handler.get("command", "")).lstrip()
+                ):
+                    continue
+                matches_all = group is None or group.get("matcher") in (None, "", "*")
+                if (
+                    event in events
+                    and event not in kept
+                    and handler.get("command") == command
+                    and matches_all
+                    and (shape == "flat" or handler.get("type", "command") == "command")
+                ):
+                    kept.add(event)
+                    if shape == "grouped" and "type" not in handler:
+                        handler["type"] = "command"
+                        fixed.append(f"{event}: type")
+                    continue
+                handlers.remove(handler)
+                removed.append(f"{event}: {handler.get('command')}")
+            if group is not None and before and not handlers:
+                entries.remove(group)
+        if not entries and len(removed) > before_removed:
+            del hooks[event]
+    for event in events:
+        if event in kept:
+            continue
+        handler = (
+            {"command": command} if shape == "flat" else {"type": "command", "command": command}
+        )
+        hooks.setdefault(event, []).append(handler if shape == "flat" else {"hooks": [handler]})
+        added.append(event)
+    if added or fixed or removed:
+        root["hooks"] = hooks
+        if shape == "flat":
+            root.setdefault("version", 1)  # cursor reads no hook file without it
+    return added, fixed, removed
+
+
+def reject_constant(name: str) -> None:
+    raise ValueError(f"{name} is not JSON")
+
+
+def write_hooks(harness: str, path: Path) -> str:
+    """Plan one config file and write it if that changes anything: through a
+    symlink to its target, in one rename, re-read first so a change another
+    program made meanwhile is planned again, never overwritten. A line for
+    the report."""
+    for _ in range(3):
+        try:
+            text = path.read_text() if path.exists() else ""
+        except OSError as e:
+            raise Unworkable(f"cannot read it: {e}") from None
+        try:
+            root = json.loads(text, parse_constant=reject_constant) if text.strip() else {}
+        except ValueError as e:
+            raise Unworkable(f"it is not valid JSON: {e}") from None
+        if not isinstance(root, dict):
+            raise Unworkable("it is not a JSON object")
+        added, fixed, removed = plan_hooks(harness, root)
+        if not (added or fixed or removed):
+            return "unchanged"
+        real = path.resolve()
+        tmp = real.with_name(f".{real.name}.museum-{os.getpid()}.tmp")
+        try:
+            real.parent.mkdir(parents=True, exist_ok=True)
+            # Settings can hold secrets: a new file is owner-only from the start.
+            mode = real.stat().st_mode & 0o777 if real.exists() else 0o600
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(root, indent=2, ensure_ascii=False) + "\n")
+            os.chmod(tmp, mode)  # O_CREAT's mode passes through the umask  # noqa: PTH101
+            if (real.read_text() if real.exists() else "") != text:
+                continue
+            tmp.replace(real)
+        except OSError as e:
+            raise Unworkable(f"cannot write it: {e}") from None
+        finally:
+            tmp.unlink(missing_ok=True)
+        parts = [f"added {', '.join(added)}"] if added else []
+        parts += [f"fixed {', '.join(fixed)}"] if fixed else []
+        parts += [f"removed {', '.join(removed)}"] if removed else []
+        return "; ".join(parts)
+    raise Unworkable("another program kept changing it; run `museum init` again")
+
+
+def install_hooks(only: set[str] | None, env: Mapping[str, str]) -> None:
+    """museum's hook entries in each harness set up here, or in ONLY's."""
+    for harness, (_, _, name, _, _) in HOOK_TARGETS.items():
+        folder = harness_dir(harness, env)
+        path = folder / name
+        if only is not None and harness not in only:
+            continue
+        if only is None and not folder.is_dir() and not path.exists():
+            continue
+        try:
+            print(f"hooks {harness}: {write_hooks(harness, path)} ({path})")
+        except Unworkable as e:
+            print(f"museum: hooks {harness}: left {path} alone: {e}", file=sys.stderr)
+
+
+def link(dest: Path, target: Path, what: str) -> None:
+    """A symlink museum owns; a real file or folder there is not ours."""
+    if dest.exists() and not dest.is_symlink():
+        print(f"museum: left {dest} (not a symlink)", file=sys.stderr)
+        return
+    if dest.is_symlink() and dest.readlink() == target:
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.unlink(missing_ok=True)
+    dest.symlink_to(target)
+    print(f"linked {what}: {dest} -> {target}")
+
+
+def install_skills(env: Mapping[str, str]) -> None:
+    """The skill, linked into each harness that reads its own skills folder.
+    cursor-agent also reads ~/.claude/skills and ~/.codex/skills (literal home
+    paths), so it gets its own link only when neither holds the skill. pi
+    loads it from the pi package; Muse installs skills with `muse skills`."""
+    skill = ROOT / "skills" / "museum"
+    for harness in ("claude", "codex"):
+        folder = harness_dir(harness, env)
+        if folder.is_dir():
+            link(folder / "skills" / "museum", skill, f"{harness} skill")
+    cursor = Path.home() / ".cursor"
+    covered = any(
+        (Path.home() / d / "skills/museum/SKILL.md").is_file() for d in (".claude", ".codex")
+    )
+    if cursor.is_dir():
+        mine = cursor / "skills" / "museum"
+        if not covered:
+            link(mine, skill, "cursor-agent skill")
+        elif mine.is_symlink():
+            mine.unlink()
+            print(f"removed {mine}: cursor-agent reads the claude or codex copy")
+    # Older installs linked these into pi's discovery paths; with the package,
+    # pi would load museum twice. Never put the skill back in ~/.agents/skills.
+    # Before 0.2 the sync kept its bookkeeping in ~/.cache/museum.
+    cache = Path.home() / ".cache/museum"
+    if cache.is_dir() and {p.name for p in cache.iterdir()} <= {
+        "state",
+        "lock",
+        "last-start",
+        "pending",
+    }:
+        shutil.rmtree(cache)
+        print(f"removed {cache}: the sync's state moved to {state_dir()}")
+    for old in (
+        Path.home() / ".agents/skills/museum",
+        Path.home() / ".pi/agent/extensions/museum.ts",
+    ):
+        if old.is_symlink():
+            old.unlink()
+            print(f"removed old link {old}")
+
+
+def is_museum(folder: Path) -> bool:
+    """A museum folder: a checkout or a copy of the package."""
+    try:
+        name = json.loads((folder / "package.json").read_text()).get("name")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return name in ("museum", "@mu-crew/museum")
+
+
+def npm_install() -> bool:
+    """A copy of the npm package (npm's global one, or pi's), not a checkout."""
+    return ROOT.parts[-3:-1] == ("node_modules", "@mu-crew")
+
+
+def install_path() -> None:
+    """`museum` on PATH for tmux, harness hooks and you. npm's bin link
+    provides it for a global install; a checkout gets ~/.local/bin/museum.
+    A ~/.local/bin/museum link to another museum (a hand-made link to a
+    checkout, museum 0.4.0's into pi's copy) is an older install's: it goes,
+    or is pointed here, so it cannot shadow this one."""
+    mine = Path.home() / ".local/bin/museum"
+    want = ROOT / "bin" / "museum"
+    stale = mine.is_symlink() and mine.resolve() != want.resolve()
+    if stale and (is_museum(mine.resolve().parent.parent) or not mine.exists()):
+        mine.unlink()
+        print(f"removed {mine}: an older install's link")
+    if not npm_install():
+        link(mine, want, "museum")
+    found = shutil.which("museum")
+    if found is None:
+        # npm's bin folder for a global install: <prefix>/lib/node_modules/@mu-crew/museum.
+        bin_dir = ROOT.parents[3] / "bin" if npm_install() else want.parent
+        print(f"museum: `museum` is not on PATH; add {bin_dir}", file=sys.stderr)
+    elif Path(found).resolve() != want:
+        print(
+            f"museum: `museum` on PATH is {Path(found).resolve()}, not this one ({want})",
+            file=sys.stderr,
+        )
+
+
+NPM_SOURCE = "npm:@mu-crew/museum"
+
+
+def pi_packages() -> list[tuple[str, Path]]:
+    """`pi list`'s museum packages: (source, folder)."""
+    r = run(["pi", "list"])
+    out, source = [], ""
+    for line in r.output.splitlines() if r.code == 0 else []:
+        if line.startswith("    ") and source:
+            folder = Path(line.strip())
+            if is_museum(folder):
+                out.append((source, folder))
+        elif line.startswith("  ") and not line.startswith("   "):
+            source = line.strip()
+    return out
+
+
+def install_pi() -> None:
+    """pi's extension and skill, as one pi package of this install's kind: the
+    npm package for an npm install (pi keeps it current with `pi update`), the
+    checkout itself for a checkout, so its edits are live. Any other museum
+    package pi loads is an older install's, and is removed: two would load the
+    extension twice."""
+    if not shutil.which("pi"):
+        return
+    want = NPM_SOURCE if npm_install() else str(ROOT)
+    have = pi_packages()
+    for source, folder in have:
+        keep = source == NPM_SOURCE if npm_install() else folder.resolve() == ROOT.resolve()
+        if not keep:
+            r = run(["pi", "remove", source])
+            print(
+                f"removed pi package {source} ({folder}): an older install's"
+                if r.code == 0
+                else f"museum: pi remove {source} failed: {r.output.strip()}"
+            )
+    kept = [folder for source, folder in have if source == NPM_SOURCE] if npm_install() else []
+    if kept:
+        # pi's copy, behind this one: bring it up, so its extension matches.
+        try:
+            theirs = json.loads((kept[0] / "package.json").read_text()).get("version")
+        except (OSError, ValueError, AttributeError):
+            theirs = None
+        if theirs != version_info()["version"]:
+            r = run(["pi", "update", NPM_SOURCE])
+            print(
+                f"pi update {NPM_SOURCE} (was {theirs})"
+                if r.code == 0
+                else f"museum: pi update {NPM_SOURCE} failed: {r.output.strip()}"
+            )
+        return
+    r = run(["pi", "install", want])
+    print(
+        f"pi install {want}"
+        if r.code == 0
+        else f"museum: pi install {want} failed: {r.output.strip()}"
+    )
+
+
+def first_config(store: str | None, machine: str | None) -> Path:
+    """config.toml, written once from STORE [MACHINE]; later runs keep it."""
+    path = config_path()
+    if sys.version_info >= (3, 11):  # noqa: UP036 (see load_config)
+        convert_legacy(path)
+    if path.exists():
+        if store:
+            print(f"museum: kept {path}; edit it to change the store", file=sys.stderr)
+        return path
+    if not store:
+        raise ConfigError("first run needs the store: museum init host:/path (or /path)")
+    host, sep, folder = store.partition(":") if ":" in store else ("", "", store)
+    if sep and not host:
+        raise ConfigError(f"no host before the colon in {store}: host:/path, or /path")
+    if not folder.startswith("/"):
+        raise ConfigError(f"the store folder must be absolute: {folder}")
+    name = machine or socket.gethostname().split(".")[0]
+    if name in (".", "..") or any(ch.isspace() or ch < " " for ch in name):
+        raise ConfigError(f"the machine name is a plain folder name: {name!r}")
+    # A taken name means another machine, or an old install, owns that folder:
+    # naming it explicitly is the caller saying the reuse is intended, so only
+    # the default name is checked. A store host that cannot answer is not a
+    # free name.
+    if not machine:
+        if sep:
+            code = run([*SSH, host, f"test -d {shlex.quote(f'{folder}/{name}')}"]).code
+            if code not in (0, 1):
+                raise ConfigError(
+                    f"cannot reach {host} to check whether {name} is taken; fix ssh, "
+                    f"or name this machine: museum init {store} <name>"
+                )
+            taken = code == 0
+        else:
+            taken = Path(folder, name).is_dir()
+        if taken:
+            raise ConfigError(
+                f"{store}/{name} already exists: museum init {store} {name} if it is this "
+                f"machine's, else museum init {store} <unique-name>"
+            )
+    c = Config(name, host if sep else None, folder.rstrip("/") or "/", False, find_rsync())
+    # load_config's rules decide, so init never writes a config the sync rejects.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(toml(c))
+    try:
+        load_config(tmp)
+    except ConfigError as e:
+        tmp.unlink()
+        raise ConfigError(str(e).replace(str(tmp), "the config")) from None
+    if not sep:
+        # The sync never creates a local store folder, so a forgotten host
+        # fails; this is the one time it is created, on purpose.
+        Path(folder).mkdir(parents=True, exist_ok=True)
+    tmp.replace(path)
+    print(f"wrote {path}")
+    return path
+
+
+def line_buffered() -> None:
+    """stdout in order with stderr and child processes, when it is a pipe."""
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(line_buffering=True)
+
+
+def init(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="museum init", description="Set this machine up for museum.")
+    p.add_argument(
+        "store", nargs="?", help="first run: host:/path for an ssh store, /path for a local one"
+    )
+    p.add_argument(
+        "machine", nargs="?", help="this machine's folder in the store (default: hostname -s)"
+    )
+    hooks = p.add_mutually_exclusive_group()
+    hooks.add_argument(
+        "--hooks",
+        metavar="LIST",
+        help=f"write hook entries for these even when not set up yet ({', '.join(HOOK_TARGETS)}, all)",
+    )
+    hooks.add_argument(
+        "--no-hooks", action="store_true", help="leave every harness's hook config alone"
+    )
+    ns = p.parse_args(argv)
+    line_buffered()
+    only = None
+    if ns.hooks:
+        only = set(HOOK_TARGETS) if ns.hooks == "all" else set(ns.hooks.split(","))
+        if unknown := only - set(HOOK_TARGETS):
+            p.error(f"--hooks: unknown harness {min(unknown)}")
+    os.chdir(HOME)
+    try:
+        first_config(ns.store, ns.machine)
+    except ConfigError as e:
+        print(f"museum: {e}", file=sys.stderr)
+        return 1
+    if not ns.no_hooks:
+        install_hooks(only, os.environ)
+    install_skills(os.environ)
+    if harness_dir("muse", os.environ).is_dir():
+        print("museum: Muse Code: add the skill with `muse skills`:", ROOT / "skills" / "museum")
+    install_path()
+    install_pi()
+    # The first sync runs before the timer exists: the timer's first tick would
+    # take the lock, and this sync would then exit 0 without its error.
+    print("running first sync...")
+    code = main(["--now"])
+    print("ok" if code == 0 else "museum: first sync failed; see above and state.json")
+    r = run(["sh", str(ROOT / "bin" / "museum"), "timer", "install"])
+    print(r.output.strip())
+    if r.code != 0:
+        print("museum: could not install the timer", file=sys.stderr)
+    return code
+
+
+def status() -> int:
+    """This machine's museum and last sync, then every machine's (museum-search machines)."""
+    line_buffered()
+    info = version_info()
+    print(f"museum {version_label(info)} ({info['source']}: {ROOT})")
+    try:
+        doc = json.loads((state_dir() / "state.json").read_text())
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(doc.get("time", 0))))
+        result = "ok" if doc.get("status") == "ok" else f"failed: {doc.get('message', '')}"
+        print(f"last sync: {when} {result}\n")
+    except (OSError, ValueError, TypeError):
+        print("last sync: none yet\n")
+    search = ROOT / "skills" / "museum" / "scripts" / "museum-search"
+    return subprocess.run([sys.executable, str(search), "machines"], check=False).returncode
+
+
 def parse(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="museum-sync",
@@ -1022,6 +1484,10 @@ def parse(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    if argv[:1] == ["init"]:
+        return init(argv[1:])
+    if argv[:1] == ["status"]:
+        return status()
     ns = parse(argv)
     if ns.version:
         info = version_info()

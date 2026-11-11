@@ -6,8 +6,8 @@
 #   museum sync [ARGS]     museum-sync, in the foreground (--now, --if-due)
 #   museum timer install   run `museum tick` every 5 minutes (launchd or systemd)
 #   museum timer remove    stop and remove that timer
-#   museum setup [STORE [MACHINE]]  install.sh: config, skill links, PATH, timer
-#   museum fleet           every machine's museum version, from the store
+#   museum init [STORE [MACHINE]]  set this machine up: config, hooks, skills, pi, timer
+#   museum status          this machine's last sync, and every machine's museum
 #   museum version         this museum's version and where it runs from
 #
 # Harness hooks may run in a sandbox that refuses rsync and ssh, so they only
@@ -238,11 +238,13 @@ case ${1-} in
     shift
     exec "$(sync_path)" "$@"
     ;;
-  setup)
+  init | setup)
     shift
-    exec "$(root)/install.sh" "$@"
+    exec "$(sync_path)" init "$@"
     ;;
-  fleet) exec python3 "$(root)/skills/museum/scripts/museum-search" fleet ;;
+  status) exec "$(sync_path)" status ;;
+  # For pi's extension, when `museum` on PATH is a version manager's shim.
+  sync-path) sync_path ;;
   version) exec "$(sync_path)" --version ;;
   timer)
     case ${2-} in

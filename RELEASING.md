@@ -20,10 +20,9 @@ creates the GitHub release, then publishes. `npm pack --dry-run` shows what
 the package holds (`files` in `package.json`); a test checks every entry
 exists.
 
-Machines pick the release up with `pi update --extensions`, or
-`pi update npm:@mu-crew/museum`. `museum fleet` shows which have. Mention in
-the CHANGELOG when a release needs `install.sh` run again (a new timer, say):
-an update replaces the package's files, but not what `install.sh` set up.
+Machines pick the release up with `npm update -g @mu-crew/museum` and
+`museum init`, and pi's copy with `pi update --extensions`; `museum status`
+shows which have.
 
 ## Trust setup
 

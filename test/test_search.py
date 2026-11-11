@@ -290,7 +290,7 @@ class Store(unittest.TestCase):
         self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], search.TURNS_VERSION + 1)
         con.close()
 
-    def test_fleet_lists_each_machines_version(self) -> None:
+    def test_machines_lists_each_machines_version(self) -> None:
         def mark(machine: str, name: str, doc: dict[str, str], mtime: int) -> None:
             path = self.dir / machine / ".museum" / f"{name}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,7 +301,7 @@ class Store(unittest.TestCase):
         mark("pc", "0.10.0", {"version": "0.10.0", "source": "npm"}, 2_000)
         mark("mac", "0.9.1+abc", {"version": "0.9.1", "commit": "abc", "source": "checkout"}, 9)
         write_session(self.dir, "old/--x--/2026-01-01T00-00-00-000Z_o.jsonl", [msg("user", "hi")])
-        out = self.run_search("fleet")
+        out = self.run_search("machines")
         self.assertEqual(out.returncode, 0, out.stderr)
         rows = {line.split()[0]: line for line in out.stdout.splitlines()[1:] if line.strip()}
         # The newest marker counts, and versions order as numbers.
@@ -310,7 +310,7 @@ class Store(unittest.TestCase):
         self.assertIn("0.9.1+abc (checkout)", rows["mac"])
         self.assertTrue(rows["mac"].rstrip().endswith("behind"))
         self.assertIn("no version reported", rows["old"])
-        self.assertIn("pi update npm:@mu-crew/museum", out.stdout)
+        self.assertIn("npm update -g @mu-crew/museum && museum init", out.stdout)
 
     def indexed_turns(self, term: str) -> int:
         db = sqlite3.connect(self.dir / search.TURNS)
@@ -462,6 +462,7 @@ class Units(unittest.TestCase):
         words = search.forward(search.parse(["show", "f", "--users"]))
         self.assertEqual(words, ["show", "--users", "--", "f"])
         self.assertEqual(search.forward(search.parse(["index"])), ["index"])
+        self.assertEqual(search.forward(search.parse(["machines"])), ["machines"])
 
     def test_forward_puts_dashed_positionals_after_double_dash(self) -> None:
         """claude's and codex's project folders start with -: -home reads as -h."""

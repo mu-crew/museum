@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from helpers import BIN, ROOT, SCRIPTS, load
 
@@ -226,8 +228,8 @@ class Failures(Sandbox):
         self.assertIn("missing", r.stderr)
         # Recorded, so pi's footer says what is wrong.
         self.assertEqual(self.state_field("status"), "error")
-        self.assertIn("run install.sh", self.state_field("message"))
-        self.assertIn("run install.sh", self.state_field("warning"))
+        self.assertIn("run museum init", self.state_field("message"))
+        self.assertIn("missing", self.state_field("warning"))  # cut at 120 characters
 
     def test_bad_config_is_recorded_not_synced(self) -> None:
         self.write_config('machine = "box"\n[store]\npath = "/tmp/x"\nhots = "typo"\n')
@@ -409,6 +411,274 @@ class FakeRsync(Sandbox):
         self.assertEqual(self.state_field("status"), "error")
 
 
+PI_FAKE = """#!/bin/sh
+echo "$*" >> "$PI_LOG"
+case "$1" in
+  list) cat "$PI_LIST" 2> /dev/null ;;
+  remove) grep -v "$2" "$PI_LIST" > "$PI_LIST.new" 2> /dev/null; mv "$PI_LIST.new" "$PI_LIST" ;;
+esac
+exit 0
+"""
+
+
+@unittest.skipUnless(RSYNC, "rsync 3 not installed")
+class Init(unittest.TestCase):
+    """`museum init` in a sandbox home: a fake pi, the real rsync, no timer."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.home = self.dir / "home"
+        self.home.mkdir()
+        self.store = self.dir / "store"
+        fake = self.dir / "fakebin"
+        fake.mkdir()
+        (fake / "pi").write_text(PI_FAKE)
+        (fake / "pi").chmod(0o755)
+        self.pi_log = self.dir / "pi.log"
+        self.pi_list = self.dir / "pi-list"
+        self.env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CURSOR_HOME", "MUSEUM_CONFIG")
+        }
+        self.env |= {
+            "HOME": str(self.home),
+            "PATH": f"{fake}:{self.home}/.local/bin:{Path(sys.executable).parent}:"
+            f"{Path(RSYNC or '').parent}:/usr/bin:/bin",
+            "MUSEUM_STATE_DIR": str(self.dir / "state"),
+            "PI_SESSIONS_DIR": str(self.dir / "sessions"),
+            "MUSEUM_TIMER_KIND": "none",  # never launchd or systemd
+            "PI_LOG": str(self.pi_log),
+            "PI_LIST": str(self.pi_list),
+        }
+
+    def init(self, *args: str, root: Path = ROOT) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sh", str(root / "bin/museum"), "init", *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    def config(self) -> Path:
+        return self.home / ".config/museum/config.toml"
+
+    def test_first_run_writes_the_config_and_syncs(self) -> None:
+        r = self.init(str(self.store), "box")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c = sync.load_config(self.config())
+        self.assertEqual((c.machine, c.host, c.path), ("box", None, str(self.store)))
+        self.assertEqual(self.config().read_text(), sync.toml(c))
+        self.assertTrue((self.store / "box" / ".museum").is_dir())  # the first sync ran
+        # A later run keeps the config, and needs no store.
+        self.assertEqual(self.init().returncode, 0)
+        self.assertEqual(sync.load_config(self.config()), c)
+
+    def test_first_run_needs_a_store_and_a_free_machine_name(self) -> None:
+        r = self.init()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("first run needs the store", r.stderr)
+        me = socket.gethostname().split(".")[0]
+        (self.store / me).mkdir(parents=True)
+        r = self.init(str(self.store))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"{me} already exists", r.stderr)
+        self.assertFalse(self.config().exists())
+        # Naming it says the reuse is intended.
+        self.assertEqual(self.init(str(self.store), me).returncode, 0)
+
+    def test_hooks_keep_other_entries_and_replace_older_museum_ones(self) -> None:
+        claude = self.home / ".claude/settings.json"
+        claude.parent.mkdir()
+        other = {"type": "command", "command": "murmur hook claude"}
+        old = {"type": "command", "command": "/opt/museum/bin/museum hook claude"}
+        claude.write_text(
+            json.dumps({"model": "x", "hooks": {"SessionStart": [{"hooks": [other, old]}]}})
+        )
+        (self.home / ".cursor").mkdir()
+        self.assertEqual(self.init(str(self.store), "box").returncode, 0)
+        doc = json.loads(claude.read_text())
+        self.assertEqual(doc["model"], "x")
+        start = [h for g in doc["hooks"]["SessionStart"] for h in g["hooks"]]
+        self.assertEqual(
+            [h["command"] for h in start], ["murmur hook claude", "museum hook claude"]
+        )
+        self.assertEqual(
+            doc["hooks"]["SessionEnd"],
+            [{"hooks": [{"type": "command", "command": "museum hook claude"}]}],
+        )
+        cursor = json.loads((self.home / ".cursor/hooks.json").read_text())
+        self.assertEqual(cursor["version"], 1)
+        self.assertEqual(cursor["hooks"]["sessionEnd"], [{"command": "museum hook cursor-agent"}])
+        # Harnesses not set up here get nothing, unless asked for.
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertFalse((self.home / ".config/muse").exists())
+        # A second run changes nothing, not even formatting.
+        before = claude.read_text()
+        r = self.init("--hooks", "muse")
+        self.assertIn("hooks muse: added SessionStart, SessionEnd", r.stdout)
+        self.assertEqual(claude.read_text(), before)
+        self.assertTrue((self.home / ".config/muse/settings.json").is_file())
+
+    def test_hooks_follow_moved_config_dirs_and_symlinks(self) -> None:
+        moved = self.dir / "claude-elsewhere"
+        moved.mkdir()
+        dotfiles = self.dir / "dotfiles/settings.json"
+        dotfiles.parent.mkdir()
+        dotfiles.write_text('{"statusLine": "→ é"}')
+        (moved / "settings.json").symlink_to(dotfiles)
+        self.env["CLAUDE_CONFIG_DIR"] = str(moved)
+        r = self.init(str(self.store), "box")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((self.home / ".claude").exists())
+        # Written through the link, which stays a link, and non-ASCII stays as it was.
+        self.assertTrue((moved / "settings.json").is_symlink())
+        text = dotfiles.read_text()
+        self.assertIn("museum hook claude", text)
+        self.assertIn('"→ é"', text)
+        self.assertEqual((moved / "skills/museum").readlink(), ROOT / "skills/museum")
+
+    def test_hooks_refuse_invalid_json_constants_and_unknown_harnesses(self) -> None:
+        settings = self.home / ".claude/settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"x": NaN}')
+        r = self.init(str(self.store), "box")
+        self.assertIn("not valid JSON", r.stderr)
+        self.assertEqual(settings.read_text(), '{"x": NaN}')
+        r = self.init("--hooks", "claude,vim")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown harness vim", r.stderr)
+
+    def test_first_run_refuses_what_the_sync_would_not_take(self) -> None:
+        for args, message in (
+            ((str(self.store), "a/b"), "without /"),
+            ((str(self.store), ".."), "plain folder name"),
+            ((":" + str(self.store),), "no host before the colon"),
+        ):
+            with self.subTest(args=args):
+                r = self.init(*args)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(message, r.stderr)
+                self.assertFalse(self.config().exists())
+        self.assertFalse(self.store.exists())
+
+    def test_first_run_stops_when_the_store_host_cannot_be_asked(self) -> None:
+        fake = Path(self.env["PATH"].split(":")[0])
+        (fake / "ssh").write_text("#!/bin/sh\nexit 255\n")
+        (fake / "ssh").chmod(0o755)
+        r = self.init("devbox:/data/museum")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("cannot reach devbox", r.stderr)
+        self.assertFalse(self.config().exists())
+
+    def test_status_shows_this_machine_then_every_machine(self) -> None:
+        self.assertEqual(self.init(str(self.store), "box").returncode, 0)
+        r = subprocess.run(
+            ["sh", str(ROOT / "bin/museum"), "status"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        version = json.loads((ROOT / "package.json").read_text())["version"]
+        lines = r.stdout.splitlines()
+        self.assertTrue(lines[0].startswith(f"museum {version}"), lines[0])
+        self.assertRegex(lines[1], r"^last sync: \d{4}-\d\d-\d\d \d\d:\d\d ok$")
+        self.assertTrue(any(line.startswith("box ") and version in line for line in lines))
+        (self.dir / "state/state.json").write_text("{broken")
+        r = subprocess.run(
+            ["sh", str(ROOT / "bin/museum"), "status"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertIn("last sync: none yet", r.stdout)
+
+    def test_no_hooks_leaves_harness_configs_alone(self) -> None:
+        (self.home / ".claude").mkdir()
+        self.assertEqual(self.init(str(self.store), "box", "--no-hooks").returncode, 0)
+        self.assertFalse((self.home / ".claude/settings.json").exists())
+
+    def test_an_unreadable_config_file_is_named_and_left_alone(self) -> None:
+        settings = self.home / ".claude/settings.json"
+        settings.parent.mkdir()
+        settings.write_text("{not json")
+        r = self.init(str(self.store), "box")
+        self.assertIn("left", r.stderr)
+        self.assertEqual(settings.read_text(), "{not json")
+
+    def test_skills_and_older_installs_leftovers(self) -> None:
+        (self.home / ".codex").mkdir()
+        (self.home / ".cursor").mkdir()
+        agents = self.home / ".agents/skills/museum"
+        agents.parent.mkdir(parents=True)
+        agents.symlink_to(ROOT / "skills/museum")
+        cursor = self.home / ".cursor/skills/museum"
+        cursor.parent.mkdir(parents=True)
+        cursor.symlink_to(ROOT / "skills/museum")  # before codex held it
+        cache = self.home / ".cache/museum"
+        cache.mkdir(parents=True)
+        (cache / "last-start").write_text("1\n")
+        self.assertEqual(self.init(str(self.store), "box").returncode, 0)
+        self.assertEqual((self.home / ".codex/skills/museum").readlink(), ROOT / "skills/museum")
+        # cursor-agent reads codex's copy, so it gets none of its own.
+        self.assertFalse(cursor.is_symlink())
+        self.assertFalse(agents.is_symlink())
+        self.assertFalse(cache.exists())
+
+    def test_a_checkout_links_itself_and_replaces_an_older_link(self) -> None:
+        old = self.dir / "old-museum"
+        (old / "bin").mkdir(parents=True)
+        (old / "package.json").write_text('{"name": "@mu-crew/museum"}')
+        (old / "bin/museum").write_text("#!/bin/sh\n")
+        link = self.home / ".local/bin/museum"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(old / "bin/museum")
+        self.pi_list.write_text(
+            f"User packages:\n  npm:@mu-crew/museum\n    {old}\n  npm:@mu-crew/mu\n    /nowhere\n"
+        )
+        r = self.init(str(self.store), "box")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(link.readlink(), ROOT / "bin/museum")
+        log = self.pi_log.read_text()
+        self.assertIn("remove npm:@mu-crew/museum", log)
+        self.assertIn(f"install {ROOT}", log)
+
+    def test_an_npm_install_registers_the_npm_package_and_drops_a_checkout(self) -> None:
+        package = self.dir / "lib/node_modules/@mu-crew/museum"
+        package.parent.mkdir(parents=True)
+        shutil.copytree(ROOT, package, ignore=shutil.ignore_patterns(".git", "test", "__pycache__"))
+        checkout = self.dir / "src/museum"
+        checkout.mkdir(parents=True)
+        (checkout / "package.json").write_text('{"name": "@mu-crew/museum"}')
+        old = self.dir / "pi-npm/@mu-crew/museum"
+        old.mkdir(parents=True)
+        (old / "package.json").write_text('{"name": "@mu-crew/museum", "version": "0.4.0"}')
+        self.pi_list.write_text(
+            f"User packages:\n  ../src/museum\n    {checkout}\n  npm:@mu-crew/museum\n    {old}\n"
+        )
+        (checkout / "bin").mkdir()
+        (checkout / "bin/museum").write_text("#!/bin/sh\n")
+        link = self.home / ".local/bin/museum"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(checkout / "bin/museum")  # a hand-made link from an older install
+        r = self.init(str(self.store), "box", root=package)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.pi_log.read_text()
+        self.assertIn("remove ../src/museum", log)
+        # pi's copy is behind this one: brought up, not installed twice.
+        self.assertIn("update npm:@mu-crew/museum", log)
+        self.assertNotIn("install", log)
+        # npm's own bin link puts it on PATH: the older link goes, none replaces it.
+        self.assertFalse(link.exists() or link.is_symlink())
+        self.assertIn("not on PATH", r.stderr)
+
+
 class Units(unittest.TestCase):
     def test_error_line_prefers_ssh_over_rsync_tail(self) -> None:
         out = (
@@ -450,81 +720,58 @@ class Units(unittest.TestCase):
                 self.load(body)
             self.assertIn(message, str(e.exception))
 
-    def test_install_and_sync_write_the_same_config(self) -> None:
-        """install.sh and convert_legacy each write config.toml; the files, and
-        so their comments, must not drift."""
-        for store, machine in (("devbox:/data/a b", 'mac"mini'), ("LOCAL", "pc")):
-            with self.subTest(store=store), tempfile.TemporaryDirectory() as d:
-                home = Path(d)
-                if store == "LOCAL":  # install.sh creates it: keep it in the temp dir
-                    store = str(home / "store")
-                # install.sh up to the config, without the ssh probe, pi install
-                # and first sync that need a real host and pi.
-                src = (ROOT / "install.sh").read_text()
-                probe = 'ssh -o BatchMode=yes "$HOST" "test -d \'$STORE_PATH/$MACHINE\'"'
-                self.assertIn(probe, src)
-                src = src[: src.index("# Older installs symlinked")].replace(probe, "false")
-                script = home / "install.sh"
-                script.write_text(
-                    src.replace('ROOT="$(cd "$(dirname "$0")" && pwd)"', f"ROOT={ROOT}")
-                )
-                subprocess.run(
-                    ["sh", str(script), store, machine],
-                    env={**os.environ, "HOME": str(home)},
-                    capture_output=True,
-                    check=True,
-                )
-                if not store.count(":"):
-                    self.assertTrue(Path(store).is_dir())
-                written = (home / ".config/museum/config.toml").read_text()
-                c = sync.load_config(home / ".config/museum/config.toml")
-                self.assertEqual(c.machine, machine)
-                self.assertEqual(written, sync.toml(c))
+    def test_plan_hooks_keeps_a_users_fields_and_drops_filtered_handlers(self) -> None:
+        mine = {"type": "command", "command": "museum hook codex", "timeout": 5}
+        filtered = {"matcher": "startup", "hooks": [{"command": "museum hook codex"}]}
+        root = {
+            "hooks": {
+                "SessionStart": [{"hooks": [mine]}, filtered],
+                "Stop": [{"hooks": [{"command": "museum-sync --hook codex"}]}],
+            }
+        }
+        added, fixed, removed = sync.plan_hooks("codex", root)
+        self.assertEqual((added, fixed), (["SessionEnd"], []))
+        self.assertEqual(
+            removed, ["SessionStart: museum hook codex", "Stop: museum-sync --hook codex"]
+        )
+        self.assertEqual(root["hooks"]["SessionStart"], [{"hooks": [mine]}])
+        self.assertNotIn("Stop", root["hooks"])
+        self.assertEqual(sync.plan_hooks("codex", root), ([], [], []))
+        for bad in ({"hooks": {"SessionEnd": {}}}, {"hooks": []}):
+            with self.subTest(bad=bad), self.assertRaises(sync.Unworkable):
+                sync.plan_hooks("codex", bad)
+        # A kept handler without a type gets one, and that is a change to write;
+        # one of another type is not museum's command handler, and is replaced.
+        typeless = {
+            "hooks": {
+                "SessionStart": [{"hooks": [{"command": "museum hook codex"}]}],
+                "SessionEnd": [{"hooks": [{"type": "prompt", "command": "museum hook codex"}]}],
+            }
+        }
+        added, fixed, removed = sync.plan_hooks("codex", typeless)
+        self.assertEqual(fixed, ["SessionStart: type"])
+        self.assertEqual((added, removed), (["SessionEnd"], ["SessionEnd: museum hook codex"]))
+        # Older hand-written forms: quoted, or through python3.
+        for old in ('"$HOME/m/bin/museum" hook claude', "python3 /x/bin/museum-sync --hook claude"):
+            with self.subTest(old=old):
+                self.assertTrue(sync.OWNED.match(old))
+        # Not museum's: a tool whose name only starts with museum.
+        other = {"hooks": {"SessionStart": [{"hooks": [{"command": "museum-pull dev0"}]}]}}
+        sync.plan_hooks("claude", other)
+        self.assertEqual(
+            other["hooks"]["SessionStart"][0], {"hooks": [{"command": "museum-pull dev0"}]}
+        )
 
-    def test_install_registers_a_checkout_with_pi_but_not_the_npm_package(self) -> None:
-        """A checkout is installed as a pi package; pi's copy of the npm
-        package is installed already. Either way, a second museum package
-        that pi loads is named, with the command that removes it."""
-        src = (ROOT / "install.sh").read_text()
-        block = src[src.index("# `museum` for tmux") : src.index("# The first sync also converts")]
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d)
-            bin_dir = home / "fakebin"
-            bin_dir.mkdir()
-            npm = home / "npm/node_modules/@mu-crew/museum"
-            npm.mkdir(parents=True)
-            (npm / "package.json").write_text('{"name": "@mu-crew/museum"}\n')
-            log = home / "pi.log"
-            listing = (
-                f"User packages:\n  ../../src/museum\n    {ROOT}\n"
-                f"  npm:@mu-crew/museum\n    {npm}\n  npm:@mu-crew/mu\n    /nowhere\n"
-            )
-            pi = bin_dir / "pi"
-            pi.write_text(
-                f'#!/bin/sh\necho "$*" >> {log}\n'
-                f'[ "$1" = list ] && printf "%s" "{listing}"\nexit 0\n'
-            )
-            pi.chmod(0o755)
-            env = {**os.environ, "HOME": str(home), "PATH": f"{bin_dir}:/usr/bin:/bin"}
-
-            def install(root: Path) -> subprocess.CompletedProcess[str]:
-                script = home / "block.sh"
-                script.write_text(f"#!/bin/sh\nset -eu\nROOT={root}\n" + block)
-                return subprocess.run(
-                    ["sh", str(script)], env=env, capture_output=True, text=True, check=True
-                )
-
-            r = install(ROOT)
-            self.assertIn(f"install {ROOT}", log.read_text())
-            self.assertIn(f"pi also loads museum from {npm}; keep one: pi remove npm:", r.stderr)
-            self.assertNotIn(f"from {ROOT};", r.stderr)  # not itself
-            self.assertEqual((home / ".local/bin/museum").readlink(), ROOT / "bin/museum")
-            log.unlink()
-            r = install(npm)
-            self.assertNotIn("install", log.read_text())
-            self.assertIn(f"from {ROOT}; keep one: pi remove ../../src/museum", r.stderr)
-            self.assertNotIn(f"from {npm};", r.stderr)
-            self.assertEqual((home / ".local/bin/museum").readlink(), npm / "bin/museum")
+    def test_npm_install_is_a_copy_of_the_package_not_any_node_modules_path(self) -> None:
+        cases = {
+            "/u/.local/lib/node_modules/@mu-crew/museum": True,
+            "/u/.pi/agent/npm/node_modules/@mu-crew/museum": True,
+            "/u/src/node_modules/museum": False,
+            "/u/hacking/crew/museum": False,
+        }
+        for root, npm in cases.items():
+            with self.subTest(root=root), mock.patch.object(sync, "ROOT", Path(root)):
+                self.assertEqual(sync.npm_install(), npm)
 
     def test_package_holds_what_museum_runs(self) -> None:
         """npm publishes only package.json's `files`: each must exist, the
@@ -547,78 +794,6 @@ class Units(unittest.TestCase):
             check=False,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
-
-    def test_install_links_skill_into_harness_dirs(self) -> None:
-        """install.sh links skills/museum into each set-up harness, never into
-        ~/.agents/skills, and skips cursor when claude or codex already covers it."""
-        src = (ROOT / "install.sh").read_text()
-        start = src.index("# Older installs symlinked")
-        end = src.index("# The first sync also converts")
-        skill_block = src[start:end]
-        skill = ROOT / "skills" / "museum"
-
-        def run_skill_install(home: Path) -> subprocess.CompletedProcess[str]:
-            script = home / "install-skills.sh"
-            script.write_text(f"#!/bin/sh\nset -eu\nROOT={ROOT}\n" + skill_block)
-            env = {
-                k: v
-                for k, v in os.environ.items()
-                if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CURSOR_HOME")
-            }
-            env["HOME"] = str(home)
-            env["PATH"] = "/usr/bin:/bin"  # no pi: skip the package step
-            return subprocess.run(
-                ["sh", str(script)], env=env, capture_output=True, text=True, check=True
-            )
-
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d)
-            (home / ".codex").mkdir()
-            (home / ".cursor").mkdir()
-            agents = home / ".agents" / "skills"
-            agents.mkdir(parents=True)
-            (agents / "museum").symlink_to(skill)
-
-            out = run_skill_install(home)
-            self.assertTrue((home / ".codex" / "skills" / "museum").is_symlink())
-            self.assertEqual((home / ".codex" / "skills" / "museum").resolve(), skill.resolve())
-            # Codex already holds the skill: cursor-agent reads that copy too.
-            self.assertFalse((home / ".cursor" / "skills" / "museum").exists())
-            self.assertFalse((agents / "museum").exists())
-            self.assertIn("muse skills", out.stdout)
-
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d)
-            (home / ".cursor").mkdir()
-            out = run_skill_install(home)
-            self.assertTrue((home / ".cursor" / "skills" / "museum").is_symlink())
-            self.assertEqual((home / ".cursor" / "skills" / "museum").resolve(), skill.resolve())
-            self.assertIn("muse skills", out.stdout)
-
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d)
-            (home / ".codex").mkdir()
-            (home / ".cursor" / "skills").mkdir(parents=True)
-            (home / ".codex" / "skills" / "museum").mkdir(parents=True)
-            (home / ".codex" / "skills" / "museum" / "SKILL.md").write_text("kept\n")
-            covered = home / ".cursor" / "skills" / "museum"
-            covered.symlink_to(skill)
-            run_skill_install(home)
-            self.assertFalse(covered.exists())
-            self.assertEqual(
-                (home / ".codex" / "skills" / "museum" / "SKILL.md").read_text(), "kept\n"
-            )
-            self.assertFalse((home / ".agents" / "skills" / "museum").exists())
-
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d)
-            (home / ".claude").mkdir()
-            dest = home / ".claude" / "skills" / "museum"
-            dest.mkdir(parents=True)
-            (dest / "SKILL.md").write_text("hand-edited\n")
-            run_skill_install(home)
-            self.assertFalse(dest.is_symlink())
-            self.assertEqual((dest / "SKILL.md").read_text(), "hand-edited\n")
 
     def test_legacy_config_converts_once(self) -> None:
         with tempfile.TemporaryDirectory() as d:
