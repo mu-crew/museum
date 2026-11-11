@@ -1287,46 +1287,30 @@ def pi_packages() -> list[tuple[str, Path]]:
     return out
 
 
-def install_pi() -> None:
-    """pi's extension and skill, as one pi package of this install's kind: the
-    npm package for an npm install (pi keeps it current with `pi update`), the
-    checkout itself for a checkout, so its edits are live. Any other museum
-    package pi loads is an older install's, and is removed: two would load the
-    extension twice."""
+def check_pi() -> None:
+    """What pi needs, as commands to run: museum never edits pi's package
+    list, as `mu init` does not. pi loads museum's extension and skill from
+    one package, `npm:@mu-crew/museum` for an npm install (registered once
+    with `pi install`) or the checkout itself; any other museum package it
+    loads is an older install's, and loads the extension twice."""
     if not shutil.which("pi"):
         return
     want = NPM_SOURCE if npm_install() else str(ROOT)
-    have = pi_packages()
-    for source, folder in have:
-        keep = source == NPM_SOURCE if npm_install() else folder.resolve() == ROOT.resolve()
-        if not keep:
-            r = run(["pi", "remove", source])
+
+    def mine(source: str, folder: Path) -> bool:
+        return source == NPM_SOURCE if npm_install() else folder.resolve() == ROOT.resolve()
+
+    packages = pi_packages()
+    if not any(mine(source, folder) for source, folder in packages):
+        print(f"pi: run `pi install {want}` once, for museum's extension and skill")
+    for source, folder in packages:
+        if not mine(source, folder):
+            # pi stores a local source relative to its settings file, and reads
+            # one given to `pi remove` relative to the cwd: name it by folder.
+            local = not re.match(r"^(npm|git|https?):", source)
             print(
-                f"removed pi package {source} ({folder}): an older install's"
-                if r.code == 0
-                else f"museum: pi remove {source} failed: {r.output.strip()}"
+                f"pi: also loads museum from {folder}; run `pi remove {folder if local else source}`"
             )
-    kept = [folder for source, folder in have if source == NPM_SOURCE] if npm_install() else []
-    if kept:
-        # pi's copy, behind this one: bring it up, so its extension matches.
-        try:
-            theirs = json.loads((kept[0] / "package.json").read_text()).get("version")
-        except (OSError, ValueError, AttributeError):
-            theirs = None
-        if theirs != version_info()["version"]:
-            r = run(["pi", "update", NPM_SOURCE])
-            print(
-                f"pi update {NPM_SOURCE} (was {theirs})"
-                if r.code == 0
-                else f"museum: pi update {NPM_SOURCE} failed: {r.output.strip()}"
-            )
-        return
-    r = run(["pi", "install", want])
-    print(
-        f"pi install {want}"
-        if r.code == 0
-        else f"museum: pi install {want} failed: {r.output.strip()}"
-    )
 
 
 def first_config(store: str | None, machine: str | None) -> Path:
@@ -1429,7 +1413,7 @@ def init(argv: list[str]) -> int:
     if harness_dir("muse", os.environ).is_dir():
         print("museum: Muse Code: add the skill with `muse skills`:", ROOT / "skills" / "museum")
     install_path()
-    install_pi()
+    check_pi()
     # The first sync runs before the timer exists: the timer's first tick would
     # take the lock, and this sync would then exit 0 without its error.
     print("running first sync...")

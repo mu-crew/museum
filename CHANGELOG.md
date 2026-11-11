@@ -3,6 +3,18 @@
 All notable changes to museum. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0.0 a minor release may change on-disk state or setup.
 
+## [0.5.1] — 2026-11-11
+
+### Fixed
+
+- `museum init` no longer edits pi's package list, as `mu init` does not.
+  0.5.0 ran `pi install npm:@mu-crew/museum` and `pi remove` on other museum
+  packages, which fails where pi cannot fetch the package, and named a local
+  package by a relative path that `pi remove` reads from the cwd. It now
+  says what to run: `pi install npm:@mu-crew/museum` once (`pi install
+  <checkout>` from a checkout), and a `pi remove <folder>` for each other
+  museum package pi loads.
+
 ## [0.5.0] — 2026-11-11
 
 museum installs like mu, murmur and muzzle: `npm i -g @mu-crew/museum`, then

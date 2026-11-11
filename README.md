@@ -20,6 +20,7 @@ ssh to the store host for an ssh store. The store host needs rsync and any
 ```sh
 npm i -g @mu-crew/museum
 museum init devbox:/data/museum
+pi install npm:@mu-crew/museum   # pi: museum's extension and skill
 ```
 
 The argument is the store: `host:/path` over ssh, or `/path` for a local
@@ -29,12 +30,13 @@ machine's folder in the store; it defaults to `hostname -s`.
 `museum init` writes `~/.config/museum/config.toml`, adds `museum hook
 <harness>` to the session start and end hooks of Claude Code, Codex,
 cursor-agent and Muse Code where each is set up (`--hooks LIST|all` for
-others, `--no-hooks` for none), links the skill into each harness, installs
-the pi package (`npm:@mu-crew/museum`: an extension that syncs as agents work
-and shows `museum: backup failing: …` in pi's footer), runs the first sync
-and installs a timer (launchd or systemd) that syncs every 5 minutes. It
-touches only museum's own entries, and removes what older museum installs
-left behind. Muse Code's skill goes in by hand: `muse skills`.
+others, `--no-hooks` for none), links the skill into each harness, runs the
+first sync and installs a timer (launchd or systemd) that syncs every 5
+minutes. It touches only museum's own entries, and removes what older museum
+installs left behind. pi's package list it leaves to you, as `mu init` does:
+it says when pi needs a `pi install` or a `pi remove`. The pi package's
+extension syncs as agents work and shows `museum: backup failing: …` in pi's
+footer. Muse Code's skill goes in by hand: `muse skills`.
 
 Optionally, `tmux set -ag status-right '#(museum tick)'` syncs from the
 status line too. On Linux, `loginctl enable-linger` keeps the timer running
@@ -49,8 +51,9 @@ machine runs.
 harnesses' hooks and their skills folders. The store is never touched.
 
 **From a checkout**, for working on museum: `./install.sh STORE` in the clone
-runs its `museum init`, which links `~/.local/bin/museum` and registers the
-checkout with pi, so edits are live, in place of the npm package.
+runs its `museum init`, which links `~/.local/bin/museum`; `pi install .`
+there loads the checkout in pi, in place of the npm package, so edits are
+live.
 
 ## Use
 

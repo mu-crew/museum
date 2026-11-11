@@ -631,7 +631,7 @@ class Init(unittest.TestCase):
         self.assertFalse(agents.is_symlink())
         self.assertFalse(cache.exists())
 
-    def test_a_checkout_links_itself_and_replaces_an_older_link(self) -> None:
+    def test_a_checkout_links_itself_and_reports_what_pi_needs(self) -> None:
         old = self.dir / "old-museum"
         (old / "bin").mkdir(parents=True)
         (old / "package.json").write_text('{"name": "@mu-crew/museum"}')
@@ -645,11 +645,14 @@ class Init(unittest.TestCase):
         r = self.init(str(self.store), "box")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(link.readlink(), ROOT / "bin/museum")
-        log = self.pi_log.read_text()
-        self.assertIn("remove npm:@mu-crew/museum", log)
-        self.assertIn(f"install {ROOT}", log)
+        # pi's package list is reported on, never edited, as mu init does.
+        self.assertEqual(self.pi_log.read_text(), "list\n")
+        self.assertIn(f"pi: run `pi install {ROOT}` once", r.stdout)
+        self.assertIn(
+            f"pi: also loads museum from {old}; run `pi remove npm:@mu-crew/museum`", r.stdout
+        )
 
-    def test_an_npm_install_registers_the_npm_package_and_drops_a_checkout(self) -> None:
+    def test_an_npm_install_reports_what_pi_needs(self) -> None:
         package = self.dir / "lib/node_modules/@mu-crew/museum"
         package.parent.mkdir(parents=True)
         shutil.copytree(ROOT, package, ignore=shutil.ignore_patterns(".git", "test", "__pycache__"))
@@ -669,11 +672,10 @@ class Init(unittest.TestCase):
         link.symlink_to(checkout / "bin/museum")  # a hand-made link from an older install
         r = self.init(str(self.store), "box", root=package)
         self.assertEqual(r.returncode, 0, r.stderr)
-        log = self.pi_log.read_text()
-        self.assertIn("remove ../src/museum", log)
-        # pi's copy is behind this one: brought up, not installed twice.
-        self.assertIn("update npm:@mu-crew/museum", log)
-        self.assertNotIn("install", log)
+        self.assertEqual(self.pi_log.read_text(), "list\n")
+        self.assertNotIn("pi install", r.stdout)  # pi has the npm package already
+        # A local source is named by its folder: pi reads a relative one from the cwd.
+        self.assertIn(f"run `pi remove {checkout}`", r.stdout)
         # npm's own bin link puts it on PATH: the older link goes, none replaces it.
         self.assertFalse(link.exists() or link.is_symlink())
         self.assertIn("not on PATH", r.stderr)

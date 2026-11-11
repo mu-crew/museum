@@ -6,7 +6,7 @@
 #   museum sync [ARGS]     museum-sync, in the foreground (--now, --if-due)
 #   museum timer install   run `museum tick` every 5 minutes (launchd or systemd)
 #   museum timer remove    stop and remove that timer
-#   museum init [STORE [MACHINE]]  set this machine up: config, hooks, skills, pi, timer
+#   museum init [STORE [MACHINE]]  set this machine up: config, hooks, skills, timer
 #   museum status          this machine's last sync, and every machine's museum
 #   museum version         this museum's version and where it runs from
 #
