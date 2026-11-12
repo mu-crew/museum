@@ -28,15 +28,17 @@ store (use that on the store host itself). A second argument names this
 machine's folder in the store; it defaults to `hostname -s`.
 
 `museum init` writes `~/.config/museum/config.toml`, adds `museum hook
-<harness>` to the session start and end hooks of Claude Code, Codex,
-cursor-agent and Muse Code where each is set up (`--hooks LIST|all` for
-others, `--no-hooks` for none), links the skill into each harness, runs the
-first sync and installs a timer (launchd or systemd) that syncs every 5
-minutes. It touches only museum's own entries, and removes what older museum
-installs left behind. pi's package list it leaves to you, as `mu init` does:
-it says when pi needs a `pi install` or a `pi remove`. The pi package's
-extension syncs as agents work and shows `museum: backup failing: …` in pi's
-footer. Muse Code's skill goes in by hand: `muse skills`.
+<harness>` to the session start hook of Claude Code, Codex, cursor-agent and
+Muse Code where each is set up (`--hooks LIST|all` for others, `--no-hooks`
+for none), links the skill into each harness, runs the first sync and
+installs a timer (launchd or systemd) that checks every 5 minutes and syncs
+what changed. It touches only museum's own entries, and removes what older
+museum installs left behind. pi's package list it leaves to you, as `mu
+init` does: it says when pi needs a `pi install` or a `pi remove`. The pi
+package's extension is pi's hook, and shows `museum: backup failing` or
+`museum: backup stale` in pi's footer when backups stop. Muse Code's skill
+goes in by hand: `muse skills`. `museum doctor` checks the whole setup and
+says how to fix what is wrong.
 
 Optionally, `tmux set -ag status-right '#(museum tick)'` syncs from the
 status line too. On Linux, `loginctl enable-linger` keeps the timer running
@@ -77,14 +79,18 @@ For an ssh store, `museum-search` runs on the store host in one ssh call.
 ## How it works
 
 - **Store layout.** Each machine writes only its own folder, so nothing needs
-  locking: `<store>/<machine>/<pi cwd folder>/<time>_<id>.jsonl` for pi, and
-  `<store>/<machine>/{claude,codex,cursor-agent}/<project>/…` for the others.
+  locking: `<store>/<machine>/<harness>/<project>/…` for every harness, pi,
+  claude, codex and cursor-agent, with each session's metadata in
+  `<harness>/meta/`. A machine's first sync with 0.6 moves its pi sessions
+  from the old layout, `<machine>/<pi cwd folder>/`, into `pi/`.
 - **Append-only.** rsync without `--delete`: sessions deleted locally, or by
   claude's cleanup, stay in the store.
-- **Triggers.** pi's extension syncs at session start, at most every 10
-  minutes while agents work, and at session end. Harness hooks only leave
-  stamps, since they may run in a sandbox; the timer and `museum tick` start
-  the sync outside it. One sync runs per machine at a time.
+- **Triggers.** Only `museum tick`, from the timer or tmux, starts a sync,
+  outside every harness sandbox: at most every 10 minutes, and only when a
+  session changed since the last sync that worked, so an idle machine makes
+  no connections. Harness hooks, pi's extension among them, only record each
+  session's repo and mu identity at its start. One sync runs per machine at
+  a time.
 - **Filtered copies.** claude, codex and cursor-agent transcripts carry bulk
   (API request copies, encrypted reasoning, repeated compaction histories);
   museum syncs a filtered copy, with tool output cut at 64 KB.
@@ -104,7 +110,7 @@ Details, configuration and environment variables:
 
 ## Develop
 
-The scripts are single-file, stdlib-only Python and POSIX shell. `make check`
+The scripts are single-file, stdlib-only Python (`install.sh` is sh). `make check`
 runs shellcheck, ruff, ty, the unittest suite and the format checks through
 `uvx` at pinned versions, so you need only [uv](https://docs.astral.sh/uv/).
 `make hooks` runs it on every commit. Releases: [RELEASING.md](RELEASING.md).

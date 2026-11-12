@@ -428,6 +428,99 @@ class StoreWithoutIndex(Store):
     index = False
 
 
+class Layout(unittest.TestCase):
+    """Since 0.6 pi's sessions sit in <host>/pi/, with `museum hook pi`'s
+    record beside them in pi/meta/; a machine that has not synced since keeps
+    the old layout, and both are read."""
+
+    rg: bool = True
+    index: bool = True
+
+    NEW = f"mac/pi/{HAIL}/2026-10-01T00-00-00-000Z_n1.jsonl"
+    ROOT = "mac/pi/2026-04-17T00-00-00-000Z_n0.jsonl"
+    OLD = f"pc/{HAIL}/2026-05-22T16-32-24-344Z_o1.jsonl"
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        header = {"type": "session", "cwd": "/home/u/hacking/hail"}
+        write_session(
+            self.dir,
+            self.NEW,
+            [header, msg("user", "pick a quokka db"), msg("assistant", "quokka uses sqlite")],
+        )
+        write_session(self.dir, self.ROOT, [msg("user", "quokka before folders")])
+        write_session(self.dir, self.OLD, [header, msg("user", "the old quokka plan")])
+        # A claude session at the same depth as the new pi ones.
+        claude = [
+            {"type": "user", "cwd": "/w", "message": {"role": "user", "content": "quokka?"}},
+        ]
+        write_session(self.dir, "mac/claude/-w/0b6c2a40-1111-4222-8333-444455556666.jsonl", claude)
+        meta = self.dir / "mac/pi/meta/n1.json"
+        meta.parent.mkdir(parents=True)
+        meta.write_text(json.dumps({"harness": "pi", "project": "hailstone", "branch": "dev"}))
+
+    def run_search(self, *args: str) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items() if k not in ("MUSEUM_NO_INDEX", "PI_SESSION_ID")}
+        if not self.rg:
+            env["PATH"] = str(Path(sys.executable).parent)
+        if not self.index:
+            env["MUSEUM_NO_INDEX"] = "1"
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / "museum-search"), "--store", str(self.dir), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+
+    def test_parse_reads_both_layouts(self) -> None:
+        new = search.Session.parse(self.NEW)
+        assert new is not None
+        self.assertEqual((new.harness, new.host, new.folder), ("pi", "mac", HAIL))
+        self.assertEqual((new.dir(), new.id()), (f"mac/pi/{HAIL}", "n1"))
+        root = search.Session.parse(self.ROOT)
+        assert root is not None
+        self.assertEqual((root.harness, root.folder), ("pi", ""))
+        old = search.Session.parse(self.OLD)
+        assert old is not None
+        self.assertEqual((old.harness, old.dir()), ("pi", f"pc/{HAIL}"))
+        self.assertIsNone(search.Session.parse("mac/pi/meta/n1.jsonl"))
+
+    def test_find_sees_every_pi_session_in_either_layout(self) -> None:
+        out = self.run_search("find", "quokka").stdout
+        files = {line.split()[1] for line in out.splitlines() if line.strip().startswith("file:")}
+        self.assertEqual(
+            files,
+            {
+                self.NEW,
+                self.ROOT,
+                self.OLD,
+                "mac/claude/-w/0b6c2a40-1111-4222-8333-444455556666.jsonl",
+            },
+        )
+
+    def test_a_pi_record_beside_the_session_labels_it(self) -> None:
+        out = self.run_search("find", "quokka db").stdout
+        self.assertIn("hailstone@dev", out)
+        show = self.run_search("show", self.NEW).stdout
+        self.assertIn('"project": "hailstone"', show)
+
+    def test_project_matches_a_folder_or_a_pi_record(self) -> None:
+        r = self.run_search("find", "quokka", "hail")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(self.NEW, r.stdout)
+        self.assertIn(self.OLD, r.stdout)
+
+
+class LayoutWithoutRg(Layout):
+    rg = False
+
+
+class LayoutWithoutIndex(Layout):
+    index = False
+
+
 del Store  # only the concrete variants run
 
 

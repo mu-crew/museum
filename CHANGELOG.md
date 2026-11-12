@@ -3,6 +3,57 @@
 All notable changes to museum. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0.0 a minor release may change on-disk state or setup.
 
+## [Unreleased]
+
+Only `museum tick` syncs, and only when a session changed; every harness,
+pi included, has the same hook and the same store layout; and `museum
+doctor` says what is wrong. Snapshot the store before the first sync with
+this version: each machine's first sync moves its pi sessions.
+
+### Changed
+
+- **One trigger: `museum tick`.** The timer and tmux's `#(museum tick)` are
+  the only things that start a sync, outside every harness sandbox. Past
+  `MUSEUM_INTERVAL` (10 minutes), a tick syncs only when a session file or
+  meta record changed since the last sync that worked, so an idle machine
+  makes no ssh connections. A failed sync leaves its changes to be tried
+  again. A finished session reaches the store within 15 minutes.
+- **Hooks only record.** `museum hook` writes the meta record at session
+  start and nothing else; `museum init` removes the `SessionEnd` entries
+  older installs added, and the old `flush` stamp.
+- **pi's extension is pi's hook.** It runs `museum hook pi` at session start,
+  so pi's meta record is written by the same code as every other harness's,
+  to `<machine>/pi/meta/<session id>.json`, not into the session file. It no
+  longer syncs.
+- **pi's footer says when backups stop:** `museum: backup failing: <error>`
+  as before, and `museum: backup stale (last ok 2h ago)` when a change to the
+  session has waited over 30 minutes for a sync that worked, as when the
+  timer is not running. Both end with `· museum doctor`. `state.json` gains
+  `last_ok`.
+- **Store layout `<machine>/<harness>/…` for every harness.** pi's sessions
+  move from `<machine>/<pi cwd folder>/` to `<machine>/pi/<pi cwd folder>/`.
+  Each machine moves its own on its first sync with this version, in the
+  same ssh connection. A session found in both places keeps the longer copy
+  when the other is a prefix of it, else both, and the sync says so.
+  `museum-search` reads both layouts, so machines not yet updated stay
+  searchable from updated machines; an older museum's search does not see
+  sessions in `pi/`. The turn index is rebuilt once, as version 2, so that
+  an older museum leaves it alone (and reads the files) instead of dropping
+  the moved sessions' rows on every search.
+- The timer also gets `PI_SESSIONS_DIR`, now that it does pi's syncs.
+- **`bin/museum` is Python.** The tick and the timer moved into
+  `museum-sync` (`museum-sync tick`, `museum-sync timer install|remove`),
+  beside the rules they share with the sync; `bin/museum` names the
+  commands and runs it, as before. It needs a `python3` on the timer's and
+  tmux's PATH, any version; `museum-sync` still needs 3.11 to sync.
+
+### Added
+
+- **`museum doctor`.** Checks the config, rsync, the store (and every
+  machine's version), the timer and linger, the last sync and whether the
+  backup is stale, each harness's hooks, pi's package and `museum` on PATH,
+  and prints the fix for each problem. Read-only; exits 1 on a failure.
+
 ## [0.5.1] — 2026-11-11
 
 ### Fixed

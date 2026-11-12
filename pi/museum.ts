@@ -1,37 +1,35 @@
 /**
- * museum: back up this node's pi sessions from inside pi.
+ * museum: pi's harness hook, and the backup warning in pi's footer.
  *
- * Sessions only change while pi runs, so pi triggers the backup, in the pane's
- * own environment (ssh agent, PATH).
+ * pi has no command hooks, only extensions, so this is pi's `museum hook`: at
+ * session start it runs `museum hook pi` with the payload the other harnesses
+ * send (hook_event_name, session_id, cwd). museum-sync writes the meta record,
+ * the session's repo and mu identity, as it does for claude, codex and
+ * cursor-agent, from inside this pi's process tree, which is the only place
+ * mu's anchor and environment can be read.
  *
- *   session_start     catch up on what a crashed or killed pi left, if due
- *   agent_settled     sync if the node's last sync started over 10 minutes ago
- *   session_shutdown  flush: sync this session's final turns, 5s after exit
+ * Nothing here syncs. `museum tick`, from the timer or tmux, syncs whatever
+ * changed, outside every sandbox. So the footer is the one place a backup
+ * that stopped shows, and it says so in two cases:
  *
- * At session start it also records where the session ran as a `museum` custom
- * entry (not sent to the model): the git repo behind the cwd and the mu
- * workstream. A mu worktree's folder name says `worker-1`, not the project, so
- * this is what lets a search group worker sessions under their repo.
+ *   failing  the last sync failed: state.json's `warning`, written by
+ *            museum-sync, the one place that rule lives
+ *   stale    a change to this session has waited over 30 minutes for a sync
+ *            that worked: the timer is not running, or syncs die before they
+ *            record anything. Decided here, because then no sync runs to say
+ *            it.
  *
- * All the coordination is in `museum-sync`: one sync per node however many
- * agents call it, and a flush that arrives mid-sync re-runs it. This file only
- * spawns it detached (never blocking a turn, surviving pi's exit).
+ * Every pi on the node shows the node's one state.json, re-read every few
+ * seconds, so a recovery any sync sees clears every footer.
  *
- * The footer warning is separate from the triggers. `museum-sync` writes the
- * label into the node's one `state.json`, empty while backups work, and every
- * pi shows it, re-read every few seconds rather than at its own events.
- * Otherwise, with many agents, an idle one keeps saying "ok" through an outage
- * that another agent's sync hit, and keeps saying "failing" after another
- * agent's sync recovered. The only label decided here is the one the script
- * cannot write: it did not start at all.
- *
- * The sync is the museum-sync beside the `museum` on PATH, the one `museum
- * init` pointed the timer and the hooks at, so one copy does every sync on the
- * node even when pi's package copy is another version. Without one on PATH,
- * it is ../bin/museum-sync beside this file. $MUSEUM_SYNC overrides both.
+ * The hook is the museum-sync beside the `museum` on PATH, the one `museum
+ * init` pointed the timer and the other hooks at, so one copy serves the node
+ * even when pi's package copy is another version. Without one on PATH, it is
+ * ../bin/museum-sync beside this file. $MUSEUM_SYNC overrides both.
  */
+
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,34 +39,18 @@ type Ctx = {
   hasUI: boolean;
   cwd: string;
   ui: { setStatus(key: string, text: string | undefined): void };
-  sessionManager: { getEntries(): Array<{ type: string; customType?: string }> };
+  sessionManager: { getSessionId(): string; getSessionFile(): string | undefined };
 };
 type ExtensionAPI = {
-  on(
-    event: "session_start" | "agent_settled" | "session_shutdown",
-    handler: (event: unknown, ctx: Ctx) => void,
-  ): void;
-  appendEntry(customType: string, data: unknown): void;
-  exec(
-    command: string,
-    args: string[],
-    options?: { cwd?: string; timeout?: number },
-  ): Promise<{ stdout: string; code: number }>;
+  on(event: "session_start" | "session_shutdown", handler: (event: unknown, ctx: Ctx) => void): void;
 };
 
-/** What `museum-search` shows for a session; every field may be missing. */
-export type Meta = {
-  project?: string; // main repo's folder name, else the mu workstream
-  repo?: string; // main repo path, the same for all of its worktrees
-  remote?: string;
-  branch?: string;
-  commit?: string;
-  workstream?: string;
-  agent?: string;
-};
-
-const INTERVAL_S = Number(process.env.MUSEUM_INTERVAL) || 600;
 const POLL_MS = 5000;
+export const STALE_S = 30 * 60;
+// A working timer syncs a change within MUSEUM_INTERVAL plus its 5-minute
+// period; past that and STALE_S, it is stale. museum-sync doctor uses the same.
+const interval = Number(process.env.MUSEUM_INTERVAL);
+const STALE_AFTER = Math.max(STALE_S, (Number.isFinite(interval) && interval > 0 ? interval : 600) + 600);
 const STATE_DIR =
   process.env.MUSEUM_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "museum");
 // 126/127: the shell or env could not run it (no python3 on PATH, say).
@@ -117,37 +99,24 @@ function syncPath(): string {
   return resolved;
 }
 
-function read(name: string): string | undefined {
-  try {
-    return readFileSync(join(STATE_DIR, name), "utf8");
-  } catch {
-    return undefined;
-  }
-}
-
-// Set when this pi could not start museum-sync, so no sync can write
-// state.json. Cleared by the next start that works.
+// Set when this pi could not run museum-sync. Cleared by the next run that works.
 let notRun: string | undefined;
 
-function run(mode: "--if-due" | "--now", delayS = 0): void {
-  // Cheap pre-check, so ten agents settling does not start ten Pythons. The
-  // script re-checks under its lock; this is only an optimisation.
-  if (mode === "--if-due") {
-    const last = Number(read("last-start")?.trim()) || 0;
-    if (Date.now() / 1000 - last < INTERVAL_S) return;
-  }
+/** `museum hook pi`, detached, with the payload on stdin: never blocks pi. */
+function hook(ctx: Ctx): void {
+  const payload = JSON.stringify({
+    hook_event_name: "SessionStart",
+    session_id: ctx.sessionManager.getSessionId(),
+    cwd: ctx.cwd,
+  });
   try {
-    const child =
-      delayS > 0
-        ? spawn("/bin/sh", ["-c", `sleep ${delayS}; exec "$0" "$1"`, syncPath(), mode], {
-            detached: true,
-            stdio: "ignore",
-          })
-        : spawn(syncPath(), [mode], { detached: true, stdio: "ignore" });
+    const child = spawn(syncPath(), ["--hook", "pi"], { detached: true, stdio: ["pipe", "ignore", "ignore"] });
     child.on("error", (e) => (notRun = `museum: cannot run museum-sync: ${e.message}`));
     child.on("exit", (code) => {
       notRun = code !== null && NOT_RUN.has(code) ? `museum: cannot run museum-sync (exit ${code})` : undefined;
     });
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(payload);
     child.unref();
   } catch (e) {
     notRun = `museum: cannot run museum-sync: ${(e as Error).message}`;
@@ -159,67 +128,110 @@ export type State = {
   status: "ok" | "error";
   time: number; // epoch seconds
   message: string; // the error, empty when ok
-  warning: string; // the footer label, empty when ok
+  warning: string; // the failing label, empty when ok
+  last_ok?: number; // epoch seconds: when the last sync that worked started
 };
 
-/**
- * The footer label: state.json's `warning`, empty while backups work. No file
- * means no sync has finished since install. The script writes it atomically,
- * so a file that does not parse is not a half-written one.
- */
-export function warning(file: string | undefined, notRun?: string): string | undefined {
-  if (notRun) return notRun.slice(0, 120);
-  if (file === undefined) return "museum: no backup yet";
+/** 2m, 3h, 4d. */
+export function ago(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m}m`;
+  return m < 48 * 60 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d`;
+}
+
+/** state.json's fields; undefined when there is none, null when it is not a JSON object. */
+function parse(file: string | undefined): State | undefined | null {
+  if (file === undefined) return undefined;
   try {
-    return (JSON.parse(file) as State).warning || undefined;
+    const state: unknown = JSON.parse(file);
+    return state && typeof state === "object" && !Array.isArray(state) ? (state as State) : null;
   } catch {
-    return "museum: state.json does not parse";
+    return null;
   }
 }
 
-/**
- * `git rev-parse --path-format=absolute --git-common-dir HEAD --abbrev-ref HEAD`
- * output and the origin URL, plus mu's pane variables, as one Meta.
- */
-export function meta(revParse: string, remote: string, env: Record<string, string | undefined>): Meta {
-  // --abbrev-ref applies to every argument after it, so the commit comes first.
-  const [common, commit, branch] = revParse.trim().split("\n");
-  // The common dir is <repo>/.git for a plain repo and for every worktree of it.
-  const repo = common?.endsWith("/.git") ? dirname(common) : undefined;
-  const m: Meta = {
-    project: repo ? repo.split("/").pop() : env.MU_WORKSTREAM,
-    repo,
-    remote: remote.trim() || undefined,
-    branch: branch && branch !== "HEAD" ? branch : undefined,
-    commit: commit || undefined,
-    workstream: env.MU_WORKSTREAM || undefined,
-    agent: env.MU_AGENT_NAME || undefined,
-  };
-  return Object.fromEntries(Object.entries(m).filter(([, v]) => v)) as Meta;
+/** When the last sync that worked started, 0 for never. */
+function lastOkOf(state: State | undefined | null): number {
+  // state.json from before last_ok: an ok sync's time is when it finished.
+  return state?.last_ok ?? (state?.status === "ok" ? state.time : 0);
 }
 
-async function record(pi: ExtensionAPI, ctx: Ctx): Promise<void> {
-  // A resumed or reloaded session already has its entry.
-  if (ctx.sessionManager.getEntries().some((e) => e.type === "custom" && e.customType === "museum")) return;
-  const git = (args: string[]) =>
-    pi.exec("git", args, { cwd: ctx.cwd, timeout: 3000 }).then(
-      (r) => (r.code === 0 ? r.stdout : ""),
-      () => "",
-    );
-  const [revParse, remote] = await Promise.all([
-    git(["rev-parse", "--path-format=absolute", "--git-common-dir", "HEAD", "--abbrev-ref", "HEAD"]),
-    git(["config", "--get", "remote.origin.url"]),
-  ]);
-  const m = meta(revParse, remote, process.env);
-  if (Object.keys(m).length > 0) pi.appendEntry("museum", m);
+/**
+ * When this pi first saw this session's file changed after the last sync that
+ * worked, carried from poll to poll: `since` is the previous answer.
+ * undefined while nothing is unsynced.
+ */
+export function unsyncedSince(
+  file: string | undefined,
+  changed: number | undefined,
+  since: number | undefined,
+  now: number = Date.now() / 1000,
+): number | undefined {
+  const lastOk = lastOkOf(parse(file));
+  if (changed === undefined || !lastOk || changed <= lastOk) return undefined;
+  return since ?? now;
+}
+
+/**
+ * The footer label, undefined while backups work. `file` is state.json, which
+ * museum-sync writes atomically, so one that does not parse is not a
+ * half-written one. `changed` is when this session's file last changed, in
+ * epoch seconds, undefined before pi has written it; `since` is
+ * unsyncedSince's answer.
+ *
+ * Stale means a change has waited longer than a working timer lets it, not
+ * that the last sync is old: after a break the last sync is hours old and the
+ * first new turn is seconds old. The change waited at least since the earlier
+ * of its file's mtime and when this pi first saw it unsynced, which also
+ * catches a session that writes on and so keeps its mtime fresh.
+ */
+export function warning(
+  file: string | undefined,
+  notRun: string | undefined,
+  changed: number | undefined,
+  now: number = Date.now() / 1000,
+  since: number | undefined = undefined,
+  staleAfter: number = STALE_S,
+): string | undefined {
+  if (notRun) return notRun.slice(0, 120);
+  const state = parse(file);
+  if (state === null) return "museum: state.json does not parse · museum doctor";
+  if (state?.warning) return state.warning;
+  const lastOk = lastOkOf(state);
+  if (!lastOk) return "museum: no backup yet · museum doctor";
+  if (changed === undefined || changed <= lastOk) return undefined;
+  const waited = now - Math.min(changed, since ?? changed);
+  if (waited <= staleAfter) return undefined;
+  return `museum: backup stale (last ok ${ago(now - lastOk)} ago) · museum doctor`;
+}
+
+function read(name: string): string | undefined {
+  try {
+    return readFileSync(join(STATE_DIR, name), "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function mtime(file: string | undefined): number | undefined {
+  try {
+    return file ? statSync(file).mtimeMs / 1000 : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export default function museum(pi: ExtensionAPI): void {
   let timer: ReturnType<typeof setInterval> | undefined;
   // null: nothing set yet, so the first show() always sets the status.
   let shown: string | undefined | null = null;
+  let since: number | undefined;
   const show = (ctx: Ctx) => {
-    const text = warning(read("state.json"), notRun);
+    const file = read("state.json");
+    const changed = mtime(ctx.sessionManager.getSessionFile());
+    const now = Date.now() / 1000;
+    since = unsyncedSince(file, changed, since, now);
+    const text = warning(file, notRun, changed, now, since, STALE_AFTER);
     if (text !== shown) ctx.ui.setStatus("museum", text);
     shown = text;
   };
@@ -227,26 +239,16 @@ export default function museum(pi: ExtensionAPI): void {
     clearInterval(timer);
     timer = undefined;
   };
-  // --if-due, not --now: mu starts agents in batches, and each start forcing
-  // a sync would turn a crew launch into a sync storm for nothing.
   pi.on("session_start", (_event, ctx) => {
     if (ctx.hasUI) {
       stop();
       shown = null;
+      since = undefined;
       show(ctx);
       timer = setInterval(() => show(ctx), POLL_MS);
       timer.unref?.();
     }
-    run("--if-due");
-    // Not awaited: git must never delay pi's startup.
-    record(pi, ctx).catch(() => {});
+    hook(ctx);
   });
-  pi.on("agent_settled", () => run("--if-due"));
-  // Delayed: other extensions still write to the session after this handler
-  // (a session name, for one), and a sync that starts now would miss them
-  // until the next one. The child is detached, so pi does not wait.
-  pi.on("session_shutdown", () => {
-    stop();
-    run("--now", 5);
-  });
+  pi.on("session_shutdown", () => stop());
 }

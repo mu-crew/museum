@@ -74,7 +74,7 @@ class LocalStore(Sandbox):
     def test_copies_sessions_only_and_records_ok(self) -> None:
         r = self.run_sync()
         self.assertEqual(r.returncode, 0, r.stderr)
-        copied = self.store / "box" / "--proj--"
+        copied = self.store / "box" / "pi" / "--proj--"
         self.assertEqual(sorted(p.name for p in copied.iterdir()), ["s1.jsonl"])
 
     def test_syncs_from_a_deleted_cwd(self) -> None:
@@ -99,7 +99,7 @@ class LocalStore(Sandbox):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.state_field("status"), "ok")
-        self.assertTrue((self.store / "box" / "--proj--" / "s1.jsonl").exists())
+        self.assertTrue((self.store / "box" / "pi" / "--proj--" / "s1.jsonl").exists())
         self.assertEqual(self.state_field("status"), "ok")
         self.assertEqual(self.state_field("warning"), "")
         self.assertFalse((self.state / "pending").exists())
@@ -121,7 +121,7 @@ class LocalStore(Sandbox):
         self.run_sync()
         (self.src / "--proj--" / "s2.jsonl").unlink()
         self.run_sync()
-        copied = self.store / "box" / "--proj--"
+        copied = self.store / "box" / "pi" / "--proj--"
         self.assertTrue((copied / "s2.jsonl").exists())
         self.assertEqual((copied / "s1.jsonl").read_text(), '{"a":1}\n{"b":2}\n')
 
@@ -163,9 +163,9 @@ class LocalStore(Sandbox):
         (self.src / "--proj--" / "s3.jsonl").write_text("{}\n")
         self.assertEqual(self.run_sync("--if-due").returncode, 0)
         self.assertEqual((self.state / "last-start").read_text(), before)
-        self.assertFalse((self.store / "box" / "--proj--" / "s3.jsonl").exists())
+        self.assertFalse((self.store / "box" / "pi" / "--proj--" / "s3.jsonl").exists())
         self.run_sync("--if-due", MUSEUM_INTERVAL="0")
-        self.assertTrue((self.store / "box" / "--proj--" / "s3.jsonl").exists())
+        self.assertTrue((self.store / "box" / "pi" / "--proj--" / "s3.jsonl").exists())
 
     def test_held_lock_leaves_pending_for_the_holder(self) -> None:
         self.state.mkdir()
@@ -182,7 +182,7 @@ class LocalStore(Sandbox):
             os.close(fd)
         # The next caller (the holder, in real life) picks up the mark.
         self.run_sync("--if-due")
-        self.assertTrue((self.store / "box" / "--proj--" / "s1.jsonl").exists())
+        self.assertTrue((self.store / "box" / "pi" / "--proj--" / "s1.jsonl").exists())
         self.assertFalse((self.state / "pending").exists())
 
     def test_unwritable_store_records_the_error(self) -> None:
@@ -455,7 +455,7 @@ class Init(unittest.TestCase):
 
     def init(self, *args: str, root: Path = ROOT) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["sh", str(root / "bin/museum"), "init", *args],
+            [str(root / "bin/museum"), "init", *args],
             env=self.env,
             capture_output=True,
             text=True,
@@ -506,20 +506,20 @@ class Init(unittest.TestCase):
         self.assertEqual(
             [h["command"] for h in start], ["murmur hook claude", "museum hook claude"]
         )
-        self.assertEqual(
-            doc["hooks"]["SessionEnd"],
-            [{"hooks": [{"type": "command", "command": "museum hook claude"}]}],
-        )
+        # Hooks start no syncs, so museum has no SessionEnd entry.
+        self.assertNotIn("SessionEnd", doc["hooks"])
         cursor = json.loads((self.home / ".cursor/hooks.json").read_text())
         self.assertEqual(cursor["version"], 1)
-        self.assertEqual(cursor["hooks"]["sessionEnd"], [{"command": "museum hook cursor-agent"}])
+        self.assertEqual(
+            cursor["hooks"], {"sessionStart": [{"command": "museum hook cursor-agent"}]}
+        )
         # Harnesses not set up here get nothing, unless asked for.
         self.assertFalse((self.home / ".codex").exists())
         self.assertFalse((self.home / ".config/muse").exists())
         # A second run changes nothing, not even formatting.
         before = claude.read_text()
         r = self.init("--hooks", "muse")
-        self.assertIn("hooks muse: added SessionStart, SessionEnd", r.stdout)
+        self.assertIn("hooks muse: added SessionStart (", r.stdout)
         self.assertEqual(claude.read_text(), before)
         self.assertTrue((self.home / ".config/muse/settings.json").is_file())
 
@@ -577,7 +577,7 @@ class Init(unittest.TestCase):
     def test_status_shows_this_machine_then_every_machine(self) -> None:
         self.assertEqual(self.init(str(self.store), "box").returncode, 0)
         r = subprocess.run(
-            ["sh", str(ROOT / "bin/museum"), "status"],
+            [str(ROOT / "bin/museum"), "status"],
             env=self.env,
             capture_output=True,
             text=True,
@@ -591,7 +591,7 @@ class Init(unittest.TestCase):
         self.assertTrue(any(line.startswith("box ") and version in line for line in lines))
         (self.dir / "state/state.json").write_text("{broken")
         r = subprocess.run(
-            ["sh", str(ROOT / "bin/museum"), "status"],
+            [str(ROOT / "bin/museum"), "status"],
             env=self.env,
             capture_output=True,
             text=True,
@@ -732,14 +732,14 @@ class Units(unittest.TestCase):
             }
         }
         added, fixed, removed = sync.plan_hooks("codex", root)
-        self.assertEqual((added, fixed), (["SessionEnd"], []))
+        self.assertEqual((added, fixed), ([], []))
         self.assertEqual(
             removed, ["SessionStart: museum hook codex", "Stop: museum-sync --hook codex"]
         )
         self.assertEqual(root["hooks"]["SessionStart"], [{"hooks": [mine]}])
         self.assertNotIn("Stop", root["hooks"])
         self.assertEqual(sync.plan_hooks("codex", root), ([], [], []))
-        for bad in ({"hooks": {"SessionEnd": {}}}, {"hooks": []}):
+        for bad in ({"hooks": {"SessionStart": {}}}, {"hooks": []}):
             with self.subTest(bad=bad), self.assertRaises(sync.Unworkable):
                 sync.plan_hooks("codex", bad)
         # A kept handler without a type gets one, and that is a change to write;
@@ -752,7 +752,16 @@ class Units(unittest.TestCase):
         }
         added, fixed, removed = sync.plan_hooks("codex", typeless)
         self.assertEqual(fixed, ["SessionStart: type"])
-        self.assertEqual((added, removed), (["SessionEnd"], ["SessionEnd: museum hook codex"]))
+        self.assertEqual((added, removed), ([], ["SessionEnd: museum hook codex"]))
+        # An older install's SessionEnd entry goes: hooks no longer start syncs.
+        old = {
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "museum hook codex"}]}],
+                "SessionEnd": [{"hooks": [{"type": "command", "command": "museum hook codex"}]}],
+            }
+        }
+        self.assertEqual(sync.plan_hooks("codex", old), ([], [], ["SessionEnd: museum hook codex"]))
+        self.assertNotIn("SessionEnd", old["hooks"])
         # Older hand-written forms: quoted, or through python3.
         for old in ('"$HOME/m/bin/museum" hook claude', "python3 /x/bin/museum-sync --hook claude"):
             with self.subTest(old=old):

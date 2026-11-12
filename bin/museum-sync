@@ -3,18 +3,22 @@
 
   museum-sync --if-due        sync if the last one started over MUSEUM_INTERVAL ago
   museum-sync [--now]         sync now; if a sync is already running, it runs again after
-  museum-sync --hook HARNESS  a harness hook: SessionStart writes the meta record,
-                              SessionEnd leaves the flush stamp for `museum tick`
+  museum-sync --hook HARNESS  a harness hook: SessionStart writes the meta record
   museum-sync init [STORE [MACHINE]] [--hooks LIST|all] [--no-hooks]
                               set this machine up (`museum init`): config, harness
                               hooks and skills, PATH, the first sync, the timer
   museum-sync status          this machine's last sync, then every machine's museum
+  museum-sync doctor          check this machine's setup, with the fix for each problem
+  museum-sync tick            start a sync, detached, if one is due and sessions changed
+  museum-sync timer install|remove   run `museum tick` every 5 minutes (launchd or systemd)
 
-pi's sessions are copied as they are, to <store>/<machine>/<pi cwd folder>/. claude's
-and codex's go through a filter first (see stage()), to
-<store>/<machine>/<harness>/<project folder>/.
+Every harness's sessions go to <store>/<machine>/<harness>/<project folder>/. pi's
+are copied as they are; claude's, codex's and cursor-agent's go through a filter
+first (see stage()). Only `museum tick` (the timer, tmux) and `museum sync` start a
+sync: hooks run in harness sandboxes that may refuse ssh and rsync, so they only
+write meta records.
 
-Many pi agents on one node call this at once, so at most one sync runs per node.
+A timer, tmux and a hand-run sync can call this at once, so at most one sync runs per node.
 The lock is flock(2) on a file descriptor: it dies with its holder, so a crash or
 reboot cannot leave it held. A caller that finds the lock taken exits 0 at once;
 with --now it first leaves a `pending` mark, and the holder syncs again before it
@@ -45,6 +49,7 @@ import fcntl
 import io
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -52,7 +57,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, TextIO
@@ -280,12 +285,16 @@ def settings() -> Settings:
     env = os.environ
     return Settings(
         config=load_config(path),
-        src=Path(env.get("PI_SESSIONS_DIR", HOME / ".pi/agent/sessions")),
+        src=pi_sessions(env),
         state=state_dir(),
         interval=int(env.get("MUSEUM_INTERVAL", "600")),
         retry_delay=int(env.get("MUSEUM_RETRY_DELAY", "30")),
         sources=harness_sources(env),
     )
+
+
+def pi_sessions(env: Mapping[str, str]) -> Path:
+    return Path(env.get("PI_SESSIONS_DIR") or HOME / ".pi/agent/sessions")
 
 
 def harness_sources(env: Mapping[str, str]) -> tuple[Source, ...]:
@@ -341,17 +350,91 @@ def run(cmd: list[str]) -> Result:
     return Result(p.returncode, p.stdout)
 
 
+# Moves what museum before 0.6 left at the top of a machine's folder, pi's
+# <cwd folder>s and its oldest top-level sessions, into pi/, where every sync
+# since puts them. It runs before every copy, as part of it, so a machine
+# migrates its own folder on its first sync with this version and never
+# touches another's; once moved, the globs match nothing. A file in both
+# places is a session the old layout kept growing: the longer copy is kept in
+# pi/, and the other is removed only when it is a prefix of it. Anything else
+# is left where it is, with a line on stderr. $1: the machine's folder.
+#
+# It reaches the store host through rsync's --rsync-path, parsed first by the
+# store host's login shell, so it is sent as one line (one_line) with no `!`
+# outside `[ ! `: csh and tcsh reject a newline inside quotes and expand `!x`
+# even inside them.
+MIGRATE = r"""
+PATH=$PATH:/usr/bin:/bin
+cd "$1" || exit 1
+fail() { echo "museum: migrate: $*" >&2; exit 1; }
+size() { wc -c < "$1" | tr -d ' '; }
+merge() {
+  if [ ! -e "$2" ]; then
+    mv "$1" "$2" || fail "cannot move $1"
+    return
+  fi
+  a=$(size "$1") b=$(size "$2")
+  if [ "$a" -gt "$b" ]; then
+    head -c "$b" "$1" | cmp -s - "$2" && { mv -f "$1" "$2" || fail "cannot move $1"; }
+  else
+    head -c "$a" "$2" | cmp -s - "$1" && rm -f "$1"
+  fi
+  [ ! -e "$1" ] || echo "museum: migrate: left $1: it differs from $2" >&2
+}
+for d in ./--*-- ./*.jsonl; do
+  [ -e "$d" ] || continue
+  n=${d#./}
+  mkdir -p pi || fail "cannot create pi/"
+  if [ -d "$d" ] && [ -d "pi/$n" ]; then
+    for f in "$d"/*; do
+      [ -f "$f" ] && merge "$f" "pi/$n/${f##*/}"
+    done
+    rmdir "$d" 2> /dev/null || echo "museum: migrate: left $d: not empty" >&2
+  else
+    merge "$d" "pi/$n"
+  fi
+done
+exit 0
+"""
+
+
+def one_line(script: str) -> str:
+    """A shell script on one line: each line ends with `;` unless it opens a
+    block or continues a list. Only for scripts written to allow it."""
+    out = ""
+    for line in filter(None, (raw.strip() for raw in script.splitlines())):
+        out += line + (" " if line.endswith(("then", "do", "else", "{", "&&", "||", "|")) else "; ")
+    return out.removesuffix("; ")
+
+
+def pi_link(s: Settings) -> Path | None:
+    """<state>/pi-link/pi, a link to pi's sessions folder: the copy sends it
+    with --relative, so pi's sessions land in <machine>/pi/ in the same rsync
+    as every other harness, and still copied as they are, not staged."""
+    if not s.src.is_dir():
+        return None
+    link = s.state / "pi-link" / "pi"
+    if not (link.is_symlink() and link.readlink() == s.src):
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.unlink(missing_ok=True)
+        link.symlink_to(s.src)
+    return link
+
+
 def copy(s: Settings, rsync: str) -> Result:
     c = s.config
     ssh = SSH + NO_AUTH if c.ssh_mux_only else SSH
     extra = []
+    here = f"{c.path}/{c.machine}"
     if c.host:
         # `-O check` only asks the local control socket; it never connects.
         if c.ssh_mux_only and run([*ssh, "-O", "check", c.host]).code != 0:
             return Result(NO_MASTER, f"no ssh master for {c.host} (run: ssh -MNf {c.host})")
-        # The remote mkdir rides rsync's own connection, so a sync opens one
-        # ssh connection, not two.
-        extra = [f"--rsync-path=mkdir -p {shlex.quote(f'{c.path}/{c.machine}')} && rsync"]
+        # The remote mkdir and the migration ride rsync's own connection, so a
+        # sync opens one ssh connection, not two.
+        migrate = shlex.quote(one_line(MIGRATE))
+        prep = f"mkdir -p {shlex.quote(here)} && sh -c {migrate} migrate {shlex.quote(here)}"
+        extra = [f"--rsync-path={prep} && rsync"]
     else:
         # Only the machine's folder is created, never the store folder: a
         # missing one most likely means a forgotten `host` line, and creating
@@ -359,26 +442,35 @@ def copy(s: Settings, rsync: str) -> Result:
         if not Path(c.path).is_dir():
             return Result(1, f"store.path {c.path} does not exist here (is store.host missing?)")
         try:
-            Path(c.path, c.machine).mkdir(exist_ok=True)
+            Path(here).mkdir(exist_ok=True)
         except OSError as e:
             return Result(1, f"mkdir: {e}")
-    # pi's sessions go as they are. The other harnesses' filtered copies ride
-    # the same rsync, so a sync still opens one ssh connection, and a machine
-    # without them runs the very command it always did.
+        r = run(["/bin/sh", "-c", one_line(MIGRATE), "migrate", here])
+        if r.code != 0:
+            return r
+        if r.output:
+            print(r.output, file=sys.stderr, end="")
+    # pi's sessions go as they are, through pi_link; the other harnesses'
+    # filtered copies, the meta records and the version marker from the stage
+    # folder. One rsync, so a sync opens one ssh connection. `/./` marks
+    # where each source's path in the store starts.
     stage = s.state / STAGE
-    sources, meta = [f"{s.src}/"], []
-    if stage.is_dir():
-        sources = [*([f"{s.src}/"] if s.src.is_dir() else []), f"{stage}/"]
-        meta = ["--include=/*/meta/*.json", f"--include=/{VERSIONS}/*.json"]
+    link = pi_link(s)
+    sources = [f"{link.parent}/./pi/"] if link else []
+    sources += [f"{stage}/./"] if stage.is_dir() else []
+    if not sources:
+        return Result(0, "")
     r = run(
         [
             rsync,
             "-a",
+            "--relative",
             "--append-verify",
             "--timeout=120",
             "--include=*/",
             "--include=*.jsonl",
-            *meta,
+            "--include=/*/meta/*.json",
+            f"--include=/{VERSIONS}/*.json",
             "--exclude=*",
             *extra,
             "-e",
@@ -624,7 +716,7 @@ def stage(state: Path, sources: tuple[Source, ...], hooks: Path) -> None:
 
 # --- `museum hook HARNESS`: the meta record and the flush stamp ---
 
-HOOKED = ("claude", "codex", "cursor-agent", "muse")
+HOOKED = ("claude", "codex", "cursor-agent", "muse", "pi")
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -832,11 +924,14 @@ def write_meta(harness: str, payload: dict[str, Any], env: Mapping[str, str]) ->
 
 
 def hook(harness: str, stdin: TextIO) -> int:
-    """One harness hook call, its payload on stdin. SessionStart writes the
-    meta record; SessionEnd only leaves the flush stamp, since a sandboxed hook
-    cannot run rsync or ssh: `museum tick`, outside every sandbox, does the
-    sync. A hook never breaks a turn, so every problem is a line on stderr and
-    exit 0, and nothing goes to stdout, which claude would show the model."""
+    """One harness hook call, its payload on stdin: SessionStart writes the
+    meta record, which only a process in the session's own tree can learn
+    (mu's anchor, its environment, the repo as it was). Nothing syncs here: a
+    sandboxed hook cannot run rsync or ssh, and `museum tick`, outside every
+    sandbox, syncs what changed. Other events, from older installs' entries,
+    do nothing. A hook never breaks a turn, so every problem is a line on
+    stderr and exit 0, and nothing goes to stdout, which claude would show
+    the model. pi's extension calls this too, with the same payload."""
     try:
         if harness not in HOOKED:
             print(f"museum: no backup for {harness} sessions", file=sys.stderr)
@@ -850,10 +945,6 @@ def hook(harness: str, stdin: TextIO) -> int:
         event = str(payload.get("hook_event_name", "")).lower()
         if event == "sessionstart":
             write_meta(harness, payload, os.environ)
-        elif event == "sessionend":
-            state = hook_dir()
-            state.mkdir(parents=True, exist_ok=True)
-            (state / "flush").touch()
     except Exception as e:  # noqa: BLE001 (a hook never breaks a turn)
         print(f"museum: hook {harness}: {type(e).__name__}: {e}", file=sys.stderr)
     # cursor-agent treats empty stdout as a failed hook (`empty_stdout`);
@@ -867,7 +958,7 @@ def error_line(output: str) -> str:
     """ssh's or the remote mkdir's line says why; rsync's last line after it is
     only "connection unexpectedly closed" / "protocol data stream"."""
     lines = [line for line in output.splitlines() if line.strip()]
-    why = [line for line in lines if re.match(r"(ssh|mkdir): ", line)]
+    why = [line for line in lines if re.match(r"(ssh|mkdir|museum): ", line)]
     return (why or lines or [""])[-1]
 
 
@@ -881,24 +972,46 @@ def write(path: Path, text: str) -> None:
 def warning(status: str, message: str) -> str:
     """pi's footer label, empty while backups work. Every pi on the node shows
     this file as it is, so the rule for the label lives here, in one place."""
-    return f"museum: backup failing: {message}"[:120] if status == "error" else ""
+    if status != "error":
+        return ""
+    hint = " · museum doctor"
+    return f"museum: backup failing: {message}"[: 120 - len(hint)] + hint
 
 
-def record(state: Path, status: str, message: str) -> None:
-    """state.json: the last sync's result, and the footer label every pi shows."""
+def record(state: Path, status: str, message: str, started: int | None = None) -> None:
+    """state.json: the last sync's result, the footer label every pi shows,
+    and last_ok, when the last sync that worked started, which pi's footer
+    reads to tell a stale backup. `started` is set when this one worked."""
     message = " ".join(message.split())
+    last_ok = started
+    if last_ok is None:
+        try:
+            last_ok = int(json.loads((state / "state.json").read_text()).get("last_ok", 0)) or None
+        except (OSError, ValueError, TypeError, AttributeError):
+            last_ok = None
     doc = {
         "status": status,
         "time": int(time.time()),
         "message": message,
         "warning": warning(status, message),
+        **({"last_ok": last_ok} if last_ok else {}),
     }
     write(state / "state.json", json.dumps(doc) + "\n")
 
 
+def mark_ok(state: Path, started: int) -> None:
+    """`last-ok`, whose mtime is when the last sync that worked started: `museum
+    tick` syncs only when a session file is newer (find -newer). A second
+    early, so a file written in the second the sync started is not missed."""
+    ok = state / "last-ok"
+    ok.touch()
+    os.utime(ok, (started - 1, started - 1))
+
+
 def sync_once(s: Settings, rsync: str | None) -> bool:
     (s.state / "pending").unlink(missing_ok=True)
-    (s.state / "last-start").write_text(f"{int(time.time())}\n")
+    started = int(time.time())
+    (s.state / "last-start").write_text(f"{started}\n")
     if rsync is None:
         configured = s.config.rsync_path
         why = f"rsync_path {configured} is not rsync 3.x" if configured else "rsync 3.x not found"
@@ -923,7 +1036,8 @@ def sync_once(s: Settings, rsync: str | None) -> bool:
         time.sleep(s.retry_delay)
         r = copy(s, rsync)
     if r.code == 0:
-        record(s.state, "ok", "")
+        mark_ok(s.state, started)
+        record(s.state, "ok", "", started)
         return True
     record(s.state, "error", error_line(r.output))
     print(r.output, file=sys.stderr, end="")
@@ -1020,11 +1134,11 @@ HOOK_TARGETS: dict[str, tuple[str | None, str, str, str, tuple[str, ...]]] = {
         ".claude",
         "settings.json",
         "grouped",
-        ("SessionStart", "SessionEnd"),
+        ("SessionStart",),
     ),
-    "codex": ("CODEX_HOME", ".codex", "hooks.json", "grouped", ("SessionStart", "SessionEnd")),
-    "cursor-agent": (None, ".cursor", "hooks.json", "flat", ("sessionStart", "sessionEnd")),
-    "muse": (None, ".config/muse", "settings.json", "grouped", ("SessionStart", "SessionEnd")),
+    "codex": ("CODEX_HOME", ".codex", "hooks.json", "grouped", ("SessionStart",)),
+    "cursor-agent": (None, ".cursor", "hooks.json", "flat", ("sessionStart",)),
+    "muse": (None, ".config/muse", "settings.json", "grouped", ("SessionStart",)),
 }
 # museum's handlers: `museum ...`, and a path to museum or museum-sync, which
 # older setups wrote by hand. Those are replaced by the one `museum hook`.
@@ -1258,16 +1372,22 @@ def install_path() -> None:
         print(f"removed {mine}: an older install's link")
     if not npm_install():
         link(mine, want, "museum")
+    problem = path_problem()
+    if problem:
+        print(f"museum: {problem}", file=sys.stderr)
+
+
+def path_problem() -> str:
+    """What is wrong with `museum` on PATH, or ""."""
+    want = ROOT / "bin" / "museum"
     found = shutil.which("museum")
     if found is None:
         # npm's bin folder for a global install: <prefix>/lib/node_modules/@mu-crew/museum.
         bin_dir = ROOT.parents[3] / "bin" if npm_install() else want.parent
-        print(f"museum: `museum` is not on PATH; add {bin_dir}", file=sys.stderr)
-    elif Path(found).resolve() != want:
-        print(
-            f"museum: `museum` on PATH is {Path(found).resolve()}, not this one ({want})",
-            file=sys.stderr,
-        )
+        return f"`museum` is not on PATH; add {bin_dir}"
+    if Path(found).resolve() != want.resolve():
+        return f"`museum` on PATH is {Path(found).resolve()}, not this one ({want})"
+    return ""
 
 
 NPM_SOURCE = "npm:@mu-crew/museum"
@@ -1288,13 +1408,19 @@ def pi_packages() -> list[tuple[str, Path]]:
 
 
 def check_pi() -> None:
+    for line in pi_problems():
+        print(f"pi: {line}")
+
+
+def pi_problems() -> list[str]:
     """What pi needs, as commands to run: museum never edits pi's package
     list, as `mu init` does not. pi loads museum's extension and skill from
     one package, `npm:@mu-crew/museum` for an npm install (registered once
     with `pi install`) or the checkout itself; any other museum package it
     loads is an older install's, and loads the extension twice."""
     if not shutil.which("pi"):
-        return
+        return []
+    out = []
     want = NPM_SOURCE if npm_install() else str(ROOT)
 
     def mine(source: str, folder: Path) -> bool:
@@ -1302,15 +1428,16 @@ def check_pi() -> None:
 
     packages = pi_packages()
     if not any(mine(source, folder) for source, folder in packages):
-        print(f"pi: run `pi install {want}` once, for museum's extension and skill")
+        out.append(f"run `pi install {want}` once, for museum's extension and skill")
     for source, folder in packages:
         if not mine(source, folder):
             # pi stores a local source relative to its settings file, and reads
             # one given to `pi remove` relative to the cwd: name it by folder.
             local = not re.match(r"^(npm|git|https?):", source)
-            print(
-                f"pi: also loads museum from {folder}; run `pi remove {folder if local else source}`"
+            out.append(
+                f"also loads museum from {folder}; run `pi remove {folder if local else source}`"
             )
+    return out
 
 
 def first_config(store: str | None, machine: str | None) -> Path:
@@ -1409,6 +1536,10 @@ def init(argv: list[str]) -> int:
         return 1
     if not ns.no_hooks:
         install_hooks(only, os.environ)
+    # Before 0.6, SessionEnd hooks left this for `museum tick`.
+    if (hook_dir() / "flush").exists():
+        (hook_dir() / "flush").unlink()
+        print(f"removed {hook_dir() / 'flush'}: hooks no longer start syncs")
     install_skills(os.environ)
     if harness_dir("muse", os.environ).is_dir():
         print("museum: Muse Code: add the skill with `muse skills`:", ROOT / "skills" / "museum")
@@ -1419,9 +1550,7 @@ def init(argv: list[str]) -> int:
     print("running first sync...")
     code = main(["--now"])
     print("ok" if code == 0 else "museum: first sync failed; see above and state.json")
-    r = run(["sh", str(ROOT / "bin" / "museum"), "timer", "install"])
-    print(r.output.strip())
-    if r.code != 0:
+    if timer_install() != 0:
         print("museum: could not install the timer", file=sys.stderr)
     return code
 
@@ -1435,11 +1564,462 @@ def status() -> int:
         doc = json.loads((state_dir() / "state.json").read_text())
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(doc.get("time", 0))))
         result = "ok" if doc.get("status") == "ok" else f"failed: {doc.get('message', '')}"
+        if doc.get("status") != "ok" and doc.get("last_ok"):
+            ok = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(doc["last_ok"])))
+            result += f" (last ok {ok})"
         print(f"last sync: {when} {result}\n")
     except (OSError, ValueError, TypeError):
         print("last sync: none yet\n")
     search = ROOT / "skills" / "museum" / "scripts" / "museum-search"
     return subprocess.run([sys.executable, str(search), "machines"], check=False).returncode
+
+
+# --- doctor: every part of this machine's setup, each with its fix ---
+#
+# Read-only. Nearly every fix is `museum init`, which leaves what is right
+# alone, so there is no --fix. It runs init's own checks (hooks, PATH, pi)
+# without writing, so the two never disagree.
+
+# ---- museum tick and its timer ----
+
+LABEL = "museum.tick"
+PERIOD = 300  # seconds between the timer's ticks
+
+
+def session_roots(src: Path, sources: tuple[Source, ...]) -> list[Path]:
+    """Every folder a sync copies from: pi's sessions, the other harnesses',
+    and the meta records hooks write."""
+    return [src, *(source.root for source in sources), hook_dir() / "meta"]
+
+
+def changed_since(roots: list[Path], since: float) -> Iterator[float]:
+    """The mtime of each session file and meta record changed after `since`.
+    A root that is itself a link is followed, as the copy follows it; links
+    inside are not."""
+    for root in roots:
+        for folder, _, names in os.walk(root):
+            for name in names:
+                if not name.endswith((".jsonl", ".json")):
+                    continue
+                try:
+                    mtime = (Path(folder) / name).stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > since:
+                    yield mtime
+
+
+def number(path: Path) -> int:
+    """A file's number, 0 when it is missing or holds anything else."""
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def tick() -> int:
+    """Start a sync, detached, when one is due and a session changed. Run by
+    the timer and a tmux status line, outside every harness sandbox; hooks
+    only write meta records.
+
+    Due when neither a sync nor an earlier check started in the last
+    MUSEUM_INTERVAL seconds. The check writes its own stamp, so the walk runs
+    once per interval however often a status line calls, and a sync that
+    cannot start (no config, old Python) is not retried on every refresh: its
+    error is in state.json already. Changed means a file newer than last-ok,
+    whose mtime is when the last sync that worked started (mark_ok), so what a
+    failed sync missed stays changed until one works. Reads no config: the
+    sync it starts does, and records what is wrong with it."""
+    state = state_dir()
+    now = int(time.time())
+    last = max(number(state / "last-start"), number(state / "last-tick"))
+    try:
+        interval = int(os.environ.get("MUSEUM_INTERVAL") or 600)
+    except ValueError:
+        interval = 600
+    if now - last < interval:
+        return 0
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "last-tick").write_text(f"{now}\n")
+    except OSError:
+        return 0
+    try:
+        ok = (state / "last-ok").stat().st_mtime
+    except OSError:
+        ok = None  # no sync has worked yet: everything is a change
+    roots = session_roots(pi_sessions(os.environ), harness_sources(os.environ))
+    if ok is not None and next(changed_since(roots, ok), None) is None:
+        return 0
+    # Detached, in its own session, so a status line or a timer never waits
+    # for rsync. The sync takes the node's lock, so a tick that races another
+    # sync adds nothing.
+    sync = os.environ.get("MUSEUM_SYNC")
+    cmd = [sync] if sync else [sys.executable, str(Path(__file__).resolve())]
+    subprocess.Popen(
+        [*cmd, "--if-due"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=HOME,
+        start_new_session=True,
+    )
+    return 0
+
+
+def timer_kind() -> str:
+    return os.environ.get("MUSEUM_TIMER_KIND") or (
+        "launchd" if sys.platform == "darwin" else "systemd"
+    )
+
+
+def launchd_plist() -> Path:
+    return Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+
+
+def systemd_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user"
+
+
+def timer_env(env: Mapping[str, str]) -> dict[str, str]:
+    """What the timer's environment gets from this one. PATH: launchd's and
+    systemd's own leave out the Homebrew or user folders that hold python3
+    3.11+. XDG_STATE_HOME and MUSEUM_STATE_DIR, when set, so its syncs share
+    pi's state folder: the lock, the cursors and state.json. The harnesses'
+    folder variables, when set and not empty, so it backs up the sessions
+    they write: the timer does every sync."""
+    out = {"PATH": env.get("PATH", "")}
+    if "MUSEUM_STATE_DIR" in env:
+        out["MUSEUM_STATE_DIR"] = env["MUSEUM_STATE_DIR"]
+    for name in (
+        "XDG_STATE_HOME",
+        "PI_SESSIONS_DIR",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "CURSOR_HOME",
+    ):
+        if env.get(name):
+            out[name] = env[name]
+    return out
+
+
+def timer_install() -> int:
+    me = str(ROOT / "bin" / "museum")
+    env = timer_env(os.environ)
+    kind = timer_kind()
+    if kind == "launchd":
+        plist = launchd_plist()
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        job = {
+            "Label": LABEL,
+            "ProgramArguments": [me, "tick"],
+            "StartInterval": PERIOD,
+            "RunAtLoad": True,
+            # The detached sync outlives `tick`, launchd's job.
+            "AbandonProcessGroup": True,
+            "EnvironmentVariables": env,
+            "StandardOutPath": "/dev/null",
+            "StandardErrorPath": "/dev/null",
+        }
+        plist.write_bytes(plistlib.dumps(job))
+        domain = f"gui/{os.getuid()}"
+        run(["launchctl", "bootout", f"{domain}/{LABEL}"])
+        # bootout returns before launchd lets go of the job, and a bootstrap
+        # that lands first fails, so wait for it to be gone.
+        for _ in range(50):
+            if run(["launchctl", "print", f"{domain}/{LABEL}"]).code != 0:
+                break
+            time.sleep(0.1)
+        r = run(["launchctl", "bootstrap", domain, str(plist)])
+        if r.code != 0:
+            print(r.output, file=sys.stderr, end="")
+            return 1
+        print(f"installed {plist}")
+        return 0
+    if kind == "systemd":
+        units = systemd_dir()
+        units.mkdir(parents=True, exist_ok=True)
+
+        def quoted(value: str) -> str:
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+        lines = "".join(f"Environment={quoted(f'{k}={v}')}\n" for k, v in env.items())
+        # KillMode=process: the detached sync outlives `tick`, the unit's process.
+        (units / "museum-tick.service").write_text(
+            "[Unit]\nDescription=museum: back up agent sessions if a sync is due\n\n"
+            f"[Service]\nType=oneshot\nKillMode=process\n{lines}ExecStart={quoted(me)} tick\n"
+        )
+        (units / "museum-tick.timer").write_text(
+            f"[Unit]\nDescription=museum: run museum tick every {PERIOD} seconds\n\n"
+            f"[Timer]\nOnBootSec=60\nOnUnitActiveSec={PERIOD}\n\n"
+            "[Install]\nWantedBy=timers.target\n"
+        )
+        for cmd in (["daemon-reload"], ["enable", "--now", "museum-tick.timer"]):
+            r = run(["systemctl", "--user", *cmd])
+            if r.code != 0:
+                print(r.output, file=sys.stderr, end="")
+                return 1
+        print(f"installed {units / 'museum-tick.timer'}")
+        return 0
+    print(f"museum: unknown timer kind {kind}", file=sys.stderr)
+    return 2
+
+
+def timer_remove() -> int:
+    kind = timer_kind()
+    if kind == "launchd":
+        run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"])
+        launchd_plist().unlink(missing_ok=True)
+        return 0
+    if kind == "systemd":
+        run(["systemctl", "--user", "disable", "--now", "museum-tick.timer"])
+        for name in ("museum-tick.service", "museum-tick.timer"):
+            (systemd_dir() / name).unlink(missing_ok=True)
+        run(["systemctl", "--user", "daemon-reload"])
+        return 0
+    print(f"museum: unknown timer kind {kind}", file=sys.stderr)
+    return 2
+
+
+# ---- museum doctor ----
+
+STALE = 30 * 60  # a change unsynced for longer is a stale backup, as pi's footer says
+
+# One call to the store host: whether the store is there, whether this
+# machine's folder still has the old layout, and each machine's newest version
+# marker. $1: the store folder, $2: this machine.
+PROBE = r"""
+cd "$1" 2> /dev/null || { echo nostore; exit 0; }
+echo store
+for d in "$2"/--*-- "$2"/*.jsonl; do
+  [ -e "$d" ] && { echo old; break; }
+done
+for m in */; do
+  [ -d "$m" ] || continue
+  f=$(ls -t "$m.museum" 2> /dev/null | head -n 1)
+  echo "version ${m%/} ${f%.json}"
+done
+exit 0
+"""
+
+
+class Report:
+    def __init__(self) -> None:
+        self.failed = 0
+        self.warned = 0
+
+    def line(self, mark: str, what: str, fix: str = "") -> None:
+        print(f"{mark:5} {what}")
+        if fix:
+            print(f"      fix: {fix}")
+
+    def ok(self, what: str) -> None:
+        self.line("ok", what)
+
+    def warn(self, what: str, fix: str = "") -> None:
+        self.warned += 1
+        self.line("warn", what, fix)
+
+    def fail(self, what: str, fix: str = "") -> None:
+        self.failed += 1
+        self.line("FAIL", what, fix)
+
+
+def ago(seconds: float) -> str:
+    """2m, 3h, 4d."""
+    m = int(seconds // 60)
+    if m < 60:
+        return f"{m}m"
+    return f"{m // 60}h" if m < 48 * 60 else f"{m // 1440}d"
+
+
+def release(label: str) -> tuple[int, ...]:
+    """0.5.1+abc as (0, 5, 1), for comparing machines' versions."""
+    return tuple(int(n) for n in re.findall(r"\d+", label.partition("+")[0]))
+
+
+def timer_program() -> tuple[str, str]:
+    """(problem, the program the timer runs). The problem is "" when the timer
+    is installed and loaded."""
+    kind = timer_kind()
+    if kind == "launchd":
+        plist = launchd_plist()
+        if not plist.exists():
+            return "no timer: not installed", ""
+        r = run(["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"])
+        if r.code != 0:
+            return f"timer {plist} is not loaded", ""
+        m = re.search(r"^\s*program = (.+)$", r.output, re.MULTILINE)
+        return "", m[1].strip() if m else ""
+    if kind == "systemd":
+        unit = systemd_dir() / "museum-tick.service"
+        if not unit.exists():
+            return "no timer: not installed", ""
+        r = run(["systemctl", "--user", "is-active", "museum-tick.timer"])
+        if r.output.strip() != "active":
+            return f"timer museum-tick.timer is {r.output.strip() or 'not active'}", ""
+        m = re.search(r'^ExecStart="?([^"\n]+?)"? tick$', unit.read_text(), re.MULTILINE)
+        return "", m[1] if m else ""
+    return f"unknown timer kind {kind}", ""
+
+
+def unsynced(s: Settings, since: float) -> tuple[int, float]:
+    """How many session files and meta records changed after `since`, as
+    `museum tick` looks for them, and the oldest of their mtimes: each one's
+    first unsynced change is no later, so that change waited at least since."""
+    n, oldest = 0, time.time()
+    for mtime in changed_since(session_roots(s.src, s.sources), since):
+        n += 1
+        oldest = min(oldest, mtime)
+    return n, oldest
+
+
+def doctor() -> int:
+    line_buffered()
+    r = Report()
+    info = version_info()
+    print(f"museum {version_label(info)} ({info['source']}: {ROOT})\n")
+    try:
+        s = settings()
+    except ConfigError as e:
+        r.fail(f"config: {e}", "museum init STORE")
+        return 1
+    c = s.config
+    r.ok(f"config {config_path()}: machine {c.machine}, store {c.target()}")
+
+    rsync = find_rsync(c.rsync_path)
+    if rsync:
+        r.ok(f"rsync 3: {rsync}")
+    else:
+        r.fail("rsync 3.x not found", "brew install rsync (macOS), then museum init")
+
+    # The store, in one call.
+    probe = None
+    if c.host:
+        ssh = SSH + NO_AUTH if c.ssh_mux_only else SSH
+        if c.ssh_mux_only and run([*ssh, "-O", "check", c.host]).code != 0:
+            r.fail(f"store: no ssh master for {c.host}", f"ssh -MNf {c.host}")
+        else:
+            cmd = f"sh -c {shlex.quote(PROBE)} probe {shlex.quote(c.path)} {shlex.quote(c.machine)}"
+            out = run([*ssh, c.host, cmd])
+            if out.code == 0:
+                probe = out.output
+            else:
+                r.fail(f"store: cannot reach {c.host}: {error_line(out.output)}", f"ssh {c.host}")
+    else:
+        probe = run(["/bin/sh", "-c", PROBE, "probe", c.path, c.machine]).output
+    if probe is not None:
+        lines = probe.splitlines()
+        if "store" not in lines:
+            r.fail(f"store: {c.path} does not exist", "check store.path, or museum init")
+        else:
+            r.ok(f"store: {c.target()} reachable")
+            if "old" in lines:
+                r.warn(
+                    f"store: {c.machine}'s pi sessions are in the old layout",
+                    "museum sync; a file it leaves differs from its copy in pi/ (the sync names it): compare and remove one",
+                )
+            mine = version_label(info)
+            for v in (ln.split()[1:] for ln in lines if ln.startswith("version ")):
+                if not v or v[0] == c.machine:
+                    continue
+                if len(v) == 1:
+                    r.warn(
+                        f"machine {v[0]} reports no version (museum before 0.4.0, or never synced)",
+                        f"on {v[0]}: npm i -g @mu-crew/museum && museum init",
+                    )
+                elif release(v[1]) < release(mine):
+                    r.warn(
+                        f"machine {v[0]} runs museum {v[1]}",
+                        f"on {v[0]}: npm update -g @mu-crew/museum && museum init",
+                    )
+                elif release(v[1]) > release(mine):
+                    r.warn(
+                        f"machine {v[0]} runs a newer museum, {v[1]}",
+                        "npm update -g @mu-crew/museum && museum init",
+                    )
+
+    problem, program = timer_program()
+    want = ROOT / "bin" / "museum"
+    if problem:
+        r.fail(problem, "museum timer install")
+    elif program and Path(program).resolve() != want.resolve():
+        r.fail(f"the timer runs {program}, not this museum", "museum init")
+    else:
+        r.ok("timer: runs museum tick every 5 minutes")
+    if sys.platform.startswith("linux") and shutil.which("loginctl"):
+        user = os.environ.get("USER") or ""
+        linger = run(["loginctl", "show-user", user, "-p", "Linger", "--value"]).output.strip()
+        if linger != "yes":
+            r.warn(
+                "linger is off: the timer stops while you are logged out", "loginctl enable-linger"
+            )
+
+    try:
+        doc = json.loads((s.state / "state.json").read_text())
+    except (OSError, ValueError):
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    last_ok = int(doc.get("last_ok") or 0)
+    now = time.time()
+    if doc.get("status") == "error":
+        r.fail(f"last sync failed: {doc.get('message', '')}", "museum sync, to see the error")
+    if not last_ok:
+        if doc.get("status") == "ok":  # from before last_ok was recorded
+            last_ok = int(doc.get("time") or 0)
+        else:
+            r.fail("no sync has worked yet", "museum sync")
+    if last_ok:
+        # Stale when a change has waited longer than a working timer lets it,
+        # not when the last sync is old: an idle machine has nothing to sync.
+        changed, oldest = unsynced(s, last_ok - 1)
+        if changed and now - oldest > max(STALE, s.interval + 600):
+            r.fail(
+                f"backup stale: {changed} session files changed since the last good sync "
+                f"{ago(now - last_ok)} ago, the first {ago(now - oldest)} ago",
+                "the timer and store fixes above, then museum sync",
+            )
+        elif doc.get("status") == "ok":
+            r.ok(f"last sync ok, {ago(now - last_ok)} ago; {changed} files changed since")
+
+    for harness, (_, _, name, _, events) in HOOK_TARGETS.items():
+        folder = harness_dir(harness, os.environ)
+        path = folder / name
+        if not folder.is_dir() and not path.exists():
+            continue
+        try:
+            text = path.read_text() if path.exists() else ""
+            root = json.loads(text, parse_constant=reject_constant) if text.strip() else {}
+            if not isinstance(root, dict):
+                raise Unworkable("it is not a JSON object")
+            added, fixed, removed = plan_hooks(harness, root)
+        except (OSError, ValueError, Unworkable) as e:
+            r.fail(f"hooks {harness}: cannot read {path}: {e}", f"fix {path}")
+            continue
+        if added or fixed or removed:
+            what = "; ".join(
+                [f"missing {', '.join(added)}"] * bool(added)
+                + [f"to fix {', '.join(fixed)}"] * bool(fixed)
+                + [f"old {', '.join(removed)}"] * bool(removed)
+            )
+            r.warn(f"hooks {harness}: {what}", "museum init")
+        else:
+            r.ok(f"hooks {harness}: museum hook {harness} on {', '.join(events)}")
+
+    for line in pi_problems():
+        r.warn(f"pi: {line}")
+    if problem := path_problem():
+        r.warn(problem)
+
+    print()
+    if r.failed:
+        print(f"{r.failed} problem(s), {r.warned} warning(s)")
+    elif r.warned:
+        print(f"backups work; {r.warned} warning(s)")
+    else:
+        print("all good")
+    return 1 if r.failed else 0
 
 
 def parse(argv: list[str]) -> argparse.Namespace:
@@ -1472,6 +2052,12 @@ def main(argv: list[str]) -> int:
         return init(argv[1:])
     if argv[:1] == ["status"]:
         return status()
+    if argv[:1] == ["doctor"]:
+        return doctor()
+    if argv[:1] == ["tick"]:
+        return tick()
+    if argv[:1] == ["timer"] and argv[1:] in (["install"], ["remove"]):
+        return timer_install() if argv[1] == "install" else timer_remove()
     ns = parse(argv)
     if ns.version:
         info = version_info()
@@ -1529,6 +2115,8 @@ def guarded(argv: list[str]) -> int:
     try:
         return main(argv)
     except Exception as e:
+        if argv[:1] in (["doctor"], ["status"]):  # read-only: they record nothing
+            raise
         with contextlib.suppress(OSError):
             record(state_dir(), "error", f"museum-sync crashed: {type(e).__name__}: {e}")
         raise

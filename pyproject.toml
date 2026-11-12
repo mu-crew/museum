@@ -1,11 +1,11 @@
 # Config for the Python gates only: museum is not a Python package. The
-# scripts (bin/museum-sync, skills/museum/scripts/museum-search) are
+# scripts (bin/museum, bin/museum-sync, skills/museum/scripts/museum-search) are
 # stdlib-only single files. They need Python 3.11 for tomllib, hence the
-# 3.11 target; museum-search's store-host side runs on any python3.
+# 3.11 target; bin/museum and museum-search's store-host side run on any python3.
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-extend-include = ["bin/museum-sync", "skills/museum/scripts/museum-search"]
+extend-include = ["bin/museum", "bin/museum-sync", "skills/museum/scripts/museum-search"]
 
 [tool.ruff.lint]
 extend-select = ["I", "UP", "B", "SIM", "RUF", "PTH"]
@@ -14,4 +14,4 @@ extend-select = ["I", "UP", "B", "SIM", "RUF", "PTH"]
 python-version = "3.11"
 
 [tool.ty.src]
-include = ["bin/museum-sync", "skills/museum/scripts/museum-search", "test"]
+include = ["bin/museum", "bin/museum-sync", "skills/museum/scripts/museum-search", "test"]

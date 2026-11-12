@@ -124,11 +124,15 @@ def tier(line: str) -> int:
     return SYSTEM if role == "system" else TOOL
 
 
-# Where museum-sync puts each harness's sessions, told apart by depth:
+# Where museum-sync puts each harness's sessions:
 #
-#   <host>/<pi folder>/<time>_<id>.jsonl                   pi
-#   <host>/<time>_<id>.jsonl                               pi, from before its
+#   <host>/pi/<pi folder>/<time>_<id>.jsonl                pi
+#   <host>/pi/<time>_<id>.jsonl                            pi, from before its
 #                                                          per-cwd folders
+#   <host>/<pi folder>/<time>_<id>.jsonl                   pi, both as museum
+#   <host>/<time>_<id>.jsonl                               before 0.6 left them,
+#                                                          until that machine's
+#                                                          next sync moves them
 #   <host>/claude/<project>/<id>.jsonl                     claude
 #   <host>/claude/<project>/<id>/subagents/agent-<x>.jsonl claude's subagents,
 #   <host>/claude/<project>/<id>/subagents/workflows/<run>/agent-<x>.jsonl
@@ -139,7 +143,7 @@ def tier(line: str) -> int:
 #
 # muse's session format is not known yet: its folder stays out of every
 # command, and rg on the store still finds it.
-HARNESS_FOLDERS = frozenset({"claude", "codex", "cursor-agent", "muse"})
+HARNESS_FOLDERS = frozenset({"claude", "codex", "cursor-agent", "muse", "pi"})
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -161,6 +165,10 @@ class Session(NamedTuple):
             return cls(path, parts[0], "", parts[1])
         if n == 3 and top not in HARNESS_FOLDERS:
             return cls(path, parts[0], parts[1], parts[2])
+        if top == "pi" and n == 3:
+            return cls(path, parts[0], "", parts[2])
+        if top == "pi" and n == 4 and parts[2] != "meta":
+            return cls(path, parts[0], parts[2], parts[3])
         # A subagent's transcript is agent-<id>.jsonl, under subagents/ or a
         # workflow run's folder below it, beside the run's journal.jsonl.
         subagent = (
@@ -179,7 +187,9 @@ class Session(NamedTuple):
 
     def dir(self) -> str:
         """The project folder, as a store path: what PROJECT selects."""
-        return "/".join(self.path.split("/")[: 2 if self.harness == "pi" else 3])
+        parts = self.path.split("/")
+        old_pi = self.harness == "pi" and parts[1] != "pi"
+        return "/".join(parts[: 2 if old_pi else 3])
 
     def id(self) -> str:
         stem = self.name.removesuffix(".jsonl")
@@ -193,6 +203,8 @@ class Session(NamedTuple):
         a claude subagent's is its parent's, a cursor-agent file's is its name,
         a codex rollout's is in its session_meta record and its name."""
         parts = self.path.split("/")
+        if self.harness == "pi":
+            return [self.id()]
         if self.harness in ("claude", "cursor-agent"):
             return [parts[3].removesuffix(".jsonl")]
         if self.harness != "codex":
@@ -802,7 +814,16 @@ def stream(s: Session) -> Iterator[dict[str, Any]]:
     one at a time; the others are merged in memory."""
     path = Path(s.path)
     if s.harness == "pi":
-        yield from entries(path)
+        # pi's extension wrote its record into the session before 0.6, and
+        # `museum hook pi` writes it beside the session since.
+        meta = record(s)
+        for entry in entries(path):
+            yield entry
+            if meta and entry.get("type") == "session":
+                yield {"type": "custom", "customType": "museum", "data": meta}
+                meta = {}
+        if meta:
+            yield {"type": "custom", "customType": "museum", "data": meta}
         return
     if s.harness == "cursor-agent":
         try:
@@ -876,13 +897,23 @@ def snippet(s: str, term: str) -> str | None:
     return s[max(0, i - SNIPPET) : i + len(term) + SNIPPET]
 
 
+# rg globs that keep the other harnesses' folders out of a whole-store pass.
+NOT_PI = [g for h in sorted(HARNESS_FOLDERS - {"pi"}) for g in ("-g", f"!/*/{h}/")]
+
+
 def rg(args: list[str], dirs: list[str], deep: bool = False) -> list[str]:
     """rg's output lines over the store's session files: <host>/... from the
-    store, <dir>/<file> from a PROJECT dir. Unless deep, only pi's: the depth
-    keeps out the other harnesses' deeper folders."""
-    depth = [] if deep else ["--max-depth", "3" if dirs == ["."] else "1"]
+    store, <dir>/<file> from a PROJECT dir. Unless deep, only pi's: from the
+    store, the other harnesses' folders are left out by name, and a PROJECT
+    dir's own files are all one harness's."""
+    if deep:
+        limit = []
+    elif dirs == ["."]:
+        limit = ["--max-depth", "4", *NOT_PI]
+    else:
+        limit = ["--max-depth", "1"]
     out = subprocess.run(
-        ["rg", "-i", "-g", "*.jsonl", *depth, *args, "--", *dirs],
+        ["rg", "-i", "-g", "*.jsonl", *limit, *args, "--", *dirs],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -986,7 +1017,10 @@ def matching_files(
 # find reads the files as before.
 
 TURNS = ".museum-turns.sqlite"
-TURNS_VERSION = 1
+# 2 since 0.6, for the pi/ layout: a museum before it drops the rows of every
+# session it cannot place, pi's under pi/ among them, and the next search here
+# would read them all again. It now leaves this index alone and reads files.
+TURNS_VERSION = 2
 MIN_TERM = 3  # the trigram tokenizer cannot match a shorter term
 HEAD = 4096  # bytes hashed to notice a file replaced rather than grown
 TURN_ROLES = ('"user"', '"assistant"')  # cheap test before parsing a line
@@ -1294,7 +1328,8 @@ def summarize(s: Session, term: str) -> Summary:
     if s.harness != "pi":
         return summarize_normalised(s, path, term)
     raw = needle(term)
-    hits, tool, meta, first, match, fallback = 0, 0, {}, "", "", ""
+    hits, tool, first, match, fallback = 0, 0, "", "", ""
+    meta: dict[str, Any] = record(s)  # since 0.6, beside the session
     with path.open(encoding="utf-8", errors="replace") as f:
         for line in f:
             mentions = raw in line.lower()
@@ -1711,7 +1746,8 @@ def session_files(project: str | None, since: str | None, until: str | None) -> 
             if until and day_time[: len(until)] > until:
                 continue
         if project and project not in s.folder:
-            meta = head_meta(Path(s.path)) if s.harness == "pi" else record(s)
+            # The record first, as summarize and stream take it.
+            meta = record(s) or (head_meta(Path(s.path)) if s.harness == "pi" else {})
             if not any(project in str(meta.get(k) or "") for k in ("project", "workstream")):
                 continue
         out.append(s)

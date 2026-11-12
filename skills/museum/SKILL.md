@@ -5,21 +5,21 @@ description: Museum, the archive of all past agent sessions (pi, Claude Code, Co
 
 # Museum
 
-Every machine rsyncs `~/.pi/agent/sessions/`, and filtered copies of `~/.claude/projects/`, `~/.codex/sessions/` and `~/.cursor/projects/*/agent-transcripts/`, into one central store. The store location is the `[store]` table in `~/.config/museum/config.toml`: `path` on `host` over ssh, or a local `path` when there is no `host`. The store is up to 10 minutes behind a running session, and a finished session reaches it when it ends. `~/.local/state/museum/state.json` says when this machine last synced and why it failed, if it did.
+Every machine rsyncs `~/.pi/agent/sessions/`, and filtered copies of `~/.claude/projects/`, `~/.codex/sessions/` and `~/.cursor/projects/*/agent-transcripts/`, into one central store. The store location is the `[store]` table in `~/.config/museum/config.toml`: `path` on `host` over ssh, or a local `path` when there is no `host`. The store is up to 15 minutes behind a session, running or finished. `~/.local/state/museum/state.json` says when this machine last synced and why it failed, if it did.
 
 ## Layout
 
 ```
-<store>/<hostname>/<pi cwd folder>/<ISO timestamp>_<session id>.jsonl
+<store>/<hostname>/pi/<pi cwd folder>/<ISO timestamp>_<session id>.jsonl
 <store>/<hostname>/claude/<project folder>/<session id>.jsonl      (and <session id>/subagents/)
 <store>/<hostname>/codex/<project folder>/rollout-<timestamp>-<id>.jsonl
 <store>/<hostname>/cursor-agent/<project folder>/<session id>.jsonl
 <store>/<hostname>/<harness>/meta/<session id>.json                 (repo, branch, mu agent, workstream)
 ```
 
-`museum-search` reads all of these, and pi files at the top of a machine's folder, from before pi kept a folder per cwd. It skips `muse/`, whose format is not known yet: search it with `rg -l` on the store host. claude's and codex's project folders spell the cwd with every non-alphanumeric character as `-`, so `/home/u/proj` is `-home-u-proj`; cursor-agent keeps Cursor's `~/.cursor/projects/` folder name as-is. The filtered copies leave out API request records (and their system prompts), file snapshots, encrypted reasoning, repeated compaction histories and cursor-agent `turn_ended` lines, and cut tool output (and cursor-agent tool inputs) at 64 KB.
+`museum-search` reads all of these, and pi files in `pi/` itself, from before pi kept a folder per cwd. A machine that has not synced with museum 0.6 yet still has its pi folders at the top of its folder, `<hostname>/<pi cwd folder>/`, and those are read too. It skips `muse/`, whose format is not known yet: search it with `rg -l` on the store host. claude's and codex's project folders spell the cwd with every non-alphanumeric character as `-`, so `/home/u/proj` is `-home-u-proj`; cursor-agent keeps Cursor's `~/.cursor/projects/` folder name as-is. The filtered copies leave out API request records (and their system prompts), file snapshots, encrypted reasoning, repeated compaction histories and cursor-agent `turn_ended` lines, and cut tool output (and cursor-agent tool inputs) at 64 KB.
 
-The path records the machine, the project, and the start time. Pi encodes the cwd folder by replacing `/` with `-`, so `/Users/x/hacking/hail` is stored as `--Users-x-hacking-hail--`. mu agents run in worktrees such as `--…-.local-state-mu-workspaces-hail-worker-1--`, and those folders still contain the project name. Newer sessions also carry a `museum` custom entry that records the git repo, branch, commit and mu workstream.
+The path records the machine, the project, and the start time. Pi encodes the cwd folder by replacing `/` with `-`, so `/Users/x/hacking/hail` is stored as `--Users-x-hacking-hail--`. mu agents run in worktrees such as `--…-.local-state-mu-workspaces-hail-worker-1--`, and those folders still contain the project name. Newer sessions also have a meta record in `<hostname>/<harness>/meta/` (pi sessions from before 0.6: a `museum` custom entry inside the session) that records the git repo, branch, commit and mu workstream.
 
 ## Searching
 
@@ -95,15 +95,16 @@ executions or sessions as uniquely identified tasks.
 
 ## Backup health
 
-Use this when the user asks whether museum is working, or pi's footer shows `museum: backup failing`, `museum: no backup yet` or `museum: cannot run museum-sync`.
+Use this when the user asks whether museum is working, or pi's footer shows `museum: backup failing`, `museum: backup stale`, `museum: no backup yet` or `museum: cannot run museum-sync`.
 
-1. Read this machine's last result: `cat ~/.local/state/museum/state.json`. `status` is `ok` or `error`, `time` is epoch seconds, `message` is the last error, and `warning` is the footer label, empty when all is well. The footer shows `warning`, and every pi on the machine picks up a change within 5 seconds, so a successful sync clears it everywhere.
-2. Sync by hand to see the full error. The script is in the museum repo's `bin/`, two folders up from this skill's folder:
+1. Run `museum doctor`: it checks the config, rsync, the store, the timer, the last sync, the hooks and pi, and prints the fix for each problem. `backup stale` means sessions changed and nothing synced them for over 30 minutes: usually the timer is not installed or not running (`museum timer install`), or, on Linux, linger is off.
+2. Read this machine's last result: `cat ~/.local/state/museum/state.json`. `status` is `ok` or `error`, `time` is epoch seconds, `message` is the last error, and `warning` is the failing label, empty when all is well, and `last_ok` is when the last sync that worked started. The footer shows `warning`, and every pi on the machine picks up a change within 5 seconds, so a successful sync clears it everywhere.
+3. Sync by hand to see the full error. The script is in the museum repo's `bin/`, two folders up from this skill's folder:
    ```
    <this skill's folder>/../../bin/museum-sync
    ```
    Exit 0 means the sync succeeded, or another sync on this machine will cover it.
-3. Common causes: `python3` on PATH is older than 3.11 (`needs Python 3.11+`: on macOS, `brew install python`), a key in `config.toml` is misspelled or wrong (`unknown key`, `must be absolute`), ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), the store folder is not writable, or, with `ssh_mux_only = true` in the config, no ssh master is running (`no ssh master for <host>`: the user runs `ssh -MNf <host>`, which may need their key).
+4. Common causes: `python3` on PATH is older than 3.11 (`needs Python 3.11+`: on macOS, `brew install python`), a key in `config.toml` is misspelled or wrong (`unknown key`, `must be absolute`), ssh to the store host fails (`BatchMode=yes` never prompts, so the key must be loaded in an agent or have no passphrase), rsync 3 is missing on macOS (`brew install rsync`), the store folder is not writable, or, with `ssh_mux_only = true` in the config, no ssh master is running (`no ssh master for <host>`: the user runs `ssh -MNf <host>`, which may need their key).
 
 To see which museum each machine runs, run `museum status` (or `"$S" machines`): this machine's last sync, then each machine's version, since when, and its newest session; `behind` marks one on an older release, updated with `npm update -g @mu-crew/museum && museum init`. A machine whose newest session has stopped moving has stopped syncing.
 

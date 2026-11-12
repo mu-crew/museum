@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -146,12 +147,21 @@ class Harness(Sandbox):
         leaks = ("MU_", "GIT_")
         return {k: v for k, v in env.items() if not k.startswith(leaks) or k in extra}
 
+    def age_sources(self, seconds: float = 700) -> None:
+        """Every session file and meta record, `seconds` old."""
+        old = time.time() - seconds
+        for root in (self.src, self.dir / "claude", self.dir / "codex", self.dir / "cursor"):
+            for f in root.rglob("*"):
+                os.utime(f, (old, old))
+        for f in (self.state / "meta").rglob("*") if (self.state / "meta").is_dir() else ():
+            os.utime(f, (old, old))
+
     def records(self, path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in path.read_text().splitlines()]
 
     def hook(self, harness: str, payload: object, **env: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["sh", str(BIN / "museum"), "hook", harness],
+            [str(BIN / "museum"), "hook", harness],
             input=payload if isinstance(payload, str) else json.dumps(payload),
             capture_output=True,
             text=True,
@@ -178,7 +188,7 @@ class Store(Harness):
         self.assertTrue(
             (self.box / "claude" / "-work-proj" / SID / "subagents" / "agent-a1.jsonl").exists()
         )
-        self.assertTrue((self.box / "--proj--" / "s1.jsonl").exists())
+        self.assertTrue((self.box / "pi" / "--proj--" / "s1.jsonl").exists())
         self.assertTrue(cursor.exists())
         self.assertFalse((self.box / "cursor-agent" / "tmp-work-proj" / "other.jsonl").exists())
 
@@ -248,29 +258,76 @@ class Store(Harness):
         record = json.loads((self.box / "claude" / "meta" / f"{SID}.json").read_text())
         self.assertEqual((record["harness"], record["agent"]), ("claude", "worker-2"))
 
-    def test_final_turn_reaches_the_store_on_the_next_tick_after_session_end(self) -> None:
-        """What the 5-minute timer does: a SessionEnd's flush stamp makes the
-        next tick sync, though the 10-minute interval has not passed."""
+    def tick(self, **env: str) -> None:
+        r = subprocess.run(
+            [str(BIN / "museum"), "tick"],
+            capture_output=True,
+            text=True,
+            env=self.env(MUSEUM_INTERVAL="0", **env),
+            check=True,
+            timeout=30,
+        )
+        self.assertEqual(r.stdout, "")
+
+    def test_a_tick_syncs_what_changed_since_the_last_good_sync(self) -> None:
+        """What the 5-minute timer does: past the interval, a tick syncs when
+        a session file changed since the last sync that worked."""
         self.run_sync()
         stored = self.box / "claude" / "-work-proj" / f"{SID}.jsonl"
         final = {"type": "assistant", "message": {"role": "assistant", "content": "final turn"}}
         with self.claude_file.open("a") as f:
             f.write(json.dumps(final) + "\n")
-        end = {"hook_event_name": "SessionEnd", "session_id": SID, "reason": "exit"}
-        self.assertEqual(self.hook("claude", end).returncode, 0)
-        tick = subprocess.run(
-            ["sh", str(BIN / "museum"), "tick"],
-            capture_output=True,
-            text=True,
-            env=self.env(),
-            check=True,
-            timeout=30,
-        )
-        self.assertEqual(tick.stdout, "")
+        self.tick()
         self.wait_for(lambda: "final turn" in stored.read_text(), "final turn not synced")
-        self.assertFalse((self.state / "flush").exists())
         # The detached sync still writes state.json after the copy: let it
         # finish before the sandbox is removed.
+        self.wait_for(self.sync_idle, "sync still running")
+        self.assertEqual(self.state_field("status"), "ok")
+
+    def test_a_tick_with_nothing_changed_starts_no_sync(self) -> None:
+        # last-ok is a second early, so a file written in the sync's own
+        # second counts as changed: the fixtures are older than that.
+        self.age_sources()
+        self.run_sync()
+        before = (self.state / "last-start").read_text()
+        self.tick()
+        time.sleep(0.5)
+        self.assertEqual((self.state / "last-start").read_text(), before)
+
+    def test_a_tick_sees_changes_in_a_linked_sessions_folder(self) -> None:
+        link = self.dir / "sessions-link"
+        link.symlink_to(self.src)
+        self.age_sources()
+        self.run_sync(PI_SESSIONS_DIR=str(link))
+        (self.src / "--proj--" / "s8.jsonl").write_text("{}\n")
+        self.tick(PI_SESSIONS_DIR=str(link))
+        target = self.box / "pi" / "--proj--" / "s8.jsonl"
+        self.wait_for(target.exists, "change in a linked folder not synced")
+        self.wait_for(self.sync_idle, "sync still running")
+
+    def test_a_failed_sync_leaves_its_changes_for_the_next_tick(self) -> None:
+        self.run_sync()
+        ok = (self.state / "last-ok").stat().st_mtime
+        last_ok = self.state_field("last_ok")
+        # An rsync 3 that fails, as a dropped connection would.
+        broken = self.dir / "broken-rsync"
+        broken.write_text(
+            '#!/bin/sh\n[ "$1" = --version ] && echo "rsync  version 3.4.1" && exit 0\n'
+            'echo "rsync: connection unexpectedly closed" >&2\nexit 12\n'
+        )
+        broken.chmod(0o755)
+        good = self.config.read_text()
+        self.write_config(f'rsync_path = "{broken}"\n' + good)
+        (self.src / "--proj--" / "s9.jsonl").write_text("{}\n")
+        self.assertEqual(self.run_sync().returncode, 1)
+        # Neither the tick's mark nor state.json's last_ok moves on a failure.
+        self.assertEqual((self.state / "last-ok").stat().st_mtime, ok)
+        self.assertEqual(self.state_field("last_ok"), last_ok)
+        self.assertEqual(self.state_field("status"), "error")
+        self.write_config(good)
+        self.tick()
+        target = self.box / "pi" / "--proj--" / "s9.jsonl"
+        self.wait_for(target.exists, "change missed by the failed sync not synced")
         self.wait_for(self.sync_idle, "sync still running")
 
     def sync_idle(self) -> bool:
@@ -300,12 +357,13 @@ class Store(Harness):
         ):
             self.assertTrue(sync.sync_once(s, RSYNC))
         self.assertIn("RuntimeError: boom", err.getvalue())
-        self.assertTrue((self.box / "--proj--" / "s1.jsonl").exists())
+        self.assertTrue((self.box / "pi" / "--proj--" / "s1.jsonl").exists())
         self.assertEqual(self.state_field("status"), "ok")
 
 
-class PiUnchanged(Harness):
-    """pi's copy is the same rsync command whether or not other harnesses exist."""
+class OneRsync(Harness):
+    """Every harness rides one rsync: pi's sessions through the pi link, the
+    rest from the stage folder, each landing in <machine>/<harness>/."""
 
     def command(self, stage: bool) -> list[str]:
         s = sync.Settings(
@@ -323,27 +381,100 @@ class PiUnchanged(Harness):
             sync.copy(s, "rsync")
         return run.call_args.args[0]
 
-    def test_without_staged_copies_the_command_is_the_old_one(self) -> None:
-        old = [
-            "rsync",
-            "-a",
-            "--append-verify",
-            "--timeout=120",
-            "--include=*/",
-            "--include=*.jsonl",
-            "--exclude=*",
-            "-e",
-            " ".join(sync.SSH),
-            f"{self.src}/",
-            f"{self.store}/box/",
-        ]
-        self.assertEqual(self.command(stage=False), old)
+    def test_pi_alone(self) -> None:
+        cmd = self.command(stage=False)
+        self.assertEqual(cmd[:3], ["rsync", "-a", "--relative"])
+        self.assertEqual(cmd[-2:], [f"{self.state}/pi-link/./pi/", f"{self.store}/box/"])
+        self.assertEqual((self.state / "pi-link" / "pi").readlink(), self.src)
         self.assertFalse((self.state / "stage").exists())
 
-    def test_staged_copies_ride_the_same_rsync_after_pi(self) -> None:
+    def test_staged_copies_ride_the_same_rsync_as_pi(self) -> None:
         cmd = self.command(stage=True)
-        self.assertEqual(cmd[-3:], [f"{self.src}/", f"{self.state}/stage/", f"{self.store}/box/"])
+        self.assertEqual(
+            cmd[-3:],
+            [f"{self.state}/pi-link/./pi/", f"{self.state}/stage/./", f"{self.store}/box/"],
+        )
         self.assertIn("--include=/*/meta/*.json", cmd)
+
+    def test_an_ssh_store_migrates_in_rsyncs_own_connection(self) -> None:
+        self.write_config('machine = "box"\n[store]\nhost = "devbox"\npath = "/data/m"\n')
+        cmd = self.command(stage=False)
+        remote = next(a for a in cmd if a.startswith("--rsync-path="))
+        self.assertTrue(remote.startswith("--rsync-path=mkdir -p /data/m/box && sh -c "))
+        self.assertTrue(remote.endswith(" migrate /data/m/box && rsync"))
+        self.assertEqual(cmd[-1], "devbox:/data/m/box/")
+
+    def test_every_login_shell_runs_the_remote_migration(self) -> None:
+        """The store host's login shell parses --rsync-path first; csh and
+        tcsh reject a newline inside quotes and expand `!x` inside them."""
+        store = self.dir / "st ore"
+        self.write_config(f'machine = "box"\n[store]\nhost = "devbox"\npath = "{store}"\n')
+        remote = next(a for a in self.command(stage=False) if a.startswith("--rsync-path="))
+        line = remote.removeprefix("--rsync-path=").removesuffix("rsync") + "echo synced"
+        shells = [sh for sh in ("sh", "dash", "bash", "zsh", "csh", "tcsh") if shutil.which(sh)]
+        for sh in shells:
+            with self.subTest(sh):
+                old = store / "box" / "--proj--" / f"{sh}.jsonl"
+                old.parent.mkdir(parents=True, exist_ok=True)
+                old.write_text("{}\n")
+                r = subprocess.run(
+                    [sh, "-c", line], capture_output=True, text=True, timeout=30, check=False
+                )
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "synced\n", ""))
+                self.assertTrue((store / "box" / "pi" / "--proj--" / f"{sh}.jsonl").exists())
+                self.assertFalse(old.parent.exists())
+
+
+@unittest.skipUnless(RSYNC, "rsync 3 not installed")
+class Migrate(Harness):
+    """A machine's first sync since 0.6 moves pi's old top-level folders into pi/."""
+
+    def old(self, rel: str, body: str) -> Path:
+        path = self.box / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        return path
+
+    def test_old_layout_moves_into_pi(self) -> None:
+        self.old("--proj--/s1.jsonl", '{"a":1}\n')
+        self.old("--gone--/s0.jsonl", "{}\n")  # deleted locally: kept, and moved
+        self.old("2026-04-17T07-33-11-729Z_x.jsonl", "{}\n")
+        r = self.run_sync()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            sorted(p.name for p in self.box.iterdir()),
+            [".museum", "claude", "codex", "cursor-agent", "pi"],
+        )
+        pi = self.box / "pi"
+        self.assertTrue((pi / "--gone--" / "s0.jsonl").exists())
+        self.assertTrue((pi / "2026-04-17T07-33-11-729Z_x.jsonl").exists())
+        self.assertEqual((pi / "--proj--" / "s1.jsonl").read_text(), '{"a":1}\n')
+        # Nothing to move the second time.
+        self.assertEqual(self.run_sync().returncode, 0)
+
+    def test_a_session_in_both_places_keeps_the_longer_copy(self) -> None:
+        """An older museum on this machine grew the old copy after a new one
+        migrated: the longer one is kept, the prefix goes."""
+        (self.src / "--proj--" / "s1.jsonl").write_text('{"a":1}\n{"b":2}\n{"c":3}\n')
+        self.old("pi/--proj--/s1.jsonl", '{"a":1}\n')
+        self.old("--proj--/s1.jsonl", '{"a":1}\n{"b":2}\n')
+        self.old("pi/--proj--/s2.jsonl", '{"z":1}\n{"y":2}\n')
+        self.old("--proj--/s2.jsonl", '{"z":1}\n')
+        r = self.run_sync()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((self.box / "--proj--").exists())
+        pi = self.box / "pi" / "--proj--"
+        self.assertEqual((pi / "s1.jsonl").read_text(), '{"a":1}\n{"b":2}\n{"c":3}\n')
+        self.assertEqual((pi / "s2.jsonl").read_text(), '{"z":1}\n{"y":2}\n')
+
+    def test_copies_that_differ_are_both_kept(self) -> None:
+        self.old("pi/--proj--/s5.jsonl", '{"new":1}\n')
+        self.old("--proj--/s5.jsonl", '{"old":1}\n')
+        r = self.run_sync()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("left ./--proj--/s5.jsonl", r.stderr)
+        self.assertTrue((self.box / "--proj--" / "s5.jsonl").exists())
+        self.assertEqual((self.box / "pi" / "--proj--" / "s5.jsonl").read_text(), '{"new":1}\n')
 
 
 class Filter(unittest.TestCase):
@@ -572,7 +703,7 @@ class Hook(Harness):
         outermost first, all below this test process."""
         scripts = self.dir / "chain"
         scripts.mkdir(exist_ok=True)
-        last = f"sh {shlex.quote(str(BIN / 'museum'))} hook claude; true\n"
+        last = f"{shlex.quote(str(BIN / 'museum'))} hook claude; true\n"
         for i, _ in enumerate(names):
             nxt = scripts / f"{i + 1}.sh"
             body = (
@@ -609,14 +740,24 @@ class Hook(Harness):
         self.start(MU_AGENT_NAME="second")
         self.assertEqual(self.meta()["agent"], "first")
 
-    def test_session_end_only_leaves_the_flush_stamp(self) -> None:
+    def test_session_end_does_nothing(self) -> None:
+        """An older install's SessionEnd entry: hooks no longer start syncs."""
         r = self.hook(
             "codex", {"hook_event_name": "SessionEnd", "session_id": SID, "transcript_path": "/t"}
         )
         self.assertEqual((r.returncode, r.stdout), (0, ""))
-        self.assertTrue((self.state / "flush").exists())
-        self.assertFalse((self.state / "meta").exists())
-        self.assertFalse((self.state / "last-start").exists())
+        self.assertFalse(self.state.exists())
+
+    def test_pi_extension_payload_writes_pis_record(self) -> None:
+        payload = {"hook_event_name": "SessionStart", "session_id": SID, "cwd": str(self.repo)}
+        r = self.hook("pi", payload, MU_AGENT_NAME="w1", MU_WORKSTREAM="ws")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        record = json.loads((self.state / "meta" / "pi" / f"{SID}.json").read_text())
+        self.assertEqual(
+            (record["harness"], record["agent"], record["workstream"], record["branch"]),
+            ("pi", "w1", "ws", "main"),
+        )
+        self.assertEqual(record["project"], "proj")
 
     def test_codex_title_session_is_dropped(self) -> None:
         for event in ("SessionStart", "SessionEnd"):
@@ -635,7 +776,6 @@ class Hook(Harness):
                 r = self.hook(harness, payload)
                 self.assertEqual((r.returncode, r.stdout), (0, ""))
         self.assertFalse((self.state / "meta").exists())
-        self.assertFalse((self.state / "flush").exists())
 
     def test_cursor_agent_meta_uses_workspace_roots(self) -> None:
         root = str(self.repo)
@@ -651,7 +791,59 @@ class Hook(Harness):
         self.assertEqual(record["agent"], "c1")
         end = self.hook("cursor-agent", {"hook_event_name": "sessionEnd"})
         self.assertEqual((end.returncode, end.stdout), (0, "{}\n"))
-        self.assertTrue((self.state / "flush").exists())
+
+
+class Launcher(unittest.TestCase):
+    """bin/museum names the commands and runs museum-sync's."""
+
+    def museum(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(BIN / "museum"), *args],
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env},
+            check=False,
+            timeout=30,
+        )
+
+    def test_each_command_runs_museum_syncs(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "log"
+            fake = Path(d) / "fake-sync"
+            fake.write_text('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n')
+            fake.chmod(0o755)
+            for args, want in [
+                (["tick"], "tick"),
+                (["hook", "pi"], "--hook pi"),
+                (["sync", "--now"], "--now"),
+                (["sync"], ""),
+                (["init", "/s", "box"], "init /s box"),
+                (["setup"], "init"),
+                (["status"], "status"),
+                (["doctor"], "doctor"),
+                (["version"], "--version"),
+                (["timer", "install"], "timer install"),
+                (["timer", "remove"], "timer remove"),
+            ]:
+                with self.subTest(args):
+                    log.unlink(missing_ok=True)
+                    r = self.museum(*args, MUSEUM_SYNC=str(fake), FAKE_LOG=str(log))
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(log.read_text(), want + "\n")
+
+    def test_anything_else_prints_usage(self) -> None:
+        for args in ([], ["bogus"], ["hook"], ["timer"], ["timer", "start"], ["status", "x"]):
+            with self.subTest(args):
+                r = self.museum(*args, MUSEUM_SYNC="/nonexistent")
+                self.assertEqual(r.returncode, 2)
+                self.assertTrue(r.stderr.startswith("museum tick "), r.stderr)
+
+    def test_sync_path_is_the_museum_sync_beside_it(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "MUSEUM_SYNC"}
+        r = subprocess.run(
+            [str(BIN / "museum"), "sync-path"], capture_output=True, text=True, env=env, check=True
+        )
+        self.assertEqual(r.stdout, f"{(BIN / 'museum-sync').resolve()}\n")
 
 
 # Stands in for museum-sync, so tick's gating is checked without a sync.
@@ -669,7 +861,8 @@ class Tick(Harness):
 
     def tick(self) -> None:
         r = subprocess.run(
-            ["sh", str(BIN / "museum"), "tick"],
+            # museum-sync itself: through museum, MUSEUM_SYNC would replace it.
+            [str(BIN / "museum-sync"), "tick"],
             capture_output=True,
             text=True,
             env=self.env(MUSEUM_SYNC=str(self.fake), FAKE_LOG=str(self.log)),
@@ -681,6 +874,12 @@ class Tick(Harness):
     def calls(self) -> list[str]:
         return self.log.read_text().splitlines() if self.log.exists() else []
 
+    def synced(self, ago: float) -> None:
+        """A sync that worked, `ago` seconds back, as museum-sync records it."""
+        when = int(time.time() - ago)
+        (self.state / "last-start").write_text(f"{when}\n")
+        sync.mark_ok(self.state, when)
+
     def test_not_due_starts_nothing(self) -> None:
         (self.state / "last-start").write_text(f"{int(time.time())}\n")
         self.tick()
@@ -688,8 +887,18 @@ class Tick(Harness):
         self.assertEqual(self.calls(), [])
         self.assertFalse((self.state / "last-tick").exists())
 
-    def test_interval_due_starts_one_sync_until_the_next_interval(self) -> None:
-        (self.state / "last-start").write_text(f"{int(time.time()) - 601}\n")
+    def test_due_but_unchanged_starts_nothing(self) -> None:
+        self.synced(ago=601)
+        self.age_sources()
+        self.tick()
+        time.sleep(0.3)
+        self.assertEqual(self.calls(), [])
+        # The check counts as a try: the next find waits for the interval.
+        self.assertTrue((self.state / "last-tick").exists())
+
+    def test_a_change_past_the_interval_starts_one_sync(self) -> None:
+        self.synced(ago=601)
+        (self.src / "--proj--" / "s1.jsonl").write_text('{"a":2}\n')
         self.tick()
         self.wait_for(lambda: self.calls() == ["--if-due"], "no sync started")
         # The sync could not start (it never wrote last-start): no retry yet.
@@ -697,45 +906,19 @@ class Tick(Harness):
         time.sleep(0.3)
         self.assertEqual(self.calls(), ["--if-due"])
 
-    def test_flush_stamp_starts_a_sync_once(self) -> None:
-        (self.state / "last-start").write_text(f"{int(time.time())}\n")
-        (self.state / "flush").touch()
+    def test_no_good_sync_yet_is_a_change(self) -> None:
+        (self.state / "last-start").write_text(f"{int(time.time()) - 601}\n")
         self.tick()
         self.wait_for(lambda: self.calls() == ["--if-due"], "no sync started")
-        self.assertFalse((self.state / "flush").exists())
-        self.assertTrue((self.state / "pending").exists())  # what makes it due
-        self.tick()
-        time.sleep(0.3)
-        self.assertEqual(self.calls(), ["--if-due"])
 
-    def test_hook_and_tick_agree_on_the_flush_stamp_whatever_the_env(self) -> None:
-        """A claude hook sees the shell's XDG_STATE_HOME, a Muse hook and the
-        timer may not: the stamp sits at one fixed path either way."""
-        xdg = self.dir / "xdg"
-        for hook_env in ({"XDG_STATE_HOME": str(xdg)}, {}):
-            with self.subTest(hook_env=hook_env):
-                self.log.unlink(missing_ok=True)
-                end = {"hook_event_name": "SessionEnd", "session_id": SID}
-                env = {k: v for k, v in self.env(**hook_env).items() if k != "MUSEUM_STATE_DIR"}
-                subprocess.run(
-                    ["sh", str(BIN / "museum"), "hook", "claude"],
-                    input=json.dumps(end),
-                    text=True,
-                    env={**env, "MUSEUM_SYNC": str(BIN / "museum-sync")},
-                    check=True,
-                    timeout=30,
-                )
-                stamp = self.home / ".local/state/museum/flush"
-                self.assertTrue(stamp.exists())
-                tick_env = self.env(MUSEUM_SYNC=str(self.fake), FAKE_LOG=str(self.log))
-                tick_env.pop("MUSEUM_STATE_DIR")
-                tick_env["XDG_STATE_HOME"] = str(xdg)
-                subprocess.run(
-                    ["sh", str(BIN / "museum"), "tick"], env=tick_env, check=True, timeout=10
-                )
-                self.wait_for(lambda: self.calls() == ["--if-due"], "no sync started")
-                self.assertFalse(stamp.exists())
-                self.assertTrue((xdg / "museum" / "pending").exists())
+    def test_a_meta_record_is_a_change(self) -> None:
+        self.synced(ago=601)
+        self.age_sources()
+        meta = self.state / "meta" / "pi" / f"{SID}.json"
+        meta.parent.mkdir(parents=True)
+        meta.write_text("{}\n")
+        self.tick()
+        self.wait_for(lambda: self.calls() == ["--if-due"], "no sync started")
 
 
 # Stand-ins that log their arguments. `launchctl print` finds no job.
@@ -755,7 +938,7 @@ class Timer(Harness):
         env = self.env(MUSEUM_TIMER_KIND=kind, FAKE_LOG=str(log), PATH=path, **extra)
         env.pop("XDG_CONFIG_HOME", None)
         r = subprocess.run(
-            ["sh", str(BIN / "museum"), "timer", action],
+            [str(BIN / "museum"), "timer", action],
             capture_output=True,
             text=True,
             env=env,
@@ -802,6 +985,17 @@ class Timer(Harness):
         self.run_timer("systemd", "remove")
         self.assertFalse((units / "museum-tick.timer").exists())
 
+    def test_a_moved_pi_sessions_folder_reaches_the_timer(self) -> None:
+        """The timer does every sync, pi's included, so it must look where pi writes."""
+        self.run_timer("launchd", "install")
+        plist = self.home / "Library/LaunchAgents/museum.tick.plist"
+        with plist.open("rb") as f:
+            job_env = plistlib.load(f)["EnvironmentVariables"]
+        self.assertEqual(job_env["PI_SESSIONS_DIR"], str(self.src))
+        self.run_timer("systemd", "install")
+        service = (self.home / ".config/systemd/user/museum-tick.service").read_text()
+        self.assertIn(f'Environment="PI_SESSIONS_DIR={self.src}"', service)
+
     def test_empty_harness_homes_are_not_forwarded(self) -> None:
         """An empty CLAUDE_CONFIG_DIR, CODEX_HOME or CURSOR_HOME means the
         default folder to museum-sync; the timer must not pin it as empty."""
@@ -829,7 +1023,7 @@ class RsyncPath(Sandbox):
         )
         r = self.run_sync(PATH=str(empty))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue((self.store / "box" / "--proj--" / "s1.jsonl").exists())
+        self.assertTrue((self.store / "box" / "pi" / "--proj--" / "s1.jsonl").exists())
 
     def test_configured_rsync_that_is_not_rsync_3_is_an_error(self) -> None:
         self.write_config(
@@ -853,3 +1047,71 @@ class RsyncPath(Sandbox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Doctor(Harness):
+    def doctor(self, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(BIN / "museum"), "doctor"],
+            capture_output=True,
+            text=True,
+            env={
+                **self.env(MUSEUM_TIMER_KIND="systemd", **env),
+                "MUSEUM_SYNC": str(BIN / "museum-sync"),
+            },
+            check=False,
+            timeout=60,
+        )
+
+    def test_names_each_problem_with_its_fix(self) -> None:
+        old = self.box / "--proj--" / "s1.jsonl"
+        old.parent.mkdir(parents=True)
+        old.write_text("{}\n")
+        r = self.doctor()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        out = r.stdout
+        self.assertIn(f"ok    store: {self.store} reachable", out)
+        self.assertIn("warn  store: box's pi sessions are in the old layout", out)
+        self.assertIn("FAIL  no timer: not installed\n      fix: museum timer install", out)
+        self.assertIn("FAIL  no sync has worked yet", out)
+
+    @unittest.skipUnless(RSYNC, "rsync 3 not installed")
+    def test_after_a_sync_the_backup_is_fresh_until_it_is_stale(self) -> None:
+        self.assertEqual(self.run_sync().returncode, 0)
+        out = self.doctor().stdout
+        self.assertIn("ok    last sync ok, 0m ago", out)
+        self.assertNotIn("old layout", out)
+        # The last good sync was an hour ago, and a session changed just now,
+        # as after a break: a working timer has not had its chance yet.
+        doc = json.loads((self.state / "state.json").read_text())
+        doc["last_ok"] -= 3600
+        (self.state / "state.json").write_text(json.dumps(doc))
+        fresh = self.src / "--proj--" / "s7.jsonl"
+        fresh.write_text("{}\n")
+        out = self.doctor().stdout
+        self.assertNotIn("stale", out)
+        # The change has waited 40 minutes: the timer would have synced it.
+        old = time.time() - 2400
+        os.utime(fresh, (old, old))
+        out = self.doctor().stdout
+        self.assertRegex(
+            out,
+            r"FAIL  backup stale: \d+ session files changed since the last good sync 1h ago, the first 40m ago",
+        )
+
+    def test_an_empty_store_has_no_machines(self) -> None:
+        out = self.doctor().stdout
+        self.assertNotIn("machine *", out)
+
+    def test_is_read_only_even_when_state_json_is_odd(self) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "state.json").write_text("[]")
+        r = self.doctor()
+        self.assertEqual((self.state / "state.json").read_text(), "[]")
+        self.assertIn("FAIL  no sync has worked yet", r.stdout, r.stderr)
+
+    def test_a_missing_config_says_to_run_init(self) -> None:
+        self.config.unlink()
+        r = self.doctor()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("fix: museum init STORE", r.stdout)
