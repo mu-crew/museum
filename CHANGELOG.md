@@ -3,7 +3,7 @@
 All notable changes to museum. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0.0 a minor release may change on-disk state or setup.
 
-## [Unreleased]
+## [0.6.1] — 2026-11-16
 
 ### Fixed
 
