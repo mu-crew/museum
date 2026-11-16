@@ -465,6 +465,11 @@ def copy(s: Settings, rsync: str) -> Result:
             rsync,
             "-a",
             "--relative",
+            # Follow the pi link: rsync builds patched for CVE-2026-53785
+            # refuse a symlinked directory in a --relative source path,
+            # failing the sync with "Too many levels of symbolic links".
+            # Neither source folder holds directory links of its own.
+            "--copy-dirlinks",
             "--append-verify",
             "--timeout=120",
             "--include=*/",

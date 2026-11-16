@@ -383,7 +383,7 @@ class OneRsync(Harness):
 
     def test_pi_alone(self) -> None:
         cmd = self.command(stage=False)
-        self.assertEqual(cmd[:3], ["rsync", "-a", "--relative"])
+        self.assertEqual(cmd[:4], ["rsync", "-a", "--relative", "--copy-dirlinks"])
         self.assertEqual(cmd[-2:], [f"{self.state}/pi-link/./pi/", f"{self.store}/box/"])
         self.assertEqual((self.state / "pi-link" / "pi").readlink(), self.src)
         self.assertFalse((self.state / "stage").exists())

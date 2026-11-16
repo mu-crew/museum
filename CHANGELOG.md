@@ -3,6 +3,15 @@
 All notable changes to museum. Versions follow [Semantic Versioning](https://semver.org/);
 before 1.0.0 a minor release may change on-disk state or setup.
 
+## [Unreleased]
+
+### Fixed
+
+- **Syncs work again with patched rsync.** rsync builds with the fix for
+  CVE-2026-53785 refuse to follow the link to pi's sessions folder under
+  `--relative`, so every sync failed with `Too many levels of symbolic links`
+  (rsync code 23). The sync now passes `--copy-dirlinks`.
+
 ## [0.6.0] — 2026-11-12
 
 Only `museum tick` syncs, and only when a session changed; every harness,
